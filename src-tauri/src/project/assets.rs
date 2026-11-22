@@ -1,0 +1,1071 @@
+use crate::caption::{self, finalize_caption};
+use crate::db::{self, AssetRow};
+use crate::error::{AppError, AppResult};
+use crate::model::*;
+use crate::project::history::{self, snapshot_asset, AssetSnapshot, HistoryState, MembershipChange};
+use crate::project::{transform, Project};
+use crate::util;
+use rusqlite::{params, params_from_iter, OptionalExtension, ToSql};
+use serde::Serialize;
+
+struct CaptionConfig {
+    trigger_word: String,
+    trigger_mode: String,
+    default_mode: String,
+}
+
+fn caption_config(conn: &rusqlite::Connection) -> AppResult<CaptionConfig> {
+    let (trigger_word, trigger_mode, default_mode) = conn.query_row(
+        "SELECT trigger_word, trigger_mode, default_caption_mode FROM project LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(CaptionConfig { trigger_word, trigger_mode, default_mode })
+}
+
+struct CaptionRaw {
+    mode: String,
+    tags: Vec<String>,
+    text: String,
+}
+
+fn caption_raw(conn: &rusqlite::Connection, revision_id: Option<&str>, default_mode: &str) -> CaptionRaw {
+    if let Some(revision_id) = revision_id {
+        if let Ok(Some((mode, tags_json, text))) = conn
+            .query_row(
+                "SELECT mode, tags_json, text FROM caption_revisions WHERE id = ?1",
+                params![revision_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .optional()
+        {
+            return CaptionRaw {
+                mode,
+                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                text,
+            };
+        }
+    }
+    CaptionRaw {
+        mode: default_mode.to_string(),
+        tags: Vec::new(),
+        text: String::new(),
+    }
+}
+
+fn final_text(conn: &rusqlite::Connection, asset: &AssetRow, cfg: &CaptionConfig) -> AppResult<String> {
+    let raw = caption_raw(conn, asset.caption_revision_id.as_deref(), &cfg.default_mode);
+    Ok(finalize_caption(
+        &raw.mode,
+        &raw.tags,
+        &raw.text,
+        &cfg.trigger_word,
+        &cfg.trigger_mode,
+        asset.trigger_disabled,
+    ))
+}
+
+fn summary_from_row(
+    conn: &rusqlite::Connection,
+    asset: &AssetRow,
+    cfg: &CaptionConfig,
+) -> AppResult<AssetSummary> {
+    let raw = caption_raw(conn, asset.caption_revision_id.as_deref(), &cfg.default_mode);
+    let final_text = finalize_caption(
+        &raw.mode,
+        &raw.tags,
+        &raw.text,
+        &cfg.trigger_word,
+        &cfg.trigger_mode,
+        asset.trigger_disabled,
+    );
+    let (blocking, suggestion): (i64, i64) = conn.query_row(
+        "SELECT
+           COALESCE(SUM(CASE WHEN level='blocking' AND ignored=0 THEN 1 ELSE 0 END),0),
+           COALESCE(SUM(CASE WHEN level='suggestion' AND ignored=0 THEN 1 ELSE 0 END),0)
+         FROM issues WHERE asset_id = ?1",
+        params![asset.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(AssetSummary {
+        id: asset.id.clone(),
+        name: asset.original_name.clone(),
+        ext: asset.ext.clone(),
+        format: asset.format.clone(),
+        width: asset.norm_width,
+        height: asset.norm_height,
+        out_width: asset.out_width,
+        out_height: asset.out_height,
+        bytes: asset.bytes,
+        status: asset.review_status.clone(),
+        favorite: asset.favorite,
+        caption_mode: raw.mode.clone(),
+        caption_preview: caption::caption_preview(&raw.mode, &raw.tags, &raw.text, 96),
+        caption_text: final_text.clone(),
+        tags: raw.tags.clone(),
+        issue_blocking: blocking,
+        issue_suggestion: suggestion,
+        duplicate_group_id: asset.duplicate_group_id.clone(),
+        split_lock: asset.split_lock.clone(),
+        thumb_version: asset.thumb_version.clone(),
+        display_version: format!("src-{}", &asset.content_hash[..asset.content_hash.len().min(10)]),
+        has_draft: asset.draft_transform_revision_id.is_some(),
+        imported_at: asset.imported_at.clone(),
+        last_human_at: asset.last_human_at.clone(),
+        sort_index: asset.sort_index,
+        revision: asset.revision,
+        has_caption: !final_text.trim().is_empty(),
+        crop_ratio: asset.crop_ratio,
+        pad_ratio: asset.pad_ratio,
+        scale_ratio: asset.scale_ratio,
+        source_label: asset.rel_path.clone(),
+        note: asset.note.clone(),
+        missing: asset.missing,
+        trigger_disabled: asset.trigger_disabled,
+    })
+}
+
+fn escape_like(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+struct FilterParts {
+    joins: String,
+    where_sql: String,
+    params: Vec<rusqlite::types::Value>,
+}
+
+fn build_filter(filter: &AssetFilter) -> FilterParts {
+    use rusqlite::types::Value;
+    let mut where_parts: Vec<String> = vec!["1=1".into()];
+    let mut values: Vec<Value> = Vec::new();
+
+    if !filter.statuses.is_empty() {
+        let placeholders: Vec<String> = filter
+            .statuses
+            .iter()
+            .map(|_| "?".to_string())
+            .collect();
+        where_parts.push(format!("a.review_status IN ({})", placeholders.join(",")));
+        for status in &filter.statuses {
+            values.push(Value::Text(status.clone()));
+        }
+    }
+    if !filter.orientations.is_empty() {
+        let mut parts = Vec::new();
+        for orientation in &filter.orientations {
+            parts.push(match orientation.as_str() {
+                "portrait" => "a.norm_height > a.norm_width".to_string(),
+                "landscape" => "a.norm_width > a.norm_height".to_string(),
+                "square" => "a.norm_width = a.norm_height".to_string(),
+                _ => "1=0".to_string(),
+            });
+        }
+        where_parts.push(format!("({})", parts.join(" OR ")));
+    }
+    if !filter.collection_ids.is_empty() {
+        let placeholders: Vec<String> = filter
+            .collection_ids
+            .iter()
+            .map(|_| "?".to_string())
+            .collect();
+        where_parts.push(format!(
+            "EXISTS (SELECT 1 FROM collection_assets ca WHERE ca.asset_id = a.id AND ca.collection_id IN ({}))",
+            placeholders.join(",")
+        ));
+        for id in &filter.collection_ids {
+            values.push(Value::Text(id.clone()));
+        }
+    }
+    if !filter.issue_rules.is_empty() {
+        let placeholders: Vec<String> = filter.issue_rules.iter().map(|_| "?".to_string()).collect();
+        where_parts.push(format!(
+            "EXISTS (SELECT 1 FROM issues i WHERE i.asset_id = a.id AND i.rule IN ({}))",
+            placeholders.join(",")
+        ));
+        for rule in &filter.issue_rules {
+            values.push(Value::Text(rule.clone()));
+        }
+    }
+    if !filter.issue_levels.is_empty() {
+        for level in &filter.issue_levels {
+            if level == "blocking" {
+                where_parts.push(
+                    "EXISTS (SELECT 1 FROM issues i WHERE i.asset_id = a.id AND i.level='blocking' AND i.ignored=0)".into(),
+                );
+            } else if level == "suggestion" {
+                where_parts.push(
+                    "EXISTS (SELECT 1 FROM issues i WHERE i.asset_id = a.id AND i.level='suggestion' AND i.ignored=0)".into(),
+                );
+            } else if level == "ignored" {
+                where_parts.push(
+                    "EXISTS (SELECT 1 FROM issues i WHERE i.asset_id = a.id AND i.ignored=1)".into(),
+                );
+            }
+        }
+    }
+    if let Some(split) = &filter.split {
+        if split == "unassigned" {
+            where_parts.push("a.split_lock IS NULL".into());
+        } else {
+            where_parts.push("a.split_lock = ?".into());
+            values.push(Value::Text(split.clone()));
+        }
+    }
+    if filter.duplicate_only {
+        where_parts.push("a.duplicate_group_id IS NOT NULL".into());
+    }
+    if filter.favorite_only {
+        where_parts.push("a.favorite = 1".into());
+    }
+    if filter.has_draft {
+        where_parts.push("a.draft_transform_revision_id IS NOT NULL".into());
+    }
+    if let Some(min) = filter.min_short_edge {
+        where_parts.push("min(a.norm_width, a.norm_height) >= ?".into());
+        values.push(Value::Integer(min as i64));
+    }
+    if let Some(max) = filter.max_short_edge {
+        where_parts.push("min(a.norm_width, a.norm_height) <= ?".into());
+        values.push(Value::Integer(max as i64));
+    }
+    let query = filter.query.trim();
+    if !query.is_empty() {
+        for term in query.split_whitespace() {
+            if let Some(rest) = term.strip_prefix('-') {
+                if rest.is_empty() {
+                    continue;
+                }
+                let needle = format!("%{}%", escape_like(&rest.to_lowercase()));
+                where_parts.push(
+                    "(lower(a.original_name) NOT LIKE ? ESCAPE '\\' AND lower(a.rel_path) NOT LIKE ? ESCAPE '\\' \
+                     AND lower(COALESCE(c.search_text,'')) NOT LIKE ? ESCAPE '\\')".into(),
+                );
+                values.push(Value::Text(needle.clone()));
+                values.push(Value::Text(needle.clone()));
+                values.push(Value::Text(needle));
+            } else if let Some(tag) = term.strip_prefix("tag:") {
+                let needle = format!("%{}%", escape_like(&tag.to_lowercase()));
+                where_parts.push("lower(COALESCE(c.tags_json,'')) LIKE ? ESCAPE '\\'".into());
+                values.push(Value::Text(needle));
+            } else {
+                let needle = format!("%{}%", escape_like(&term.to_lowercase()));
+                where_parts.push(
+                    "(lower(a.original_name) LIKE ? ESCAPE '\\' OR lower(a.rel_path) LIKE ? ESCAPE '\\' \
+                     OR lower(COALESCE(a.note,'')) LIKE ? ESCAPE '\\' \
+                     OR lower(COALESCE(c.search_text,'')) LIKE ? ESCAPE '\\')".into(),
+                );
+                values.push(Value::Text(needle.clone()));
+                values.push(Value::Text(needle.clone()));
+                values.push(Value::Text(needle.clone()));
+                values.push(Value::Text(needle));
+            }
+        }
+    }
+
+    FilterParts {
+        joins: "LEFT JOIN caption_revisions c ON c.id = a.caption_revision_id".into(),
+        where_sql: where_parts.join(" AND "),
+        params: values,
+    }
+}
+
+fn order_sql(sort: &AssetSort) -> String {
+    let direction = if sort.direction.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" };
+    let primary = match sort.field.as_str() {
+        "name" => "lower(a.original_name)",
+        "edge" => "max(a.norm_width, a.norm_height)",
+        "status" => "CASE a.review_status WHEN 'pending' THEN 0 WHEN 'review' THEN 1 WHEN 'approved' THEN 2 ELSE 3 END",
+        "date" => "a.imported_at",
+        _ => "a.sort_index",
+    };
+    format!("{primary} {direction}, a.id ASC")
+}
+
+pub fn query(project: &Project, filter: &AssetFilter, sort: &AssetSort, offset: i64, limit: i64) -> AppResult<AssetsPage> {
+    let conn = project.conn();
+    let cfg = caption_config(&conn)?;
+    let parts = build_filter(filter);
+    let total: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM assets a {} WHERE {}",
+            parts.joins, parts.where_sql
+        ),
+        params_from_iter(parts.params.iter()),
+        |row| row.get(0),
+    )?;
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+    let sql = format!(
+        "SELECT {columns} FROM assets a {joins} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
+        columns = db::ASSET_COLUMNS
+            .split(", ")
+            .map(|column| format!("a.{column}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        joins = parts.joins,
+        where_sql = parts.where_sql,
+        order = order_sql(sort)
+    );
+    let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+    for value in &parts.params {
+        values.push(Box::new(value.clone()));
+    }
+    values.push(Box::new(limit));
+    values.push(Box::new(offset));
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(values.iter().map(|v| v.as_ref())), db::asset_row)?;
+    let mut items = Vec::new();
+    for row in rows {
+        let asset = row?;
+        items.push(summary_from_row(&conn, &asset, &cfg)?);
+    }
+    let next_offset = if offset + (items.len() as i64) < total {
+        Some(offset + items.len() as i64)
+    } else {
+        None
+    };
+    Ok(AssetsPage { items, total, next_offset })
+}
+
+pub fn resolve_ids(conn: &rusqlite::Connection, filter: &AssetFilter) -> AppResult<Vec<String>> {
+    let parts = build_filter(filter);
+    let sql = format!(
+        "SELECT a.id FROM assets a {} WHERE {} ORDER BY a.sort_index ASC, a.id ASC",
+        parts.joins, parts.where_sql
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(parts.params.iter()), |row| row.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn summaries(project: &Project, ids: &[String]) -> AppResult<Vec<AssetSummary>> {
+    let conn = project.conn();
+    let cfg = caption_config(&conn)?;
+    let mut result = Vec::new();
+    for id in ids.iter().take(5000) {
+        if let Ok(asset) = db::get_asset(&conn, id) {
+            if let Ok(summary) = summary_from_row(&conn, &asset, &cfg) {
+                result.push(summary);
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub fn detail(project: &Project, asset_id: &str) -> AppResult<AssetDetail> {
+    let conn = project.conn();
+    let cfg = caption_config(&conn)?;
+    let asset = db::get_asset(&conn, asset_id)?;
+    let summary = summary_from_row(&conn, &asset, &cfg)?;
+    let raw = caption_raw(&conn, asset.caption_revision_id.as_deref(), &cfg.default_mode);
+    let final_text = finalize_caption(
+        &raw.mode,
+        &raw.tags,
+        &raw.text,
+        &cfg.trigger_word,
+        &cfg.trigger_mode,
+        asset.trigger_disabled,
+    );
+    let stats = caption::caption_stats(&raw.mode, &raw.tags, &raw.text);
+    let (caption_source, caption_created): (String, Option<String>) = asset
+        .caption_revision_id
+        .as_deref()
+        .and_then(|id| {
+            conn.query_row(
+                "SELECT source, created_at FROM caption_revisions WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+        .unwrap_or(("none".into(), None));
+    let issues = {
+        let mut statement = conn.prepare(
+            "SELECT id, asset_id, rule, level, message, evidence_json, ignored, ignore_reason
+             FROM issues WHERE asset_id = ?1 ORDER BY CASE level WHEN 'blocking' THEN 0 ELSE 1 END, rule LIMIT 80",
+        )?;
+        let rows = statement.query_map(params![asset_id], |row| {
+            let evidence: String = row.get(5)?;
+            Ok(IssueInfo {
+                id: row.get(0)?,
+                asset_id: row.get(1)?,
+                rule: row.get(2)?,
+                level: row.get(3)?,
+                message: row.get(4)?,
+                evidence: serde_json::from_str(&evidence).unwrap_or(serde_json::json!({})),
+                ignored: row.get::<_, i64>(6)? != 0,
+                ignore_reason: row.get(7)?,
+            })
+        })?;
+        rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+    };
+    let collections = {
+        let mut statement = conn.prepare(
+            "SELECT col.id, col.name, col.kind, col.created_at,
+                    (SELECT COUNT(*) FROM collection_assets ca2 WHERE ca2.collection_id = col.id),
+                    col.target_width, col.target_height
+             FROM collections col
+             JOIN collection_assets ca ON ca.collection_id = col.id
+             WHERE ca.asset_id = ?1 ORDER BY col.name",
+        )?;
+        let rows = statement.query_map(params![asset_id], |row| {
+            Ok(CollectionInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                count: row.get(4)?,
+                created_at: row.get(3)?,
+                query: None,
+                sort: None,
+                target_width: row.get(5)?,
+                target_height: row.get(6)?,
+            })
+        })?;
+        rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+    };
+    let source_root: Option<String> = asset
+        .source_root_id
+        .as_deref()
+        .and_then(|root_id| {
+            conn.query_row(
+                "SELECT path FROM source_roots WHERE id = ?1",
+                params![root_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+    drop(conn);
+    let transform_data = transform::transform_data(project, &asset)?;
+    let history_entries = history::list_for_asset(project, asset_id)?;
+    let source_path = project.source_path(&asset)?;
+    let missing = !source_path.exists();
+    let filesize = std::fs::metadata(&source_path).map(|m| m.len() as i64).unwrap_or(asset.bytes);
+    let design = CaptionData {
+        revision_id: asset.caption_revision_id.clone(),
+        mode: raw.mode,
+        tags: raw.tags,
+        text: raw.text,
+        final_text,
+        source: caption_source,
+        created_at: caption_created,
+        char_count: stats.char_count,
+        tag_count: stats.tag_count,
+        token_estimate: stats.token_estimate,
+        tokenizer_note: stats.tokenizer_note,
+    };
+    Ok(AssetDetail {
+        summary,
+        sha256: asset.content_hash,
+        orig_width: asset.orig_width,
+        orig_height: asset.orig_height,
+        norm_width: asset.norm_width,
+        norm_height: asset.norm_height,
+        has_alpha: asset.has_alpha,
+        phash: asset.phash,
+        blur_score: asset.blur_score,
+        dark_ratio: asset.dark_ratio,
+        bright_ratio: asset.bright_ratio,
+        source_root,
+        rel_path: asset.rel_path,
+        source_path: source_path.to_string_lossy().to_string(),
+        source_size: asset.source_size,
+        missing,
+        excluded_reason: asset.excluded_reason,
+        review_note: asset.review_note,
+        issues,
+        transform: transform_data,
+        caption: design,
+        collections,
+        history: history_entries,
+        imported_at: asset.imported_at,
+        filesize,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetUpdateResult {
+    pub asset: AssetSummary,
+    pub history_seq: i64,
+    pub quality_stale: bool,
+}
+
+pub fn update(project: &Project, asset_id: &str, patch: &AssetPatch) -> AppResult<AssetUpdateResult> {
+    let mut conn = project.conn();
+    let cfg = caption_config(&conn)?;
+    let asset = db::get_asset(&conn, asset_id)?;
+    if let Some(status) = &patch.status {
+        if !matches!(status.as_str(), "pending" | "approved" | "review" | "excluded") {
+            return Err(AppError::new("INVALID_STATUS", "未知的审核状态"));
+        }
+    }
+    if let Some(split) = &patch.split_lock {
+        if !split.is_empty() && !matches!(split.as_str(), "train" | "val") {
+            return Err(AppError::new("INVALID_SPLIT", "未知的用途"));
+        }
+    }
+    let before = snapshot_asset(&conn, asset_id)?;
+    let now = util::now_iso();
+    let tx = conn.transaction()?;
+    if let Some(status) = &patch.status {
+        let reason = if status == "excluded" {
+            patch.excluded_reason.clone().or(asset.excluded_reason.clone())
+        } else {
+            None
+        };
+        tx.execute(
+            "UPDATE assets SET review_status = ?1, excluded_reason = ?2, last_human_at = ?3,
+                revision = revision + 1 WHERE id = ?4",
+            params![status, reason, now, asset_id],
+        )?;
+    }
+    if let Some(favorite) = patch.favorite {
+        tx.execute(
+            "UPDATE assets SET favorite = ?1, revision = revision + 1 WHERE id = ?2",
+            params![if favorite { 1 } else { 0 }, asset_id],
+        )?;
+    }
+    if let Some(split) = &patch.split_lock {
+        let value = if split.is_empty() { None } else { Some(split.clone()) };
+        tx.execute(
+            "UPDATE assets SET split_lock = ?1, revision = revision + 1 WHERE id = ?2",
+            params![value, asset_id],
+        )?;
+    }
+    if let Some(note) = &patch.note {
+        tx.execute(
+            "UPDATE assets SET note = ?1, revision = revision + 1 WHERE id = ?2",
+            params![note, asset_id],
+        )?;
+    }
+    if let Some(reason) = &patch.excluded_reason {
+        tx.execute(
+            "UPDATE assets SET excluded_reason = ?1, revision = revision + 1 WHERE id = ?2",
+            params![reason, asset_id],
+        )?;
+    }
+    if let Some(disabled) = patch.trigger_disabled {
+        tx.execute(
+            "UPDATE assets SET trigger_disabled = ?1, revision = revision + 1 WHERE id = ?2",
+            params![if disabled { 1 } else { 0 }, asset_id],
+        )?;
+    }
+    tx.commit()?;
+    let after = snapshot_asset(&conn, asset_id)?;
+    let label = if patch.status.is_some() {
+        match patch.status.as_deref() {
+            Some("approved") => "标记为已通过",
+            Some("excluded") => "排除图片",
+            Some("review") => "标记为需复核",
+            _ => "重置为待审核",
+        }
+    } else if patch.favorite.is_some() {
+        "更新收藏"
+    } else if patch.split_lock.is_some() {
+        "分配训练/验证用途"
+    } else if patch.trigger_disabled.is_some() {
+        "切换触发词"
+    } else {
+        "更新图片信息"
+    };
+    let seq = history::record(
+        &conn,
+        "asset.update",
+        label,
+        &[asset_id.to_string()],
+        &HistoryState { assets: vec![before], memberships: vec![] },
+        &HistoryState { assets: vec![after], memberships: vec![] },
+        if patch.note.is_some() { Some(1200) } else { None },
+    )?;
+    db::mark_quality_stale(&conn)?;
+    let asset = db::get_asset(&conn, asset_id)?;
+    let summary = summary_from_row(&conn, &asset, &cfg)?;
+    Ok(AssetUpdateResult { asset: summary, history_seq: seq, quality_stale: true })
+}
+
+// ---------------------------------------------------------------------------
+// 批量操作
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct PendingCaption {
+    pub mode: String,
+    pub tags: Vec<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAssetChange {
+    pub asset_id: String,
+    pub expected_revision: i64,
+    pub before: AssetSnapshot,
+    pub caption: Option<PendingCaption>,
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    pub split: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingMembership {
+    pub collection_id: String,
+    pub asset_id: String,
+    pub add: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingBatch {
+    pub id: String,
+    pub label: String,
+    pub command_type: String,
+    pub entries: Vec<PendingAssetChange>,
+    pub memberships: Vec<PendingMembership>,
+    pub created_at: String,
+}
+
+fn is_member(conn: &rusqlite::Connection, collection_id: &str, asset_id: &str) -> AppResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM collection_assets WHERE collection_id = ?1 AND asset_id = ?2",
+        params![collection_id, asset_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn transform_caption(
+    op: &BatchOp,
+    raw: &CaptionRaw,
+    trigger_word: &str,
+) -> (CaptionRaw, Option<String>) {
+    if raw.mode == "tags" {
+        let (tags, _text) = caption::apply_tag_transform(op, &raw.mode, &raw.tags, &raw.text, trigger_word);
+        return (
+            CaptionRaw { mode: "tags".into(), tags, text: raw.text.clone() },
+            None,
+        );
+    }
+    // 自然语言模式：对逗号分隔的段落做有限变换
+    let mut terms = caption::split_caption_text(&raw.text);
+    let mut warning = None;
+    match op {
+        BatchOp::AddTags { tags } => {
+            for tag in tags {
+                if !terms.iter().any(|t| caption::normalize_key(t) == caption::normalize_key(tag)) {
+                    terms.push(tag.clone());
+                }
+            }
+        }
+        BatchOp::RemoveTags { tags } => {
+            let keys: Vec<String> = tags.iter().map(|t| caption::normalize_key(t)).collect();
+            terms.retain(|t| !keys.contains(&caption::normalize_key(t)));
+        }
+        BatchOp::ReplaceTag { from, to } => {
+            let key = caption::normalize_key(from);
+            for term in terms.iter_mut() {
+                if caption::normalize_key(term) == key {
+                    *term = to.clone();
+                }
+            }
+        }
+        BatchOp::MoveToFront { tag } => {
+            let key = caption::normalize_key(tag);
+            if let Some(index) = terms.iter().position(|t| caption::normalize_key(t) == key) {
+                let value = terms.remove(index);
+                terms.insert(0, value);
+            }
+        }
+        BatchOp::Lowercase => {
+            for term in terms.iter_mut() {
+                *term = term.to_lowercase();
+            }
+        }
+        BatchOp::Underscores => {
+            warning = Some("自然语言模式不支持下划线规则，已跳过正文".into());
+        }
+        BatchOp::CleanShort { max_len } => {
+            let trigger_key = caption::normalize_key(trigger_word);
+            terms.retain(|t| {
+                caption::normalize_key(t) == trigger_key || t.chars().count() > *max_len
+            });
+        }
+        _ => {}
+    }
+    let text = terms.join(", ");
+    (
+        CaptionRaw { mode: "nl".into(), tags: raw.tags.clone(), text },
+        warning,
+    )
+}
+
+pub fn batch_preview(
+    project: &Project,
+    request: &BatchRequest,
+    batch_id: &str,
+) -> AppResult<(BatchPreview, PendingBatch)> {
+    let conn = project.conn();
+    let cfg = caption_config(&conn)?;
+    let ids = if !request.asset_ids.is_empty() {
+        let mut ids = request.asset_ids.clone();
+        ids.retain(|id| !request.exclude_ids.contains(id));
+        ids
+    } else if let Some(filter) = &request.filter {
+        let mut ids = resolve_ids(&conn, filter)?;
+        ids.retain(|id| !request.exclude_ids.contains(id));
+        ids
+    } else {
+        Vec::new()
+    };
+    if ids.is_empty() {
+        return Err(AppError::new("EMPTY_SCOPE", "没有可应用操作的图片"));
+    }
+    let mut entries = Vec::new();
+    let mut memberships = Vec::new();
+    let mut skipped = Vec::new();
+    let mut diffs = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // 复制标注需要源内容
+    let copy_source = if let BatchOp::CopyCaption { source } = &request.op {
+        let source_asset = db::get_asset(&conn, source)?;
+        Some(caption_raw(&conn, source_asset.caption_revision_id.as_deref(), &cfg.default_mode))
+    } else {
+        None
+    };
+
+    let mut operation_label = String::new();
+    for id in ids {
+        let asset = match db::get_asset(&conn, &id) {
+            Ok(asset) => asset,
+            Err(_) => {
+                skipped.push(BatchSkip { asset_id: id, name: String::new(), reason: "图片已不存在".into() });
+                continue;
+            }
+        };
+        let raw = caption_raw(&conn, asset.caption_revision_id.as_deref(), &cfg.default_mode);
+        let mut before_preview = caption::caption_preview(&raw.mode, &raw.tags, &raw.text, 80);
+        let mut caption_change: Option<PendingCaption> = None;
+        let mut status_change = None;
+        let mut reason_change = None;
+        let mut split_change = None;
+        let mut after_preview = before_preview.clone();
+
+        match &request.op {
+            BatchOp::SetStatus { status, reason } => {
+                let reason = reason.clone().unwrap_or_default();
+                if asset.review_status == *status
+                    && (status != "excluded" || asset.excluded_reason.clone().unwrap_or_default() == reason)
+                {
+                    skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "状态未变化".into() });
+                    continue;
+                }
+                status_change = Some(status.clone());
+                reason_change = if status == "excluded" { Some(reason) } else { None };
+                after_preview = format!("状态：{}", status_label(status));
+                operation_label = "更改审核状态".into();
+            }
+            BatchOp::SetSplit { split } => {
+                let target = split.clone().filter(|s| !s.is_empty());
+                if asset.split_lock == target {
+                    skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "用途未变化".into() });
+                    continue;
+                }
+                split_change = Some(target.clone());
+                after_preview = format!("用途：{}", target.as_deref().unwrap_or("未分配"));
+                operation_label = "分配用途".into();
+            }
+            BatchOp::AddToCollection { collection } | BatchOp::RemoveFromCollection { collection } => {
+                let add = matches!(request.op, BatchOp::AddToCollection { .. });
+                let collection_name: Option<String> = conn
+                    .query_row(
+                        "SELECT name FROM collections WHERE id = ?1",
+                        params![collection],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(collection_name) = collection_name else {
+                    return Err(AppError::not_found("集合"));
+                };
+                let member = is_member(&conn, collection, &id)?;
+                if add == member {
+                    skipped.push(BatchSkip {
+                        asset_id: id.clone(),
+                        name: asset.original_name.clone(),
+                        reason: if add { "已在集合中".into() } else { "不在集合中".into() },
+                    });
+                    continue;
+                }
+                memberships.push(PendingMembership { collection_id: collection.clone(), asset_id: id.clone(), add });
+                before_preview = format!("集合：{}", if member { "已加入" } else { "未加入" });
+                after_preview = format!(
+                    "集合：{}「{}」",
+                    if add { "已加入" } else { "已移出" },
+                    collection_name
+                );
+                operation_label = if add { "加入集合".into() } else { "从集合移除".into() };
+            }
+            BatchOp::CopyCaption { .. } => {
+                if let Some(source) = &copy_source {
+                    if source.mode == raw.mode && source.tags == raw.tags && source.text == raw.text {
+                        skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "标注已相同".into() });
+                        continue;
+                    }
+                    caption_change = Some(PendingCaption {
+                        mode: source.mode.clone(),
+                        tags: source.tags.clone(),
+                        text: source.text.clone(),
+                    });
+                    after_preview = caption::caption_preview(&source.mode, &source.tags, &source.text, 80);
+                    operation_label = "复制标注".into();
+                }
+            }
+            op => {
+                let (new_raw, warning) = transform_caption(op, &raw, &cfg.trigger_word);
+                if let Some(warning) = warning {
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+                if new_raw.mode == raw.mode && new_raw.tags == raw.tags && new_raw.text == raw.text {
+                    skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "标注无变化".into() });
+                    continue;
+                }
+                after_preview = caption::caption_preview(&new_raw.mode, &new_raw.tags, &new_raw.text, 80);
+                caption_change = Some(PendingCaption {
+                    mode: new_raw.mode,
+                    tags: new_raw.tags,
+                    text: new_raw.text,
+                });
+                operation_label = match op {
+                    BatchOp::AddTags { .. } => "添加标签",
+                    BatchOp::RemoveTags { .. } => "删除标签",
+                    BatchOp::ReplaceTag { .. } => "替换标签",
+                    BatchOp::MoveToFront { .. } => "移动标签到首位",
+                    BatchOp::Lowercase => "统一大小写",
+                    BatchOp::Underscores => "空格转下划线",
+                    BatchOp::CleanShort { .. } => "清理短标签",
+                    _ => "批量编辑标注",
+                }
+                .into();
+            }
+        }
+
+        if diffs.len() < 8 {
+            diffs.push(BatchDiff {
+                asset_id: id.clone(),
+                name: asset.original_name.clone(),
+                before: before_preview,
+                after: after_preview,
+                changed: true,
+            });
+        }
+        let before = snapshot_asset(&conn, &id)?;
+        entries.push(PendingAssetChange {
+            asset_id: id,
+            expected_revision: asset.revision,
+            before,
+            caption: caption_change,
+            status: status_change,
+            reason: reason_change,
+            split: split_change,
+        });
+    }
+
+    let changed = entries.len();
+    let memberships_only = changed > 0 && entries.iter().all(|e| e.caption.is_none() && e.status.is_none() && e.split.is_none());
+    let count = if memberships_only { memberships.len() as i64 } else { changed as i64 };
+    let skipped_count = skipped.len();
+    let summary = if count == 0 {
+        "没有需要变更的图片".to_string()
+    } else if memberships_only {
+        format!("将更新 {count} 张图片的集合归属，跳过 {skipped_count} 张")
+    } else {
+        format!("将修改 {count} 张图片，跳过 {skipped_count} 张")
+    };
+    if skipped.len() > 8 {
+        skipped.truncate(8);
+    }
+    let preview = BatchPreview {
+        preview_id: batch_id.to_string(),
+        count,
+        skipped,
+        diffs,
+        summary,
+        warnings,
+        created_at: util::now_iso(),
+    };
+    let label = if operation_label.is_empty() { "批量操作".into() } else { format!("批量{operation_label}") };
+    let command_type = match request.op {
+        BatchOp::SetStatus { .. } => "batch.status",
+        BatchOp::SetSplit { .. } => "batch.split",
+        BatchOp::AddToCollection { .. } | BatchOp::RemoveFromCollection { .. } => "batch.collection",
+        _ => "batch.caption",
+    };
+    let pending = PendingBatch {
+        id: batch_id.to_string(),
+        label,
+        command_type: command_type.into(),
+        entries,
+        memberships,
+        created_at: util::now_iso(),
+    };
+    Ok((preview, pending))
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "approved" => "已通过",
+        "review" => "需复核",
+        "excluded" => "已排除",
+        _ => "待审核",
+    }
+}
+
+pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchResult> {
+    let mut conn = project.conn();
+    // 先校验全部修订号
+    for entry in &pending.entries {
+        let current = db::get_asset(&conn, &entry.asset_id)?;
+        if current.revision != entry.expected_revision {
+            return Err(
+                AppError::new("REVISION_CONFLICT", "部分图片已被修改，批量操作未执行。请重新预览。")
+                    .items(vec![entry.asset_id.clone()]),
+            );
+        }
+    }
+    if pending.entries.is_empty() && pending.memberships.is_empty() {
+        return Err(AppError::new("EMPTY_SCOPE", "没有需要变更的图片"));
+    }
+    let now = util::now_iso();
+    let tx = conn.transaction()?;
+    for entry in &pending.entries {
+        let mut changed = false;
+        if let Some(caption) = &entry.caption {
+            let revision_no: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(revision_no),0) + 1 FROM caption_revisions WHERE asset_id = ?1",
+                params![entry.asset_id],
+                |row| row.get(0),
+            )?;
+            let revision_id = util::new_id();
+            let search = caption::search_text(&caption.mode, &caption.tags, &caption.text);
+            tx.execute(
+                "INSERT INTO caption_revisions(id, asset_id, revision_no, mode, tags_json, text, source, status, parent_id, search_text, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'batch', 'active', (SELECT caption_revision_id FROM assets WHERE id = ?2), ?7, ?8)",
+                params![
+                    revision_id,
+                    entry.asset_id,
+                    revision_no,
+                    caption.mode,
+                    serde_json::to_string(&caption.tags)?,
+                    caption.text,
+                    search,
+                    now
+                ],
+            )?;
+            tx.execute(
+                "UPDATE assets SET caption_revision_id = ?1, revision = revision + 1,
+                 last_human_at = ?2,
+                 review_status = CASE WHEN review_status='approved' THEN 'pending' ELSE review_status END
+                 WHERE id = ?3",
+                params![revision_id, now, entry.asset_id],
+            )?;
+            changed = true;
+        }
+        if let Some(status) = &entry.status {
+            tx.execute(
+                "UPDATE assets SET review_status = ?1, excluded_reason = ?2, last_human_at = ?3,
+                 revision = revision + 1 WHERE id = ?4",
+                params![status, entry.reason, now, entry.asset_id],
+            )?;
+            changed = true;
+        }
+        if let Some(split) = &entry.split {
+            tx.execute(
+                "UPDATE assets SET split_lock = ?1, revision = revision + 1 WHERE id = ?2",
+                params![split, entry.asset_id],
+            )?;
+            changed = true;
+        }
+        if !changed {
+            // 集合归属等由 memberships 处理
+        }
+    }
+    for membership in &pending.memberships {
+        if membership.add {
+            tx.execute(
+                "INSERT OR IGNORE INTO collection_assets(collection_id, asset_id) VALUES(?1, ?2)",
+                params![membership.collection_id, membership.asset_id],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM collection_assets WHERE collection_id = ?1 AND asset_id = ?2",
+                params![membership.collection_id, membership.asset_id],
+            )?;
+        }
+    }
+    tx.commit()?;
+
+    let asset_ids: Vec<String> = pending
+        .entries
+        .iter()
+        .map(|e| e.asset_id.clone())
+        .chain(pending.memberships.iter().map(|m| m.asset_id.clone()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let after_assets = {
+        let mut snapshots = Vec::new();
+        for entry in &pending.entries {
+            if let Ok(snapshot) = snapshot_asset(&conn, &entry.asset_id) {
+                snapshots.push(snapshot);
+            }
+        }
+        snapshots
+    };
+    let before_assets = pending.entries.iter().map(|e| e.before.clone()).collect::<Vec<_>>();
+    let membership_changes = {
+        let mut map: std::collections::HashMap<(String, bool), Vec<String>> = std::collections::HashMap::new();
+        for membership in &pending.memberships {
+            map.entry((membership.collection_id.clone(), membership.add))
+                .or_default()
+                .push(membership.asset_id.clone());
+        }
+        map.into_iter()
+            .map(|((collection_id, add), asset_ids)| MembershipChange { collection_id, asset_ids, add })
+            .collect::<Vec<_>>()
+    };
+    // 历史状态的 memberships 表示“应用该状态时需要执行的变更”：
+    // 撤销时执行反向变更，重做时重新执行原变更。
+    let undo_memberships = membership_changes
+        .iter()
+        .map(|change| MembershipChange {
+            collection_id: change.collection_id.clone(),
+            asset_ids: change.asset_ids.clone(),
+            add: !change.add,
+        })
+        .collect::<Vec<_>>();
+    let seq = history::record(
+        &conn,
+        &pending.command_type,
+        &pending.label,
+        &asset_ids,
+        &HistoryState { assets: before_assets, memberships: undo_memberships },
+        &HistoryState { assets: after_assets, memberships: membership_changes },
+        None,
+    )?;
+    db::mark_quality_stale(&conn)?;
+    let applied = if pending.memberships.is_empty() {
+        pending.entries.len() as i64
+    } else {
+        (pending.entries.len().max(pending.memberships.len())) as i64
+    };
+    Ok(BatchResult {
+        applied,
+        skipped: 0,
+        history_seq: seq,
+        label: pending.label,
+    })
+}

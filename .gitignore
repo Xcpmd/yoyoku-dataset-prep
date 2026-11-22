@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+tests/tmp/
+tests/out/
+wd14Tagger/
