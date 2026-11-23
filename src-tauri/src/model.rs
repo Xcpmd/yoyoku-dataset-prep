@@ -11,6 +11,7 @@ pub struct AppSettings {
     pub density: String,
     pub reduce_transparency: bool,
     pub reduce_motion: bool,
+    pub smooth_zoom: bool,
     pub high_contrast: bool,
     pub large_text: bool,
     pub grid_card_min: u32,
@@ -29,6 +30,7 @@ impl Default for AppSettings {
             density: "comfortable".into(),
             reduce_transparency: false,
             reduce_motion: false,
+            smooth_zoom: true,
             high_contrast: false,
             large_text: false,
             grid_card_min: 168,
@@ -37,7 +39,7 @@ impl Default for AppSettings {
             models_dir: None,
             baidu_translate_app_id: None,
             baidu_translate_key: None,
-            image_slots: 2,
+            image_slots: 4,
         }
     }
 }
@@ -157,6 +159,8 @@ pub struct TransformPlan {
     pub allow_upscale: bool,
     pub resample: String,
     pub background: String,
+    /// 导出/渲染时是否把透明像素填充为白色。关闭后 PNG 保留透明通道。
+    pub fill_transparent: bool,
     pub color: ColorAdjust,
     pub format: String,
     pub quality: u32,
@@ -177,6 +181,7 @@ impl Default for TransformPlan {
             allow_upscale: false,
             resample: "lanczos".into(),
             background: "#ffffff".into(),
+            fill_transparent: true,
             color: ColorAdjust::default(),
             format: "png".into(),
             quality: 95,
@@ -245,6 +250,8 @@ pub struct AssetFilter {
     pub min_short_edge: Option<u32>,
     pub max_short_edge: Option<u32>,
     pub has_draft: bool,
+    /// 只看去重回收区；默认视图会隐藏回收区图片。
+    pub recycled_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,6 +728,7 @@ pub struct SizePolicy {
     pub longest_edge: Option<u32>,
     pub allow_upscale: bool,
     pub background: String,
+    pub fill_transparent: bool,
     pub resample: String,
 }
 
@@ -733,6 +741,7 @@ impl Default for SizePolicy {
             longest_edge: None,
             allow_upscale: false,
             background: "#ffffff".into(),
+            fill_transparent: true,
             resample: "lanczos".into(),
         }
     }

@@ -8,6 +8,7 @@ export interface AppSettings {
   density: "comfortable" | "compact";
   reduceTransparency: boolean;
   reduceMotion: boolean;
+  smoothZoom: boolean;
   highContrast: boolean;
   largeText: boolean;
   gridCardMin: number;
@@ -87,6 +88,7 @@ export interface TransformPlan {
   allowUpscale: boolean;
   resample: "lanczos" | "bicubic";
   background: string;
+  fillTransparent: boolean;
   color: ColorAdjust;
   format: "png" | "jpg";
   quality: number;
@@ -246,6 +248,7 @@ export interface AssetFilter {
   minShortEdge: number | null;
   maxShortEdge: number | null;
   hasDraft: boolean;
+  recycledOnly: boolean;
 }
 
 export interface AssetSort {
@@ -417,6 +420,49 @@ export interface DuplicateGroupView {
   members: DuplicateMember[];
 }
 
+export interface DedupeMember {
+  assetId: string;
+  name: string;
+  width: number;
+  height: number;
+  bytes: number;
+  status: ReviewStatus;
+  thumbVersion: string;
+  displayVersion: string;
+  distance: number | null;
+  keepRecommended: boolean;
+}
+
+export interface DedupeGroup {
+  id: string;
+  kind: "exact" | "near";
+  members: DedupeMember[];
+}
+
+export interface DedupeScan {
+  threshold: number;
+  scanned: number;
+  groups: DedupeGroup[];
+  recycled: number;
+}
+
+export interface DedupeRecycled {
+  assetId: string;
+  name: string;
+  width: number;
+  height: number;
+  bytes: number;
+  thumbVersion: string;
+  displayVersion: string;
+  excludedReason: string | null;
+  recycledAt: string | null;
+}
+
+export interface DedupeActionResult {
+  moved: number;
+  restored: number;
+}
+
 export interface OverviewBucket {
   label: string;
   count: number;
@@ -458,6 +504,7 @@ export interface SizePolicy {
   longestEdge: number | null;
   allowUpscale: boolean;
   background: string;
+  fillTransparent: boolean;
   resample: "lanczos" | "bicubic";
 }
 
@@ -680,6 +727,35 @@ export interface PromptUpsertRequest {
 export interface CaptionTagState {
   order: string[];
   disabled: string[];
+}
+
+export interface TagTotalEntry {
+  tag: string;
+  count: number;
+}
+
+export interface TagTotalsResult {
+  targetAssets: number;
+  taggedAssets: number;
+  tags: TagTotalEntry[];
+  truncated: boolean;
+}
+
+export interface TagBulkRequest {
+  /** 空数组表示作用于项目内全部图片。 */
+  assetIds: string[];
+  action: "add" | "remove" | "rename";
+  from?: string;
+  to?: string;
+  tags?: string[];
+}
+
+export interface TagBulkResult {
+  action: string;
+  totalAssets: number;
+  changedAssets: number;
+  skippedAssets: number;
+  historySeq: number | null;
 }
 
 export interface CachedTranslation {

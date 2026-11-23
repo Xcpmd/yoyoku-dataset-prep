@@ -55,7 +55,7 @@ impl AppState {
             python.clone(),
             worker_script.clone(),
             worker_log.clone(),
-            settings.image_slots.max(1) as usize,
+            settings.image_slots.clamp(1, 8) as usize,
         );
         Ok(Self {
             data_dir,

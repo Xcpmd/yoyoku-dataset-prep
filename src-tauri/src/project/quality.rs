@@ -1328,3 +1328,394 @@ pub fn overview(project: &Project) -> AppResult<QualityOverview> {
         split_counts: split_list,
     })
 }
+
+// ---------------------------------------------------------------------------
+// 导入页去重与回收区
+// ---------------------------------------------------------------------------
+
+/// 去重回收的排除原因。回收区只收纳由去重功能移入的图片，便于恢复。
+pub const DEDUPE_REASON: &str = "去重回收";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupeMember {
+    pub asset_id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: i64,
+    pub status: String,
+    pub thumb_version: String,
+    pub display_version: String,
+    /// 与建议保留图片的 pHash 汉明距离；完全相同时为 0。
+    pub distance: Option<u32>,
+    pub keep_recommended: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupeGroup {
+    pub id: String,
+    pub kind: String,
+    pub members: Vec<DedupeMember>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupeScan {
+    pub threshold: u32,
+    pub scanned: i64,
+    pub groups: Vec<DedupeGroup>,
+    pub recycled: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupeRecycled {
+    pub asset_id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: i64,
+    pub thumb_version: String,
+    pub display_version: String,
+    pub excluded_reason: Option<String>,
+    pub recycled_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupeActionResult {
+    pub moved: i64,
+    pub restored: i64,
+}
+
+fn recommend_keep<'a>(members: &[&'a AssetRow]) -> Option<&'a AssetRow> {
+    let area = |asset: &AssetRow| asset.norm_width as u64 * asset.norm_height as u64;
+    let reviewed = |asset: &AssetRow| matches!(asset.review_status.as_str(), "approved" | "review");
+    let mut best: Option<&'a AssetRow> = None;
+    for asset in members {
+        let better = match best {
+            None => true,
+            Some(current) => {
+                if area(asset) != area(current) {
+                    area(asset) > area(current)
+                } else if reviewed(asset) != reviewed(current) {
+                    reviewed(asset)
+                } else {
+                    asset.id < current.id
+                }
+            }
+        };
+        if better {
+            best = Some(asset);
+        }
+    }
+    best
+}
+
+/// 扫描未排除图片中的重复组。完全相同的图片按内容哈希归组，感知相近的图片按 pHash 距离归组。
+/// 该扫描独立于质检的 duplicate_groups，不会改动质检结果。
+pub fn dedupe_scan(project: &Project, threshold: Option<u32>) -> AppResult<DedupeScan> {
+    let conn = project.conn();
+    let threshold = threshold
+        .unwrap_or_else(|| thresholds(&conn).duplicate_distance)
+        .clamp(1, 16);
+    let assets: Vec<AssetRow> = {
+        let mut statement = conn.prepare(&format!(
+            "SELECT {} FROM assets WHERE review_status <> 'excluded' ORDER BY sort_index ASC, id ASC",
+            db::ASSET_COLUMNS
+        ))?;
+        let rows = statement.query_map([], db::asset_row)?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let scanned = assets.len() as i64;
+
+    // pHash 近邻分带 + 并查集
+    let mut parent: HashMap<String, String> = HashMap::new();
+    fn find(parent: &mut HashMap<String, String>, value: &str) -> String {
+        let mut current = value.to_string();
+        loop {
+            let next = parent.get(&current).cloned().unwrap_or_else(|| current.clone());
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        let root = current;
+        let mut cursor = value.to_string();
+        loop {
+            let next = parent.get(&cursor).cloned().unwrap_or_else(|| cursor.clone());
+            if next == root {
+                break;
+            }
+            parent.insert(cursor.clone(), root.clone());
+            cursor = next;
+        }
+        root
+    }
+    fn union(parent: &mut HashMap<String, String>, a: &str, b: &str) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent.insert(rb, ra);
+        }
+    }
+
+    let band_count = (threshold as usize + 1).min(16);
+    let mut hashes: Vec<(String, u64)> = Vec::new();
+    for asset in &assets {
+        if let Some(value) = asset.phash.as_deref().and_then(parse_hash) {
+            parent.entry(asset.id.clone()).or_insert_with(|| asset.id.clone());
+            hashes.push((asset.id.clone(), value));
+        }
+    }
+    let mut bands: HashMap<(usize, u64), Vec<usize>> = HashMap::new();
+    for (index, (_, value)) in hashes.iter().enumerate() {
+        let width = (64 + band_count - 1) / band_count;
+        for band in 0..band_count {
+            let shift = 64usize.saturating_sub((band + 1) * width);
+            let mask = if width >= 64 { u64::MAX } else { ((1u64 << width) - 1) << shift };
+            let key = (band, value & mask);
+            let candidates = bands.entry(key).or_default();
+            for &other in candidates.iter() {
+                let (other_id, other_value) = &hashes[other];
+                if (other_value ^ value).count_ones() <= threshold {
+                    union(&mut parent, &hashes[index].0, other_id);
+                }
+            }
+            candidates.push(index);
+        }
+    }
+    let mut components: HashMap<String, Vec<String>> = HashMap::new();
+    for (asset_id, _) in &hashes {
+        let root = find(&mut parent, asset_id);
+        components.entry(root).or_default().push(asset_id.clone());
+    }
+
+    let mut near_groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (_, mut members) in components {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort();
+        let distinct_hashes: HashSet<String> = members
+            .iter()
+            .filter_map(|id| assets.iter().find(|asset| &asset.id == id))
+            .map(|asset| asset.content_hash.clone())
+            .collect();
+        if distinct_hashes.len() < 2 {
+            continue;
+        }
+        let id = format!("near-{}", &util::sha256_text(&members.join("|"))[..16]);
+        near_groups.push((id, members));
+    }
+    near_groups.sort_by(|a, b| a.0.cmp(&b.0));
+    let near_members: HashSet<String> = near_groups
+        .iter()
+        .flat_map(|(_, members)| members.iter().cloned())
+        .collect();
+
+    let mut by_hash: HashMap<&str, Vec<&AssetRow>> = HashMap::new();
+    for asset in &assets {
+        by_hash.entry(asset.content_hash.as_str()).or_default().push(asset);
+    }
+    let mut exact_groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (hash, members) in &by_hash {
+        if members.len() < 2 {
+            continue;
+        }
+        if members.iter().all(|asset| near_members.contains(&asset.id)) {
+            continue;
+        }
+        let mut ids: Vec<String> = members.iter().map(|asset| asset.id.clone()).collect();
+        ids.sort();
+        let key = &hash[..hash.len().min(16)];
+        exact_groups.push((format!("exact-{key}"), ids));
+    }
+    exact_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut groups: Vec<DedupeGroup> = Vec::new();
+    for (kind, group_id, member_ids) in exact_groups
+        .iter()
+        .map(|(id, members)| ("exact", id, members))
+        .chain(near_groups.iter().map(|(id, members)| ("near", id, members)))
+    {
+        let group_assets: Vec<&AssetRow> = member_ids
+            .iter()
+            .filter_map(|id| assets.iter().find(|asset| &asset.id == id))
+            .collect();
+        if group_assets.len() < 2 {
+            continue;
+        }
+        let Some(keep) = recommend_keep(&group_assets) else {
+            continue;
+        };
+        let keep_hash = keep.phash.as_deref().and_then(parse_hash);
+
+        let mut members: Vec<DedupeMember> = group_assets
+            .iter()
+            .map(|asset| {
+                let distance = if kind == "exact" {
+                    Some(0)
+                } else {
+                    asset
+                        .phash
+                        .as_deref()
+                        .and_then(parse_hash)
+                        .and_then(|value| keep_hash.map(|kept| (value ^ kept).count_ones()))
+                };
+                DedupeMember {
+                    asset_id: asset.id.clone(),
+                    name: asset.original_name.clone(),
+                    width: asset.norm_width,
+                    height: asset.norm_height,
+                    bytes: asset.bytes,
+                    status: asset.review_status.clone(),
+                    thumb_version: asset.thumb_version.clone(),
+                    display_version: format!(
+                        "src-{}",
+                        &asset.content_hash[..asset.content_hash.len().min(10)]
+                    ),
+                    distance,
+                    keep_recommended: asset.id == keep.id,
+                }
+            })
+            .collect();
+        members.sort_by(|a, b| {
+            b.keep_recommended
+                .cmp(&a.keep_recommended)
+                .then_with(|| a.distance.unwrap_or(u32::MAX).cmp(&b.distance.unwrap_or(u32::MAX)))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.asset_id.cmp(&b.asset_id))
+        });
+        groups.push(DedupeGroup {
+            id: group_id.clone(),
+            kind: kind.to_string(),
+            members,
+        });
+    }
+    groups.sort_by(|a, b| {
+        b.members
+            .len()
+            .cmp(&a.members.len())
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let recycled: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assets WHERE review_status = 'excluded' AND excluded_reason = ?1",
+        params![DEDUPE_REASON],
+        |row| row.get(0),
+    )?;
+    Ok(DedupeScan {
+        threshold,
+        scanned,
+        groups,
+        recycled,
+    })
+}
+
+pub fn dedupe_recycled(project: &Project) -> AppResult<Vec<DedupeRecycled>> {
+    let conn = project.conn();
+    let mut statement = conn.prepare(
+        "SELECT id, original_name, norm_width, norm_height, bytes, thumb_version,
+                'src-' || substr(content_hash, 1, 10), excluded_reason, last_human_at
+         FROM assets
+         WHERE review_status = 'excluded' AND excluded_reason = ?1
+         ORDER BY last_human_at DESC, sort_index ASC
+         LIMIT 2000",
+    )?;
+    let rows = statement.query_map(params![DEDUPE_REASON], |row| {
+        Ok(DedupeRecycled {
+            asset_id: row.get(0)?,
+            name: row.get(1)?,
+            width: row.get(2)?,
+            height: row.get(3)?,
+            bytes: row.get(4)?,
+            thumb_version: row.get(5)?,
+            display_version: row.get(6)?,
+            excluded_reason: row.get(7)?,
+            recycled_at: row.get(8)?,
+        })
+    })?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+pub fn dedupe_recycle(project: &Project, asset_ids: &[String]) -> AppResult<DedupeActionResult> {
+    dedupe_move(project, asset_ids, true)
+}
+
+pub fn dedupe_restore(project: &Project, asset_ids: &[String]) -> AppResult<DedupeActionResult> {
+    dedupe_move(project, asset_ids, false)
+}
+
+fn dedupe_move(project: &Project, asset_ids: &[String], recycle: bool) -> AppResult<DedupeActionResult> {
+    let mut conn = project.conn();
+    let mut ids: Vec<String> = Vec::new();
+    for id in asset_ids {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return Err(AppError::new(
+            "EMPTY_SCOPE",
+            if recycle { "请选择要移入回收区的图片" } else { "请选择要恢复的图片" },
+        ));
+    }
+    let mut targets: Vec<String> = Vec::new();
+    for id in &ids {
+        let asset = db::get_asset(&conn, id)?;
+        let recycled =
+            asset.review_status == "excluded" && asset.excluded_reason.as_deref() == Some(DEDUPE_REASON);
+        if recycle && !recycled && asset.review_status != "excluded" {
+            targets.push(id.clone());
+        } else if !recycle && recycled {
+            targets.push(id.clone());
+        }
+    }
+    if targets.is_empty() {
+        return Ok(DedupeActionResult { moved: 0, restored: 0 });
+    }
+    let mut before = Vec::new();
+    for id in &targets {
+        before.push(snapshot_asset(&conn, id)?);
+    }
+    let now = util::now_iso();
+    let tx = conn.transaction()?;
+    for id in &targets {
+        if recycle {
+            tx.execute(
+                "UPDATE assets SET review_status = 'excluded', excluded_reason = ?1,
+                 revision = revision + 1, last_human_at = ?2 WHERE id = ?3",
+                params![DEDUPE_REASON, now, id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE assets SET review_status = 'pending', excluded_reason = NULL,
+                 revision = revision + 1, last_human_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    let mut after = Vec::new();
+    for id in &targets {
+        after.push(snapshot_asset(&conn, id)?);
+    }
+    history::record(
+        &conn,
+        if recycle { "dedupe.recycle" } else { "dedupe.restore" },
+        if recycle { "去重：移至回收区" } else { "去重：从回收区恢复" },
+        &targets,
+        &HistoryState { assets: before, memberships: vec![] },
+        &HistoryState { assets: after, memberships: vec![] },
+        None,
+    )?;
+    let count = targets.len() as i64;
+    Ok(DedupeActionResult {
+        moved: if recycle { count } else { 0 },
+        restored: if recycle { 0 } else { count },
+    })
+}

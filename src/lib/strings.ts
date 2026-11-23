@@ -671,6 +671,8 @@ export const S = {
     reduceTransparencyHint: "关闭玻璃模糊，使用不透明表面。",
     reduceMotion: "减少动效",
     reduceMotionHint: "面板切换即刻完成，仅保留极短淡入。",
+    smoothZoom: "平滑缩放",
+    smoothZoomHint: "大图画布缩放时使用短缓动，关闭后立即跳到目标比例。",
     highContrast: "高对比",
     largeText: "大字号",
     gridCard: "图库卡片最小宽度",

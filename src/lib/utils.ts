@@ -178,6 +178,7 @@ export function emptyFilter(): AssetFilter {
     minShortEdge: null,
     maxShortEdge: null,
     hasDraft: false,
+    recycledOnly: false,
   };
 }
 
@@ -193,6 +194,7 @@ export function filterActiveCount(filter: AssetFilter): number {
   if (filter.duplicateOnly) count += 1;
   if (filter.favoriteOnly) count += 1;
   if (filter.hasDraft) count += 1;
+  if (filter.recycledOnly) count += 1;
   if (filter.minShortEdge) count += 1;
   if (filter.maxShortEdge) count += 1;
   return count;
@@ -212,6 +214,7 @@ export function defaultPlan(baseResolution: number): TransformPlan {
     allowUpscale: false,
     resample: "lanczos",
     background: "#ffffff",
+    fillTransparent: true,
     color: { brightness: 1, contrast: 1, saturation: 1 },
     format: "png",
     quality: 95,

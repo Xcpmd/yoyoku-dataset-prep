@@ -58,7 +58,7 @@ pub async fn app_settings_set(state: State<'_, AppState>, settings: AppSettings)
     let mut normalized = settings;
     normalized.grid_card_min = normalized.grid_card_min.clamp(112, 168);
     normalized.inspector_width = normalized.inspector_width.clamp(280, 420);
-    normalized.image_slots = normalized.image_slots.clamp(1, 4);
+    normalized.image_slots = normalized.image_slots.clamp(1, 8);
     state.save_settings(&normalized)?;
     Ok(normalized)
 }
@@ -691,6 +691,24 @@ pub async fn caption_tag_state_set(
 }
 
 #[tauri::command]
+pub async fn caption_tag_totals(
+    state: State<'_, AppState>,
+    asset_ids: Vec<String>,
+) -> AppResult<captions::TagTotalsResult> {
+    let project = state.project()?;
+    captions::tag_totals(&project, &asset_ids)
+}
+
+#[tauri::command]
+pub async fn caption_tag_bulk(
+    state: State<'_, AppState>,
+    req: captions::TagBulkRequest,
+) -> AppResult<captions::TagBulkResult> {
+    let project = state.project()?;
+    captions::tag_bulk(&project, &req)
+}
+
+#[tauri::command]
 pub async fn caption_suggestions(
     state: State<'_, AppState>,
     asset_id: String,
@@ -811,6 +829,43 @@ pub async fn quality_duplicate_action(
 pub async fn quality_overview(state: State<'_, AppState>) -> AppResult<QualityOverview> {
     let project = state.project()?;
     quality::overview(&project)
+}
+
+// ---------------------------------------------------------------------------
+// 图片去重 / 回收区
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn dedupe_scan(
+    state: State<'_, AppState>,
+    threshold: Option<u32>,
+) -> AppResult<quality::DedupeScan> {
+    let project = state.project()?;
+    quality::dedupe_scan(&project, threshold)
+}
+
+#[tauri::command]
+pub async fn dedupe_recycled(state: State<'_, AppState>) -> AppResult<Vec<quality::DedupeRecycled>> {
+    let project = state.project()?;
+    quality::dedupe_recycled(&project)
+}
+
+#[tauri::command]
+pub async fn dedupe_recycle(
+    state: State<'_, AppState>,
+    asset_ids: Vec<String>,
+) -> AppResult<quality::DedupeActionResult> {
+    let project = state.project()?;
+    quality::dedupe_recycle(&project, &asset_ids)
+}
+
+#[tauri::command]
+pub async fn dedupe_restore(
+    state: State<'_, AppState>,
+    asset_ids: Vec<String>,
+) -> AppResult<quality::DedupeActionResult> {
+    let project = state.project()?;
+    quality::dedupe_restore(&project, &asset_ids)
 }
 
 // ---------------------------------------------------------------------------

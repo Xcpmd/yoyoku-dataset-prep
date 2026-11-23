@@ -151,6 +151,14 @@ fn build_filter(filter: &AssetFilter) -> FilterParts {
             values.push(Value::Text(status.clone()));
         }
     }
+    if filter.recycled_only {
+        where_parts.push("a.review_status = 'excluded' AND a.excluded_reason = ?".into());
+        values.push(Value::Text(crate::project::quality::DEDUPE_REASON.into()));
+    } else if filter.statuses.is_empty() {
+        // 去重回收的图片默认从图库主视图隐藏，只在回收区筛选中出现。
+        where_parts.push("COALESCE(a.excluded_reason, '') <> ?".into());
+        values.push(Value::Text(crate::project::quality::DEDUPE_REASON.into()));
+    }
     if !filter.orientations.is_empty() {
         let mut parts = Vec::new();
         for orientation in &filter.orientations {

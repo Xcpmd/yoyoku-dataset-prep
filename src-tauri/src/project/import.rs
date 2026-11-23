@@ -482,6 +482,48 @@ pub fn run_import(mut ctx: JobContext, cache: ScanCache, total: i64) -> AppResul
     };
     plan.format = "png".into();
     plan.crop = crate::model::CropRect::default();
+    let plan_json = serde_json::to_string(&plan)?;
+    let max_sort_index: i64 = {
+        let conn = project.conn();
+        conn.query_row("SELECT COALESCE(MAX(sort_index), 0) FROM assets", [], |row| row.get(0))?
+    };
+    // 预先登记来源根目录，避免并行线程重复插入同一路径。
+    let root_ids: HashMap<String, String> = {
+        let conn = project.conn();
+        let mut map = HashMap::new();
+        for root in &cache.roots {
+            map.insert(root.clone(), ensure_source_root(&conn, root, &options.mode)?);
+        }
+        map
+    };
+
+    // 质检标记与项目更新时间只写一次；批量导入时逐张写入会成为主要瓶颈。
+    {
+        let conn = project.conn();
+        let _ = db::meta_set(&conn, "quality_stale", "1");
+        let _ = db::meta_set(
+            &conn,
+            "orphan_captions",
+            &cache.summary.isolated_sidecars.to_string(),
+        );
+        let _ = conn.execute(
+            "UPDATE project SET updated_at = ?1 WHERE id = ?2",
+            params![util::now_iso(), project_id(&project)],
+        );
+    }
+
+    let entries: Vec<&ScanEntryInternal> = cache
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "ok")
+        .collect();
+    let seen: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
+    let worker_slots = {
+        let state = ctx.app.state::<crate::state::AppState>();
+        state.worker.worker_count()
+    };
+    let parallelism = worker_slots.clamp(1, 4).min(entries.len().max(1));
+    let chunk_size = (parallelism * 4).max(8);
 
     let mut success = 0i64;
     let mut skipped = 0i64;
@@ -490,49 +532,73 @@ pub fn run_import(mut ctx: JobContext, cache: ScanCache, total: i64) -> AppResul
     let mut conflicts: Vec<String> = Vec::new();
     let mut errors: Vec<JobItemError> = Vec::new();
     let mut done = 0i64;
-    let mut seen_hashes: HashMap<String, String> = HashMap::new();
+    let mut index = 0usize;
 
-    for entry in cache.entries.iter().filter(|e| e.status == "ok") {
-        done += 1;
-        let source_path = PathBuf::from(&entry.path);
-        match import_one(
-            &project,
-            &ctx.app,
-            &entry,
-            &options,
-            &default_mode,
-            &plan,
-            &mut seen_hashes,
-            &mut skipped,
-            &mut duplicate_paths,
-            &mut conflicts,
-        ) {
-            Ok(true) => success += 1,
-            Ok(false) => {}
-            Err(error) => {
-                failed += 1;
-                if errors.len() < 200 {
-                    errors.push(JobItemError {
-                        item_id: entry.rel_path.clone(),
-                        path: source_path.to_string_lossy().to_string(),
-                        message: error.message,
-                        code: error.code,
-                    });
+    while index < entries.len() {
+        let end = (index + chunk_size).min(entries.len());
+        let chunk = &entries[index..end];
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let outcomes: std::sync::Mutex<Vec<(usize, &ScanEntryInternal, AppResult<ImportOneOutcome>)>> =
+            std::sync::Mutex::new(Vec::with_capacity(chunk.len()));
+        std::thread::scope(|scope| {
+            for _ in 0..parallelism {
+                scope.spawn(|| loop {
+                    let offset = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if offset >= chunk.len() {
+                        break;
+                    }
+                    let entry = chunk[offset];
+                    let sort_index = max_sort_index + 1 + (index + offset) as i64;
+                    let result = import_one(
+                        &project,
+                        &ctx.app,
+                        entry,
+                        &options,
+                        &default_mode,
+                        &plan,
+                        &plan_json,
+                        sort_index,
+                        &seen,
+                        &root_ids,
+                    );
+                    outcomes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((offset, entry, result));
+                });
+            }
+        });
+        let mut results = outcomes
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        results.sort_by_key(|(offset, _, _)| *offset);
+        for (_, entry, result) in results {
+            done += 1;
+            match result {
+                Ok(outcome) => {
+                    if outcome.success {
+                        success += 1;
+                    }
+                    if outcome.skipped {
+                        skipped += 1;
+                    }
+                    if let Some(duplicate) = outcome.duplicate {
+                        duplicate_paths.push(duplicate);
+                    }
+                    conflicts.extend(outcome.conflicts);
+                }
+                Err(error) => {
+                    failed += 1;
+                    if errors.len() < 200 {
+                        errors.push(JobItemError {
+                            item_id: entry.rel_path.clone(),
+                            path: entry.path.clone(),
+                            message: error.message,
+                            code: error.code,
+                        });
+                    }
                 }
             }
-        }
-        {
-            let conn = project.conn();
-            let _ = db::meta_set(&conn, "quality_stale", "1");
-            let _ = db::meta_set(
-                &conn,
-                "orphan_captions",
-                &cache.summary.isolated_sidecars.to_string(),
-            );
-            let _ = conn.execute(
-                "UPDATE project SET updated_at = ?1 WHERE id = ?2",
-                params![util::now_iso(), project_id(&project)],
-            );
         }
         if let JobRun::Cancelled = ctx.checkpoint(done, failed, total, "导入图片", false)? {
             let result = serde_json::json!({
@@ -545,11 +611,19 @@ pub fn run_import(mut ctx: JobContext, cache: ScanCache, total: i64) -> AppResul
             cleanup_scan_file(&project, &cache.id);
             return Ok(JobOutcome { status: "cancelled".into(), result });
         }
+        index = end;
     }
 
     ctx.checkpoint(done, failed, total, "收尾", true)?;
     if failed == 0 {
         cleanup_scan_file(&project, &cache.id);
+    }
+    {
+        let conn = project.conn();
+        let _ = conn.execute(
+            "UPDATE project SET updated_at = ?1 WHERE id = ?2",
+            params![util::now_iso(), project_id(&project)],
+        );
     }
     {
         let state = ctx.app.state::<crate::state::AppState>();
@@ -574,6 +648,40 @@ fn cleanup_scan_file(project: &Project, scan_id: &str) {
     let _ = std::fs::remove_file(project.staging_dir().join(format!("import-{scan_id}.json")));
 }
 
+struct ImportOneOutcome {
+    success: bool,
+    skipped: bool,
+    duplicate: Option<String>,
+    conflicts: Vec<String>,
+}
+
+/// 同一批导入内的哈希占位；失败时自动释放，成功导入后保留。
+struct HashClaim<'a> {
+    seen: &'a std::sync::Mutex<HashSet<String>>,
+    hash: String,
+    committed: bool,
+}
+
+impl Drop for HashClaim<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Ok(mut set) = self.seen.lock() {
+            set.remove(&self.hash);
+        }
+    }
+}
+
+fn skipped_outcome(duplicate: Option<String>) -> ImportOneOutcome {
+    ImportOneOutcome {
+        success: false,
+        skipped: true,
+        duplicate,
+        conflicts: vec![],
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn import_one(
     project: &Project,
@@ -582,16 +690,30 @@ fn import_one(
     options: &ScanRequest,
     default_mode: &str,
     plan: &crate::model::TransformPlan,
-    seen_hashes: &mut HashMap<String, String>,
-    skipped: &mut i64,
-    duplicate_paths: &mut Vec<String>,
-    conflicts: &mut Vec<String>,
-) -> AppResult<bool> {
+    plan_json: &str,
+    sort_index: i64,
+    seen: &std::sync::Mutex<HashSet<String>>,
+    root_ids: &HashMap<String, String>,
+) -> AppResult<ImportOneOutcome> {
     let source_path = PathBuf::from(&entry.path);
     let metadata_before = std::fs::metadata(&source_path)
         .map_err(|e| AppError::new("SOURCE_MISSING", format!("源文件不可读取：{e}")))?;
     let size_before = metadata_before.len();
     let mtime_before = mtime_ms(&metadata_before);
+
+    let source_root_path = entry.root.clone();
+    let source_root_id = {
+        let conn = project.conn();
+        let root_id = root_ids.get(&source_root_path).cloned().ok_or_else(|| {
+            AppError::new("SOURCE_ROOT", "扫描根目录未登记，请重新扫描后再导入")
+        })?;
+        // 已导入过同一来源路径则跳过，不再读取与解码图片。
+        if db::find_asset_by_source(&conn, &root_id, &entry.rel_path)?.is_some() {
+            return Ok(skipped_outcome(None));
+        }
+        root_id
+    };
+
     let (hash, hashed_size) = util::sha256_file(&source_path)
         .map_err(|e| AppError::io("读取源文件失败", e))?;
     let metadata_after = std::fs::metadata(&source_path)
@@ -607,11 +729,32 @@ fn import_one(
         let conn = project.conn();
         if let Some(existing) = db::find_asset_by_hash(&conn, &hash)? {
             if options.duplicate_policy != "keep" {
-                *skipped += 1;
-                duplicate_paths.push(format!("{}（与 {} 内容相同）", entry.rel_path, existing.original_name));
-                return Ok(false);
+                return Ok(skipped_outcome(Some(format!(
+                    "{}（与 {} 内容相同）",
+                    entry.rel_path, existing.original_name
+                ))));
             }
         }
+    }
+
+    // 先占位再分析：完全相同的图片在并行批次中只解码一次。
+    let mut claim: Option<HashClaim> = None;
+    if options.duplicate_policy != "keep" {
+        let inserted = seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(hash.clone());
+        if !inserted {
+            return Ok(skipped_outcome(Some(format!(
+                "{}（与本次导入中的另一张内容相同）",
+                entry.rel_path
+            ))));
+        }
+        claim = Some(HashClaim {
+            seen,
+            hash: hash.clone(),
+            committed: false,
+        });
     }
 
     // 规范化尺寸与哈希分析
@@ -626,21 +769,10 @@ fn import_one(
         return Err(AppError::new("TOO_LARGE", "图片像素超过 80 MP 上限"));
     }
 
-    let source_root_path = entry.root.clone();
     let content_hash = hash.clone();
     let ext = entry.ext.clone();
     let originals_dir = project.originals_dir();
     let managed_path = originals_dir.join(format!("{content_hash}.{ext}"));
-    let (source_root_id, source_path_for_asset) = {
-        let conn = project.conn();
-        let root_id = ensure_source_root(&conn, &source_root_path, &options.mode)?;
-        // 已导入过同一来源路径则跳过
-        if db::find_asset_by_source(&conn, &root_id, &entry.rel_path)?.is_some() {
-            *skipped += 1;
-            return Ok(false);
-        }
-        (root_id, source_path.clone())
-    };
 
     if options.mode == "copy" {
         if managed_path.exists() {
@@ -653,15 +785,29 @@ fn import_one(
                 ));
             }
         } else {
-            util::copy_atomic(&source_path, &managed_path)?;
-            let (copied_hash, _) = util::sha256_file(&managed_path)
-                .map_err(|e| AppError::io("校验复制结果失败", e))?;
-            if copied_hash != content_hash {
-                let _ = std::fs::remove_file(&managed_path);
-                return Err(AppError::new(
-                    "COPY_VERIFY_FAILED",
-                    "复制后的文件校验失败，已清理临时原件",
-                ));
+            // 一次读取同时写入并计算哈希，避免复制后再完整读一遍校验。
+            match util::copy_atomic_hash(&source_path, &managed_path) {
+                Ok((copied_hash, copied_size)) => {
+                    if copied_hash != content_hash || copied_size != size_before {
+                        let _ = std::fs::remove_file(&managed_path);
+                        return Err(AppError::new(
+                            "COPY_VERIFY_FAILED",
+                            "复制后的文件校验失败，已清理临时原件",
+                        ));
+                    }
+                }
+                Err(error) => {
+                    // 并行导入相同内容且保留重复项时，另一线程可能已先完成同名原件。
+                    if managed_path.exists() {
+                        let (existing_hash, _) = util::sha256_file(&managed_path)
+                            .map_err(|e| AppError::io("校验受管理原件失败", e))?;
+                        if existing_hash != content_hash {
+                            return Err(error);
+                        }
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
         }
     }
@@ -677,6 +823,7 @@ fn import_one(
     let text = entry.sidecar_text.clone().unwrap_or_default().trim_end().to_string();
     let search = crate::caption::search_text(default_mode, &tags, &text);
     let now = util::now_iso();
+    let plan_hash = util::sha256_text(&format!("{content_hash}:{plan_json}"));
     let analysis_json = serde_json::json!({
         "icc": analysis.icc,
         "iccDescription": analysis.icc_description,
@@ -690,11 +837,6 @@ fn import_one(
     {
         let mut conn = project.conn();
         let tx = conn.transaction()?;
-        let sort_index: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(sort_index), 0) + 1 FROM assets",
-            [],
-            |row| row.get(0),
-        )?;
         tx.execute(
             "INSERT INTO assets(id, content_hash, source_root_id, rel_path, original_name, ext, format, bytes,
                 orig_width, orig_height, norm_width, norm_height, out_width, out_height, has_alpha, phash,
@@ -741,8 +883,8 @@ fn import_one(
             params![
                 transform_revision_id,
                 asset_id,
-                serde_json::to_string(plan)?,
-                util::sha256_text(&format!("{content_hash}:{}", serde_json::to_string(plan)?)),
+                plan_json,
+                plan_hash,
                 content_hash,
                 geometry.out_width,
                 geometry.out_height,
@@ -775,29 +917,24 @@ fn import_one(
         tx.commit()?;
     }
 
-    // 缩略图（失败不阻塞导入）
-    {
-        let state = app.state::<crate::state::AppState>();
-        let asset = {
-            let conn = project.conn();
-            db::get_asset(&conn, &asset_id)?
-        };
-        let thumb_path = project.thumb_path(&asset.id, &thumb_version);
-        if let Err(error) = state.worker.thumbnail(&source_path_for_asset, Some(plan), &thumb_path, 512) {
-            eprintln!("thumbnail failed for {}: {}", entry.rel_path, error.message);
-        }
+    if let Some(claim) = claim.as_mut() {
+        claim.committed = true;
     }
 
+    let mut conflicts = Vec::new();
     if !entry.sidecar_conflicts.is_empty() {
-        let message = format!(
+        conflicts.push(format!(
             "{}：同一文件名存在多个标注候选（{}）",
             entry.rel_path,
             entry.sidecar_conflicts.join("；")
-        );
-        conflicts.push(message);
+        ));
     }
-    seen_hashes.insert(content_hash, entry.rel_path.clone());
-    Ok(true)
+    Ok(ImportOneOutcome {
+        success: true,
+        skipped: false,
+        duplicate: None,
+        conflicts,
+    })
 }
 
 /// 重试导入任务：按任务记录中的扫描 id 重新载入。

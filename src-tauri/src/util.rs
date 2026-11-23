@@ -277,6 +277,51 @@ pub fn ensure_dir(path: &Path) -> AppResult<()> {
     fs::create_dir_all(path).map_err(|e| AppError::io("无法创建目录", e))
 }
 
+/// 批量导入专用：一次读取同时写入并计算 SHA-256，跳过逐文件 fsync。
+/// 返回值用于与源文件哈希比对；调用方负责删除哈希不一致的结果。
+pub fn copy_atomic_hash(src: &Path, dst: &Path) -> AppResult<(String, u64)> {
+    if let Some(parent) = dst.parent() {
+        ensure_dir(parent)?;
+    }
+    let tmp = dst.with_file_name(format!(
+        ".{}.part-{}",
+        dst.file_name().unwrap_or_default().to_string_lossy(),
+        short_id(8)
+    ));
+    let result = (|| -> std::io::Result<(String, u64)> {
+        let mut input = BufReader::with_capacity(1024 * 1024, File::open(src)?);
+        let mut output = std::io::BufWriter::with_capacity(1024 * 1024, File::create(&tmp)?);
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            output.write_all(&buf[..n])?;
+            total += n as u64;
+        }
+        output.flush()?;
+        drop(output);
+        Ok((hex::encode(hasher.finalize()), total))
+    })();
+    match result {
+        Ok((hash, bytes)) => {
+            if let Err(e) = fs::rename(&tmp, dst) {
+                let _ = fs::remove_file(&tmp);
+                return Err(AppError::io("无法完成文件写入", e));
+            }
+            Ok((hash, bytes))
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(AppError::io("复制文件失败", e))
+        }
+    }
+}
+
 pub fn copy_atomic(src: &Path, dst: &Path) -> AppResult<u64> {
     if let Some(parent) = dst.parent() {
         ensure_dir(parent)?;

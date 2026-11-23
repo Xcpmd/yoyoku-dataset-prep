@@ -29,6 +29,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   density: "comfortable",
   reduceTransparency: false,
   reduceMotion: false,
+  smoothZoom: true,
   highContrast: false,
   largeText: false,
   gridCardMin: 168,
@@ -37,7 +38,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   modelsDir: null,
   baiduTranslateAppId: null,
   baiduTranslateKey: null,
-  imageSlots: 2,
+  imageSlots: 4,
 };
 
 interface RootContextValue {

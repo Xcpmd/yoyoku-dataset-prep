@@ -192,6 +192,7 @@ fn effective_plan(
     plan.format = if config.image_format == "jpg" { "jpg".into() } else { "png".into() };
     plan.quality = config.quality.clamp(1, 100);
     plan.background = config.size.background.clone();
+    plan.fill_transparent = config.size.fill_transparent;
     plan.resample = if config.size.resample == "bicubic" { "bicubic".into() } else { "lanczos".into() };
     match config.size.mode.as_str() {
         "preserve" => {

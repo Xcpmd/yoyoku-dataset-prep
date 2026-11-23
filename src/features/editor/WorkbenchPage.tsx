@@ -39,6 +39,7 @@ import {
 import { CanvasStage, type CanvasBackground, type CanvasMode } from "./CanvasStage";
 import { CropPanel } from "./CropPanel";
 import { CaptionPanel, type CaptionSaveState } from "./CaptionPanel";
+import { TagAssist } from "./TagAssist";
 import { InfoPanel } from "./InfoPanel";
 import { CropModeSwitch, type CropMode } from "./CropModeSwitch";
 
@@ -70,7 +71,7 @@ export function WorkbenchPage({
     navigate,
     setJobsOpen,
   } = useProject();
-  const { modelRevision } = useRoot();
+  const { modelRevision, settings: appSettings } = useRoot();
 
   const [detail, setDetail] = useState<AssetDetail | null>(null);
   const [loading, setLoading] = useState(false);
@@ -100,6 +101,11 @@ export function WorkbenchPage({
   const [tagBatchRunning, setTagBatchRunning] = useState(false);
   const [aiTagging, setAiTagging] = useState(false);
   const [tagBatchProgress, setTagBatchProgress] = useState<{ done: number; total: number } | null>(null);
+  const [aiTagActiveId, setAiTagActiveId] = useState<string | null>(null);
+  const [aiTagDoneIds, setAiTagDoneIds] = useState<string[]>([]);
+  const [aiTagProgress, setAiTagProgress] = useState<{ done: number; total: number } | null>(null);
+  const [aiTagNote, setAiTagNote] = useState<string | null>(null);
+  const aiHighlightTimer = useRef<number | undefined>(undefined);
 
   const [captionMode, setCaptionMode] = useState<CaptionMode>("tags");
   const [tags, setTags] = useState<string[]>([]);
@@ -381,6 +387,30 @@ export function WorkbenchPage({
       return false;
     }
   }, [bumpRefresh, notify]);
+
+  /** 从右侧提示词库把短语追加到当前图片，并立即落盘。 */
+  const addTagsToCurrent = useCallback(
+    async (values: string[]): Promise<"added" | "exists" | "failed"> => {
+      if (!detail) return "failed";
+      const current = captionRef.current;
+      const merged = normalizeTagList([...current.tags, ...values]);
+      if (merged.length === current.tags.length) return "exists";
+      const mode: CaptionMode = current.text.trim() ? "mixed" : "tags";
+      captionRef.current = { ...current, mode, tags: merged, dirty: true };
+      setCaptionMode(mode);
+      setTags(merged);
+      setCaptionDirty(true);
+      setCaptionSaveState("dirty");
+      return (await saveCaptionNow()) ? "added" : "failed";
+    },
+    [detail, saveCaptionNow],
+  );
+
+  /** 批量修改后刷新当前图片与素材列表统计。 */
+  const handleBulkDone = useCallback(() => {
+    bumpRefresh();
+    reloadDetail(true);
+  }, [bumpRefresh, reloadDetail]);
 
   const saveDraftNow = useCallback(async () => {
     const id = assetIdRef.current;
@@ -879,6 +909,17 @@ export function WorkbenchPage({
     };
   }, [active, workspace, modelRevision, loadAvailableModels]);
 
+  useEffect(() => {
+    setAiTagNote(null);
+  }, [currentId]);
+
+  useEffect(
+    () => () => {
+      if (aiHighlightTimer.current) window.clearTimeout(aiHighlightTimer.current);
+    },
+    [],
+  );
+
   const phraseKey = (value: string) =>
     normalizeKey(value).replace(/[.!?。！？]/g, " ").replace(/\s+/g, " ").trim();
 
@@ -945,26 +986,38 @@ export function WorkbenchPage({
   };
 
   const runAiTagCurrent = async () => {
-    if (!currentId || !tagModel || aiTagging) return;
+    if (!currentId || !tagModel || aiTagging || tagBatchRunning) return;
+    const runId = currentId;
+    if (aiHighlightTimer.current) window.clearTimeout(aiHighlightTimer.current);
     setAiTagging(true);
+    setAiTagNote(null);
+    setAiTagDoneIds([]);
+    setAiTagActiveId(currentId);
+    setAiTagProgress({ done: 0, total: 1 });
     try {
-      const result = await augmentCaptionWithModel(currentId, tagModel);
+      const result = await augmentCaptionWithModel(runId, tagModel);
       if (result.saved > 0) {
         bumpRefresh();
         reloadDetail(true);
       }
-      notify({
-        tone: "success",
-        title: "AI 打标完成",
-        message:
+      if (assetIdRef.current === runId) {
+        setAiTagNote(
           result.added > 0
-            ? `新增 ${result.added} 条短语`
-            : "模型没有产生新的短语（重复项已剔除）",
-      });
+            ? `已新增 ${result.added} 条短语`
+            : "没有新增短语（重复项已剔除）",
+        );
+      }
+      setAiTagDoneIds([runId]);
+      setAiTagProgress({ done: 1, total: 1 });
     } catch (error) {
       notify({ tone: "danger", title: "AI 打标失败", message: normalizeError(error).message });
     } finally {
       setAiTagging(false);
+      setAiTagActiveId(null);
+      aiHighlightTimer.current = window.setTimeout(() => {
+        setAiTagDoneIds([]);
+        setAiTagProgress(null);
+      }, 1100);
     }
   };
 
@@ -973,28 +1026,36 @@ export function WorkbenchPage({
     if (!tagModel || targets.length === 0) return;
     const captionOk = await saveCaptionNow();
     if (!captionOk) return;
+    if (aiHighlightTimer.current) window.clearTimeout(aiHighlightTimer.current);
     setTagBatchOpen(false);
     setTagBatchRunning(true);
     setTagBatchProgress({ done: 0, total: targets.length });
+    setAiTagDoneIds([]);
+    setAiTagProgress({ done: 0, total: targets.length });
     let saved = 0;
     const failures: string[] = [];
     try {
       const summaries = await api.assetSummaries(targets);
       const byId = new Map(summaries.map((item) => [item.id, item]));
-      for (const id of targets) {
+      for (const [index, id] of targets.entries()) {
         const summary = byId.get(id);
         if (!summary) {
           failures.push(`${id.slice(0, 8)}：图片已不存在`);
-          setTagBatchProgress((current) => ({ done: (current?.done || 0) + 1, total: targets.length }));
+          setTagBatchProgress({ done: index + 1, total: targets.length });
+          setAiTagProgress({ done: index + 1, total: targets.length });
           continue;
         }
+        setAiTagActiveId(id);
         try {
           const result = await augmentCaptionWithModel(id, tagModel);
           saved += result.saved;
+          setAiTagDoneIds((current) => (current.includes(id) ? current : [...current, id]));
         } catch (error) {
           failures.push(`${summary.name}：${normalizeError(error).message}`);
         }
-        setTagBatchProgress((current) => ({ done: (current?.done || 0) + 1, total: targets.length }));
+        setAiTagActiveId(null);
+        setTagBatchProgress({ done: index + 1, total: targets.length });
+        setAiTagProgress({ done: index + 1, total: targets.length });
       }
       if (saved > 0) {
         bumpRefresh();
@@ -1027,8 +1088,13 @@ export function WorkbenchPage({
     } catch (error) {
       notify({ tone: "danger", title: "批量打标失败", message: normalizeError(error).message });
     } finally {
+      setAiTagActiveId(null);
       setTagBatchRunning(false);
       setTagBatchProgress(null);
+      aiHighlightTimer.current = window.setTimeout(() => {
+        setAiTagDoneIds([]);
+        setAiTagProgress(null);
+      }, 1200);
     }
   };
 
@@ -1406,11 +1472,23 @@ export function WorkbenchPage({
               <span>全部图片</span>
               <span className="tiny faint">{sequence.length}</span>
             </div>
-            <span className="tiny faint">
-              {railSelection.length > 0
-                ? `${railSelection.length} 已选`
-                : `${currentIndex >= 0 ? currentIndex + 1 : "—"} / ${sequence.length}`}
-            </span>
+            {aiTagProgress ? (
+              <span className="wb-rail-ai-progress" role="status">
+                AI 打标 {aiTagProgress.done}/{aiTagProgress.total}
+              </span>
+            ) : (
+              <span
+                className="tiny faint wb-rail-selection"
+                data-tag-drop={workspace === "tag" && railSelection.length > 0 ? "selection" : undefined}
+                data-tag-drop-label={
+                  railSelection.length > 0 ? `添加至选中 ${railSelection.length} 张` : undefined
+                }
+              >
+                {railSelection.length > 0
+                  ? `${railSelection.length} 已选`
+                  : `${currentIndex >= 0 ? currentIndex + 1 : "—"} / ${sequence.length}`}
+              </span>
+            )}
             <div className="wb-rail-actions">
               <button
                 type="button"
@@ -1434,6 +1512,8 @@ export function WorkbenchPage({
             {filmItems.map((id, index) => {
               const summary = filmSummaries[id];
               const checked = railSelection.includes(id);
+              const aiActive = aiTagActiveId === id;
+              const aiDone = aiTagDoneIds.includes(id);
               return (
                 <div
                   key={id}
@@ -1442,6 +1522,8 @@ export function WorkbenchPage({
                     id === currentId && "active",
                     checked && "checked",
                     summary?.status === "excluded" && "excluded",
+                    aiActive && "ai-active",
+                    aiDone && "ai-done",
                   )}
                   onPointerEnter={() => railDragEnter(id)}
                 >
@@ -1470,6 +1552,15 @@ export function WorkbenchPage({
                     <span className="wb-rail-thumb">
                       {summary ? <img src={thumbUrlRaw(summary.id, summary.thumbVersion)} alt="" loading="lazy" /> : null}
                       <span className="wb-rail-index">{filmWindow.start + index + 1}</span>
+                      {aiActive ? (
+                        <span className="wb-rail-ai-badge active" aria-label="AI 打标中">
+                          <Spinner />
+                        </span>
+                      ) : aiDone ? (
+                        <span className="wb-rail-ai-badge done" aria-label="AI 打标完成">
+                          <Icon name="check" className="sm" />
+                        </span>
+                      ) : null}
                     </span>
                     <span className="wb-rail-meta">
                       <span className="wb-rail-name">{summary?.name || id.slice(0, 8)}</span>
@@ -1484,7 +1575,11 @@ export function WorkbenchPage({
             })}
           </div>
         </aside>
-        <div className={classNames("wb-canvas-wrap", sideOpen && mobileSection !== "image" && "mobile-hidden")}>
+        <div
+          className={classNames("wb-canvas-wrap", sideOpen && mobileSection !== "image" && "mobile-hidden")}
+          data-tag-drop={workspace === "tag" ? "current" : undefined}
+          data-tag-drop-label="添加至当前图片"
+        >
           {workspace === "crop" ? (
             <div className="crop-batch-bar">
               <span className="crop-batch-count"><strong>{linkedTargets.length}</strong> 张</span>
@@ -1505,54 +1600,38 @@ export function WorkbenchPage({
               {batchProgress ? <span className="tiny mono">{batchProgress.done}/{batchProgress.total}</span> : null}
             </div>
           ) : (
-            <>
-              <div className="crop-batch-bar tag-batch-bar">
-                <span className="crop-batch-count"><strong>{tagSelection.length}</strong> 张</span>
-                <div className="tag-ai-controls">
-                  <select
-                    className="select tag-model-select"
-                    value={tagModel}
-                    onChange={(event) => setTagModel(event.target.value)}
-                    disabled={tagModelsLoading || tagModels.length === 0 || tagBatchRunning || aiTagging}
-                    title={tagModels.find((item) => item.id === tagModel)?.name || "选择 AI 打标模型"}
-                  >
-                    {tagModels.length === 0 ? (
-                      <option value="">{tagModelsLoading ? "正在读取模型…" : "未找到模型"}</option>
-                    ) : (
-                      tagModels.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name}
-                          {item.kind === "caption" ? "（自然语言）" : ""}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                  <button
-                    type="button"
-                    className="btn secondary sm"
-                    onClick={() => void runAiTagCurrent()}
-                    disabled={!currentId || !tagModel || aiTagging || tagBatchRunning}
-                    title="用所选模型为当前图片补充短语，重复项自动剔除"
-                  >
-                    {aiTagging ? <Spinner /> : <Icon name="sparkles" className="sm" />}
-                    AI 打标
-                  </button>
-                </div>
-                <button
-                  type="button"
-                  className="btn secondary sm"
-                  onClick={() => void openTagBatch()}
-                  disabled={tagSelection.length === 0 || tagBatchRunning || aiTagging}
-                >
-                  {tagBatchRunning ? <Spinner /> : <Icon name="sparkles" className="sm" />}
-                  批量打标
-                </button>
-                <span className="hint">AI 打标当前图片；批量处理选中的 {tagSelection.length} 张</span>
-                <div className="spacer" />
-                {tagBatchProgress ? (
-                  <span className="tiny mono">{tagBatchProgress.done}/{tagBatchProgress.total}</span>
-                ) : null}
-              </div>
+            <div className="crop-batch-bar tag-batch-bar">
+              <span
+                className="crop-batch-count"
+                data-tag-drop={tagSelection.length > 0 ? "selection" : undefined}
+                data-tag-drop-label={
+                  tagSelection.length > 0 ? `添加至选中 ${tagSelection.length} 张` : undefined
+                }
+              >
+                <strong>{tagSelection.length}</strong> 张
+              </span>
+              <button
+                type="button"
+                className="btn secondary sm"
+                onClick={() => void openTagBatch()}
+                disabled={tagSelection.length === 0 || tagBatchRunning || aiTagging}
+              >
+                {tagBatchRunning ? <Spinner /> : <Icon name="sparkles" className="sm" />}
+                批量打标
+              </button>
+              <span className="hint tag-batch-hint">
+                {aiTagActiveId
+                  ? `正在打标 ${filmSummaries[aiTagActiveId]?.name || "当前图片"}`
+                  : aiTagging
+                    ? "正在为当前图片补充短语"
+                    : `选中 ${tagSelection.length} 张 · 单图 AI 在标注列`}
+              </span>
+              <div className="spacer" />
+              {aiTagProgress ? (
+                <span className="tag-ai-progress">
+                  AI {aiTagProgress.done}/{aiTagProgress.total}
+                </span>
+              ) : null}
               {tagBatchProgress ? (
                 <div
                   className="tag-batch-progress"
@@ -1568,7 +1647,7 @@ export function WorkbenchPage({
                   />
                 </div>
               ) : null}
-            </>
+            </div>
           )}
           <CanvasStage
             asset={detail}
@@ -1583,6 +1662,7 @@ export function WorkbenchPage({
             onChangeCrop={(crop) => updatePlan({ ...plan, crop })}
             active={active}
             croppable={workspace === "crop"}
+            smoothZoom={appSettings.smoothZoom}
           />
         </div>
 
@@ -1646,6 +1726,13 @@ export function WorkbenchPage({
                   saveState={captionSaveState}
                   triggerWord={triggerWord}
                   triggerDisabled={detail.summary.triggerDisabled}
+                  aiModels={tagModels}
+                  aiModel={tagModel}
+                  aiModelsLoading={tagModelsLoading}
+                  aiBusy={aiTagging}
+                  aiNote={aiTagNote}
+                  onAiModelChange={setTagModel}
+                  onAiTag={() => void runAiTagCurrent()}
                   onChange={updateCaption}
                   onToggleTrigger={(disabled) => void toggleTrigger(disabled)}
                   onSaveNow={() => void saveCaptionNow()}
@@ -1655,6 +1742,17 @@ export function WorkbenchPage({
               )}
             </div>
           </div>
+        ) : null}
+        {workspace === "tag" ? (
+          <TagAssist
+            active={active}
+            currentId={currentId}
+            selectedIds={tagSelection}
+            refreshToken={refreshToken}
+            onAddToCurrent={addTagsToCurrent}
+            beforeBulk={saveCaptionNow}
+            onAfterBulk={handleBulkDone}
+          />
         ) : null}
       </div>
 

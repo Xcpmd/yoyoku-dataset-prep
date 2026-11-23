@@ -20,6 +20,7 @@ import {
   Modal,
   Notice,
   Segmented,
+  Select,
   Spinner,
   Toggle,
 } from "../../components/ui";
@@ -76,6 +77,7 @@ export function SettingsPage({ active }: { active: boolean }) {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [pythonPath, setPythonPath] = useState(settings.pythonPath || "");
   const [modelsDir, setModelsDir] = useState(settings.modelsDir || "");
+  const [imageSlots, setImageSlots] = useState(settings.imageSlots || 4);
   const [translateAppId, setTranslateAppId] = useState(settings.baiduTranslateAppId || "");
   const [translateKey, setTranslateKey] = useState(settings.baiduTranslateKey || "");
   const [stats, setStats] = useState<StorageStats | null>(null);
@@ -105,9 +107,16 @@ export function SettingsPage({ active }: { active: boolean }) {
   useEffect(() => {
     setPythonPath(settings.pythonPath || "");
     setModelsDir(settings.modelsDir || "");
+    setImageSlots(settings.imageSlots || 4);
     setTranslateAppId(settings.baiduTranslateAppId || "");
     setTranslateKey(settings.baiduTranslateKey || "");
-  }, [settings.pythonPath, settings.modelsDir, settings.baiduTranslateAppId, settings.baiduTranslateKey]);
+  }, [
+    settings.pythonPath,
+    settings.modelsDir,
+    settings.imageSlots,
+    settings.baiduTranslateAppId,
+    settings.baiduTranslateKey,
+  ]);
 
   const loadModels = useCallback(async () => {
     setModelsLoading(true);
@@ -202,6 +211,7 @@ export function SettingsPage({ active }: { active: boolean }) {
     await updateSettings({
       pythonPath: pythonPath.trim() || null,
       modelsDir: modelsDir.trim() || null,
+      imageSlots: Math.min(8, Math.max(1, Math.round(imageSlots) || 4)),
     });
     notify({ message: S.settings.restartRequired });
     await loadModels();
@@ -411,6 +421,19 @@ export function SettingsPage({ active }: { active: boolean }) {
               </div>
             </div>
             <div className="settings-row">
+              <div className="settings-label">
+                {S.settings.smoothZoom}
+                <small>{S.settings.smoothZoomHint}</small>
+              </div>
+              <div className="settings-control" style={{ maxWidth: 90 }}>
+                <Toggle
+                  checked={settings.smoothZoom}
+                  onChange={(value) => void updateSettings({ smoothZoom: value })}
+                  label=""
+                />
+              </div>
+            </div>
+            <div className="settings-row">
               <div className="settings-label">{S.settings.highContrast}</div>
               <div className="settings-control" style={{ maxWidth: 90 }}>
                 <Toggle
@@ -459,19 +482,19 @@ export function SettingsPage({ active }: { active: boolean }) {
             </Field>
             <div className="grid-2">
               <Field label={S.settings.baseModel} hint={`当前 ${formatNumber(project.counts.total)} 张图片；更改模型不会自动重算处理配方。`}>
-                <select
-                  className="select"
+                <Select
                   value={model}
-                  onChange={(event) => {
-                    const next = event.target.value;
+                  onChange={(next) => {
                     if (project.counts.total > 0 && next !== model) setModelPending(next);
                     else setModel(next);
                   }}
-                >
-                  <option value="sdxl">SDXL（1024 基准）</option>
-                  <option value="sd15">SD 1.5（512 基准）</option>
-                  <option value="custom">自定义</option>
-                </select>
+                  ariaLabel={S.settings.baseModel}
+                  options={[
+                    { value: "sdxl", label: "SDXL（1024 基准）" },
+                    { value: "sd15", label: "SD 1.5（512 基准）" },
+                    { value: "custom", label: "自定义" },
+                  ]}
+                />
               </Field>
               <Field label={S.settings.defaultCaptionMode}>
                 <Segmented
@@ -489,11 +512,16 @@ export function SettingsPage({ active }: { active: boolean }) {
               <input className="input" value={triggerWord} onChange={(event) => setTriggerWord(event.target.value)} />
             </Field>
             <Field label={S.settings.triggerMode}>
-              <select className="select" value={triggerMode} onChange={(event) => setTriggerMode(event.target.value)}>
-                <option value="first">{S.settings.triggerFirst}</option>
-                <option value="prefix">{S.settings.triggerPrefix}</option>
-                <option value="manual">{S.settings.triggerManual}</option>
-              </select>
+              <Select
+                value={triggerMode}
+                onChange={setTriggerMode}
+                ariaLabel={S.settings.triggerMode}
+                options={[
+                  { value: "first", label: S.settings.triggerFirst },
+                  { value: "prefix", label: S.settings.triggerPrefix },
+                  { value: "manual", label: S.settings.triggerManual },
+                ]}
+              />
             </Field>
             <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
               <button type="button" className="btn subtle" onClick={() => void saveProject(false)} disabled={savingProject}>
@@ -724,6 +752,16 @@ export function SettingsPage({ active }: { active: boolean }) {
                     <Icon name="save" />
                   </button>
                 </div>
+              </Field>
+              <Field label="图像处理并发" hint="1–8 个本地图像进程；批量导入时提高可加速，过大占用更多内存，重启后生效。">
+                <input
+                  className="input number"
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={imageSlots}
+                  onChange={(event) => setImageSlots(Number(event.target.value) || 2)}
+                />
               </Field>
             </div>
             <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>

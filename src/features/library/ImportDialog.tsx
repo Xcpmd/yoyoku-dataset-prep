@@ -5,7 +5,7 @@ import { useProject } from "../../app/ProjectContext";
 import { S } from "../../lib/strings";
 import { classNames, formatBytes, formatNumber, shortPath } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
-import { Badge, Field, Modal, Notice, Segmented, Spinner, Toggle } from "../../components/ui";
+import { Badge, Field, Modal, Notice, Segmented, Select, Spinner, Toggle } from "../../components/ui";
 
 interface Props {
   open: boolean;
@@ -244,19 +244,24 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
               hint="同一分组的图片在裁剪页共享目标尺寸；也可以稍后在裁剪页调整。"
             >
               <div className="stack" style={{ gap: 8 }}>
-                <select
-                  className="select"
+                <Select
                   value={collectionId}
-                  onChange={(event) => setCollectionId(event.target.value)}
-                >
-                  <option value="">不分组</option>
-                  {collections.filter((item) => item.kind !== "query").map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name}（{item.count}）
-                      {item.targetWidth && item.targetHeight ? ` · ${item.targetWidth}×${item.targetHeight}` : ""}
-                    </option>
-                  ))}
-                </select>
+                  onChange={setCollectionId}
+                  ariaLabel="导入分组"
+                  options={[
+                    { value: "", label: "不分组" },
+                    ...collections
+                      .filter((item) => item.kind !== "query")
+                      .map((item) => ({
+                        value: item.id,
+                        label: item.name,
+                        hint:
+                          item.targetWidth && item.targetHeight
+                            ? `${item.targetWidth}×${item.targetHeight}`
+                            : item.count,
+                      })),
+                  ]}
+                />
                 <div className="input-row">
                   <input
                     className="input"

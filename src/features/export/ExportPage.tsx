@@ -93,6 +93,7 @@ export function ExportPage({ active }: { active: boolean }) {
       longestEdge: base,
       allowUpscale: false,
       background: "#ffffff",
+      fillTransparent: true,
       resample: "lanczos",
     },
     kohya: {
@@ -263,7 +264,13 @@ export function ExportPage({ active }: { active: boolean }) {
   const applyPreset = (name: string) => {
     const preset = presets.find((item) => item.name === name);
     if (!preset) return;
-    setConfig(preset.config);
+    setConfig({
+      ...preset.config,
+      size: {
+        ...preset.config.size,
+        fillTransparent: preset.config.size.fillTransparent !== false,
+      },
+    });
     setPreview(null);
     setResult(null);
     setStep(0);
@@ -721,6 +728,26 @@ export function ExportPage({ active }: { active: boolean }) {
                           }))
                         }
                         style={{ width: 48, height: 38, border: "1px solid var(--line-strong)", borderRadius: 8, background: "var(--surface)" }}
+                      />
+                    </Field>
+                    <Field
+                      label="填充透明背景"
+                      hint={
+                        config.imageFormat === "jpg"
+                          ? "JPEG 没有透明通道，导出时始终填充为白色。"
+                          : "导出时将透明像素合成到白色；关闭后 PNG 保留透明通道。"
+                      }
+                    >
+                      <Toggle
+                        checked={config.size.fillTransparent || config.imageFormat === "jpg"}
+                        disabled={config.imageFormat === "jpg"}
+                        onChange={(value) =>
+                          patchConfig((current) => ({
+                            ...current,
+                            size: { ...current.size, fillTransparent: value },
+                          }))
+                        }
+                        label="填充为白色"
                       />
                     </Field>
                     {config.size.mode === "preserve" ? (

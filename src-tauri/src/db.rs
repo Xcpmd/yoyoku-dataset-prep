@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS assets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(content_hash);
+CREATE INDEX IF NOT EXISTS idx_assets_source_path ON assets(source_root_id, rel_path);
 CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(review_status);
 CREATE INDEX IF NOT EXISTS idx_assets_sort ON assets(sort_index);
 
@@ -258,7 +259,7 @@ pub fn open_connection(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path).map_err(AppError::sql)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(AppError::sql)?;
-    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")
         .map_err(AppError::sql)?;
     Ok(conn)
 }
@@ -300,6 +301,10 @@ pub fn migrate(conn: &mut Connection, backup_dir: &Path) -> AppResult<u32> {
         if version < 4 {
             conn.execute_batch(TAG_STATE_SCHEMA_SQL).map_err(AppError::sql)?;
         }
+        // 批量导入按来源根目录 + 相对路径查重；老项目打开时补建索引。
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_assets_source_path ON assets(source_root_id, rel_path);",
+        );
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(AppError::sql)?;
     }

@@ -22,6 +22,8 @@ interface Props {
   active: boolean;
   /** 裁剪页可拖拽裁框；打标页只看图与对比，避免误改裁剪。 */
   croppable?: boolean;
+  /** 平滑缩放画布；捏合手势期间自动关闭，避免跟手延迟。 */
+  smoothZoom?: boolean;
 }
 
 type Gesture =
@@ -46,6 +48,7 @@ export function CanvasStage({
   onChangeCrop,
   active,
   croppable = true,
+  smoothZoom = true,
 }: Props) {
   const stageRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<HTMLDivElement>(null);
@@ -55,6 +58,7 @@ export function CanvasStage({
   const [autoFit, setAutoFit] = useState(true);
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [panning, setPanning] = useState(false);
+  const [pinching, setPinching] = useState(false);
   // 记录“哪张素材已载入/失败”而不是单纯布尔值：切换页面时缓存图片可能在
   // effect 重置前就触发 onLoad，布尔值被重置后会一直停在载入态。
   const [imageState, setImageState] = useState<{ id: string; status: "loaded" | "failed" } | null>(null);
@@ -193,6 +197,7 @@ export function CanvasStage({
       if (event.touches.length === 2) {
         event.preventDefault();
         gestureRef.current = null;
+        setPinching(true);
         pinchRef.current = {
           distance: distance(event.touches),
           zoom,
@@ -210,6 +215,7 @@ export function CanvasStage({
     };
     const onEnd = () => {
       if (pinchRef.current) pinchRef.current = null;
+      setPinching(false);
     };
     stage.addEventListener("touchstart", onStart, { passive: false });
     stage.addEventListener("touchmove", onMove, { passive: false });
@@ -528,7 +534,11 @@ export function CanvasStage({
         ) : (
           <div className="canvas-scroll">
             <div
-              className={classNames("canvas-world", background === "checker" && "checker")}
+              className={classNames(
+                "canvas-world",
+                background === "checker" && "checker",
+                smoothZoom && !pinching && "smooth-zoom",
+              )}
               ref={worldRef}
               style={{
                 width: worldWidth,

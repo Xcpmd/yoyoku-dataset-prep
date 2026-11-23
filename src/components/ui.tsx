@@ -569,6 +569,211 @@ export function Dropdown({
   );
 }
 
+export interface SelectOption {
+  value: string;
+  label: ReactNode;
+  hint?: ReactNode;
+  disabled?: boolean;
+}
+
+/**
+ * 自绘下拉选择器，替代原生的系统弹层，保证菜单与全站 Apple 风格一致。
+ */
+export function Select({
+  value,
+  options,
+  onChange,
+  placeholder = "请选择",
+  ariaLabel,
+  className,
+  disabled,
+  title,
+}: {
+  value: string;
+  options: SelectOption[];
+  onChange: (value: string) => void;
+  placeholder?: string;
+  ariaLabel?: string;
+  className?: string;
+  disabled?: boolean;
+  title?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<{
+    top?: number;
+    bottom?: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+  }>({ left: 0, width: 180, maxHeight: 320 });
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const selected = options.find((option) => option.value === value);
+  const close = useCallback((restoreFocus: boolean) => {
+    setOpen(false);
+    if (restoreFocus) triggerRef.current?.focus();
+  }, []);
+
+  const openMenu = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const width = Math.max(rect.width, 180);
+    let left = rect.left;
+    left = Math.min(Math.max(8, left), window.innerWidth - width - 8);
+    const spaceBelow = window.innerHeight - rect.bottom - 10;
+    const spaceAbove = rect.top - 10;
+    if (spaceBelow < 220 && spaceAbove > spaceBelow) {
+      setPosition({
+        bottom: window.innerHeight - rect.top + 6,
+        left,
+        width,
+        maxHeight: Math.max(180, Math.min(spaceAbove, 360)),
+      });
+    } else {
+      setPosition({
+        top: rect.bottom + 6,
+        left,
+        width,
+        maxHeight: Math.max(180, Math.min(spaceBelow, 360)),
+      });
+    }
+    setOpen(true);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (menuRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
+      close(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        event.preventDefault();
+        close(true);
+      }
+    };
+    const onScroll = (event: Event) => {
+      const target = event.target as Node | null;
+      if (target && menuRef.current?.contains(target)) return;
+      close(false);
+    };
+    const onResize = () => close(false);
+    document.addEventListener("pointerdown", onPointer, true);
+    document.addEventListener("keydown", onKey, true);
+    document.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onResize);
+    const timer = window.setTimeout(() => {
+      const preferred =
+        menuRef.current?.querySelector<HTMLElement>(".select-option.selected") ||
+        menuRef.current?.querySelector<HTMLElement>(".select-option:not([disabled])");
+      preferred?.focus();
+      preferred?.scrollIntoView({ block: "nearest" });
+    }, 20);
+    return () => {
+      document.removeEventListener("pointerdown", onPointer, true);
+      document.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
+      window.clearTimeout(timer);
+    };
+  }, [open, close]);
+
+  const onMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLElement>(".select-option:not([disabled])") || [],
+    );
+    if (items.length === 0) return;
+    const index = items.indexOf(document.activeElement as HTMLElement);
+    let next = 0;
+    if (event.key === "ArrowDown") next = (index + 1) % items.length;
+    if (event.key === "ArrowUp") next = (index - 1 + items.length) % items.length;
+    if (event.key === "End") next = items.length - 1;
+    items[next]?.focus();
+  };
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={classNames("select", "select-trigger", open && "open", className)}
+        disabled={disabled}
+        title={title}
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => (open ? close(false) : openMenu())}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            if (!open) openMenu();
+          }
+        }}
+      >
+        <span className={classNames("select-label", !selected && "placeholder")}>
+          {selected ? selected.label : placeholder}
+        </span>
+        <Icon name="chevron-down" className="sm select-chevron" />
+      </button>
+      {open
+        ? createPortal(
+            <div
+              ref={menuRef}
+              className="select-pop"
+              role="listbox"
+              aria-label={ariaLabel}
+              style={{
+                position: "fixed",
+                top: position.top,
+                bottom: position.bottom,
+                left: position.left,
+                width: position.width,
+                maxHeight: position.maxHeight,
+                overflowY: "auto",
+                zIndex: 130,
+              }}
+              onKeyDown={onMenuKeyDown}
+            >
+              {options.length === 0 ? (
+                <div className="select-empty">{placeholder}</div>
+              ) : (
+                options.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="option"
+                    aria-selected={option.value === value}
+                    disabled={option.disabled}
+                    className={classNames(
+                      "select-option",
+                      option.value === value && "selected",
+                    )}
+                    onClick={() => {
+                      onChange(option.value);
+                      close(true);
+                    }}
+                  >
+                    <span className="select-option-label">{option.label}</span>
+                    {option.hint ? <span className="select-option-hint">{option.hint}</span> : null}
+                    {option.value === value ? (
+                      <Icon name="check" className="sm select-option-check" />
+                    ) : null}
+                  </button>
+                ))
+              )}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
 export function MenuItem({
   icon,
   children,
@@ -576,8 +781,7 @@ export function MenuItem({
   danger,
   disabled,
   hint,
-}: {
-  icon?: IconName;
+}: {  icon?: IconName;
   children: ReactNode;
   onClick?: () => void;
   danger?: boolean;

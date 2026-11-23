@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, normalizeError } from "../../lib/api";
-import type { CaptionMode, PromptLibraryEntry } from "../../lib/types";
+import type { CaptionMode, ModelInfo, PromptLibraryEntry } from "../../lib/types";
 import { useProject } from "../../app/ProjectContext";
 import { S } from "../../lib/strings";
 import { classNames, normalizeKey, normalizeTagList, splitCaption } from "../../lib/utils";
@@ -14,7 +14,7 @@ import {
   type PromptLibrary,
 } from "../../lib/promptDictionary";
 import { Icon } from "../../components/Icon";
-import { Dropdown, MenuItem, MenuLabel, Notice, Segmented, Spinner } from "../../components/ui";
+import { Dropdown, MenuItem, MenuLabel, Notice, Segmented, Select, Spinner } from "../../components/ui";
 
 export type CaptionSaveState = "idle" | "saving" | "saved" | "error" | "dirty";
 type PhraseView = "sort" | "group";
@@ -29,6 +29,13 @@ interface Props {
   saveState: CaptionSaveState;
   triggerWord: string;
   triggerDisabled: boolean;
+  aiModels: ModelInfo[];
+  aiModel: string;
+  aiModelsLoading: boolean;
+  aiBusy: boolean;
+  aiNote: string | null;
+  onAiModelChange: (value: string) => void;
+  onAiTag: () => void;
   onChange: (patch: { mode?: CaptionMode; tags?: string[]; text?: string }) => void;
   onToggleTrigger: (disabled: boolean) => void;
   onSaveNow: () => void;
@@ -47,6 +54,13 @@ export function CaptionPanel({
   saveState,
   triggerWord,
   triggerDisabled,
+  aiModels,
+  aiModel,
+  aiModelsLoading,
+  aiBusy,
+  aiNote,
+  onAiModelChange,
+  onAiTag,
   onChange,
   onToggleTrigger,
   onSaveNow,
@@ -746,25 +760,58 @@ export function CaptionPanel({
         <p className="hint" style={{ marginTop: 6 }}>
           短语与自然语言描述都显示为短语，并一起参与翻译；触发词由项目设置自动添加到导出文本开头。
         </p>
+        <div className="caption-ai-row">
+          <span className="caption-ai-label">
+            <Icon name="sparkles" className="sm" />
+            AI 打标
+          </span>
+          <Select
+            className="caption-ai-select"
+            value={aiModel}
+            onChange={onAiModelChange}
+            ariaLabel="AI 打标模型"
+            disabled={aiBusy || aiModelsLoading || aiModels.length === 0}
+            placeholder={aiModelsLoading ? "正在读取模型…" : "未找到模型"}
+            title={aiModels.find((item) => item.id === aiModel)?.name || "选择 AI 打标模型"}
+            options={aiModels.map((item) => ({
+              value: item.id,
+              label: `${item.name}${item.kind === "caption" ? "（自然语言）" : ""}`,
+            }))}
+          />
+          <button
+            type="button"
+            className="btn secondary sm"
+            onClick={onAiTag}
+            disabled={aiBusy || !aiModel || aiModels.length === 0}
+            title="用所选模型为当前图片补充短语，重复项自动剔除"
+          >
+            {aiBusy ? <Spinner /> : null}
+            {aiBusy ? "打标中" : "补充短语"}
+          </button>
+        </div>
+        {aiNote ? (
+          <div className="caption-ai-note">
+            <Icon name="check" className="sm" />
+            {aiNote}
+          </div>
+        ) : null}
       </div>
 
       <section className="caption-field">
         <div className="caption-field-head">
           <span className="caption-field-title">短语</span>
           <div className="row" style={{ gap: 8 }}>
-            <select
-              className="select phrase-category-select"
+            <Select
+              className="phrase-category-select"
               value={categoryFilter}
-              onChange={(event) => setCategoryFilter(event.target.value)}
+              onChange={setCategoryFilter}
+              ariaLabel="按提示词库主分类筛选补全建议"
               title="按提示词库主分类筛选补全建议"
-            >
-              <option value="">全部分类</option>
-              {library.categories.map((category) => (
-                <option key={category} value={category}>
-                  {category}
-                </option>
-              ))}
-            </select>
+              options={[
+                { value: "", label: "全部分类" },
+                ...library.categories.map((category) => ({ value: category, label: category })),
+              ]}
+            />
             <span className="caption-stats">
               {phrases.length} 条
               {disabledTags.length > 0 ? ` · ${disabledTags.length} 停用` : ""}

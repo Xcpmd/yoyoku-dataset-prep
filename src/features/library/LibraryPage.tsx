@@ -28,10 +28,12 @@ import {
   MenuSeparator,
   PromptDialog,
   Segmented,
+  Select,
   Spinner,
   Toggle,
 } from "../../components/ui";
 import { ImportDialog } from "./ImportDialog";
+import { DedupeDialog } from "./DedupeDialog";
 import { Inspector } from "./Inspector";
 import { BatchDialog } from "./BatchDialog";
 
@@ -96,6 +98,7 @@ export function LibraryPage({ active }: { active: boolean }) {
   const [inspectorWidth, setInspectorWidth] = useState(settings.inspectorWidth || 336);
   const [importOpen, setImportOpen] = useState(false);
   const [importPaths, setImportPaths] = useState<string[]>([]);
+  const [dedupeOpen, setDedupeOpen] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
   const [excludeTargets, setExcludeTargets] = useState<string[] | null>(null);
   const [collectionPrompt, setCollectionPrompt] = useState<"new" | "smart" | null>(null);
@@ -682,6 +685,9 @@ export function LibraryPage({ active }: { active: boolean }) {
     if (filter.hasDraft) {
       chips.push({ key: "draft", label: S.library.filterDraft, remove: () => setFilter({ ...filter, hasDraft: false }) });
     }
+    if (filter.recycledOnly) {
+      chips.push({ key: "recycled", label: "回收区", remove: () => setFilter({ ...filter, recycledOnly: false }) });
+    }
     if (filter.minShortEdge) {
       chips.push({ key: "minEdge", label: `短边 ≥ ${filter.minShortEdge}`, remove: () => setFilter({ ...filter, minShortEdge: null }) });
     }
@@ -731,6 +737,10 @@ export function LibraryPage({ active }: { active: boolean }) {
               active={inspectorOpen}
               onClick={() => setInspectorOpen((value) => !value)}
             />
+            <button type="button" className="btn subtle" onClick={() => setDedupeOpen(true)}>
+              <Icon name="copy" />
+              去重
+            </button>
             <button type="button" className="btn primary" onClick={() => { setImportPaths([]); setImportOpen(true); }}>
               <Icon name="import" />
               {S.library.import}
@@ -879,36 +889,38 @@ export function LibraryPage({ active }: { active: boolean }) {
 
                   <div className="filter-section">
                     <div className="filter-title">{S.library.filterCollection}</div>
-                    <select
-                      className="select"
+                    <Select
                       value={filterDraft.collectionIds[0] || ""}
-                      onChange={(event) =>
-                        setFilterDraft({ ...filterDraft, collectionIds: event.target.value ? [event.target.value] : [] })
+                      onChange={(value) =>
+                        setFilterDraft({ ...filterDraft, collectionIds: value ? [value] : [] })
                       }
-                    >
-                      <option value="">{S.library.filterAny}</option>
-                      {collections.map((collection) => (
-                        <option key={collection.id} value={collection.id}>
-                          {collection.name}（{collection.count}）
-                        </option>
-                      ))}
-                    </select>
+                      ariaLabel={S.library.filterCollection}
+                      options={[
+                        { value: "", label: S.library.filterAny },
+                        ...collections.map((collection) => ({
+                          value: collection.id,
+                          label: collection.name,
+                          hint: collection.count,
+                        })),
+                      ]}
+                    />
                     <div className="filter-title" style={{ marginTop: 8 }}>{S.library.filterSplit}</div>
-                    <select
-                      className="select"
+                    <Select
                       value={filterDraft.split || ""}
-                      onChange={(event) =>
+                      onChange={(value) =>
                         setFilterDraft({
                           ...filterDraft,
-                          split: (event.target.value || null) as AssetFilter["split"],
+                          split: (value || null) as AssetFilter["split"],
                         })
                       }
-                    >
-                      <option value="">{S.library.filterAny}</option>
-                      <option value="train">{S.library.splitTrain}</option>
-                      <option value="val">{S.library.splitVal}</option>
-                      <option value="unassigned">{S.library.splitUnassigned}</option>
-                    </select>
+                      ariaLabel={S.library.filterSplit}
+                      options={[
+                        { value: "", label: S.library.filterAny },
+                        { value: "train", label: S.library.splitTrain },
+                        { value: "val", label: S.library.splitVal },
+                        { value: "unassigned", label: S.library.splitUnassigned },
+                      ]}
+                    />
                   </div>
 
                   <div className="filter-section">
@@ -926,6 +938,11 @@ export function LibraryPage({ active }: { active: boolean }) {
                       checked={filterDraft.hasDraft}
                       onChange={(value) => setFilterDraft({ ...filterDraft, hasDraft: value })}
                       label={S.library.filterDraft}
+                    />
+                    <Toggle
+                      checked={filterDraft.recycledOnly}
+                      onChange={(value) => setFilterDraft({ ...filterDraft, recycledOnly: value })}
+                      label="回收区"
                     />
                   </div>
                 </div>
@@ -1005,6 +1022,17 @@ export function LibraryPage({ active }: { active: boolean }) {
                 >
                   {S.library.smartRecent}
                 </MenuItem>
+                <MenuSeparator />
+                <MenuItem
+                  icon="trash"
+                  onClick={() => {
+                    close();
+                    setFilter({ ...emptyFilter(), recycledOnly: true });
+                  }}
+                  hint={filter.recycledOnly ? "✓" : undefined}
+                >
+                  回收区
+                </MenuItem>
                 {collections.length > 0 ? <MenuSeparator /> : null}
                 {collections.map((collection) => (
                   <MenuItem
@@ -1049,23 +1077,24 @@ export function LibraryPage({ active }: { active: boolean }) {
 
           <div className="toolbar-divider" />
 
-          <select
-            className="select"
-            aria-label={S.library.sort}
+          <Select
+            className="sort-select"
+            ariaLabel={S.library.sort}
             value={`${sort.field}:${sort.direction}`}
-            onChange={(event) => {
-              const [field, direction] = event.target.value.split(":");
+            onChange={(value) => {
+              const [field, direction] = value.split(":");
               setSort({ field: field as AssetSort["field"], direction: direction as AssetSort["direction"] });
             }}
-          >
-            <option value="import:asc">{S.library.sortImport}</option>
-            <option value="name:asc">{S.library.sortName} A–Z</option>
-            <option value="name:desc">{S.library.sortName} Z–A</option>
-            <option value="edge:desc">{S.library.sortEdge} ↓</option>
-            <option value="edge:asc">{S.library.sortEdge} ↑</option>
-            <option value="status:asc">{S.library.sortStatus}</option>
-            <option value="date:desc">{S.library.smartRecent}</option>
-          </select>
+            options={[
+              { value: "import:asc", label: S.library.sortImport },
+              { value: "name:asc", label: `${S.library.sortName} A–Z` },
+              { value: "name:desc", label: `${S.library.sortName} Z–A` },
+              { value: "edge:desc", label: `${S.library.sortEdge} ↓` },
+              { value: "edge:asc", label: `${S.library.sortEdge} ↑` },
+              { value: "status:asc", label: S.library.sortStatus },
+              { value: "date:desc", label: S.library.smartRecent },
+            ]}
+          />
 
           <Segmented
             compact
@@ -1411,6 +1440,14 @@ export function LibraryPage({ active }: { active: boolean }) {
         }}
       />
       <BatchDialog open={batchOpen} onClose={() => setBatchOpen(false)} assetNames={assetNames} />
+      <DedupeDialog
+        open={dedupeOpen}
+        onClose={() => setDedupeOpen(false)}
+        onChanged={() => {
+          bumpRefresh();
+          void loadFirst();
+        }}
+      />
 
       <PromptDialog
         open={excludeTargets !== null}

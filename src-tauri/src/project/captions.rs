@@ -66,7 +66,7 @@ fn clean_tag_state_values(values: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     for value in values {
         let tag = value.trim();
-        if tag.is_empty() || tag.chars().count() > 200 {
+        if tag.is_empty() || tag.chars().count() > 2000 {
             continue;
         }
         if seen.insert(tag.to_string()) {
@@ -116,6 +116,427 @@ pub fn tag_state_set(project: &Project, asset_id: &str, state: &TagState) -> App
         ],
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagTotalEntry {
+    pub tag: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagTotalsResult {
+    pub target_assets: i64,
+    pub tagged_assets: i64,
+    pub tags: Vec<TagTotalEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagBulkRequest {
+    /// 空数组表示作用于项目内全部图片。
+    #[serde(default)]
+    pub asset_ids: Vec<String>,
+    pub action: String,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagBulkResult {
+    pub action: String,
+    pub total_assets: i64,
+    pub changed_assets: i64,
+    pub skipped_assets: i64,
+    pub history_seq: Option<i64>,
+}
+
+struct BulkTarget {
+    asset: AssetRow,
+    mode: String,
+    tags: Vec<String>,
+    text: String,
+}
+
+fn is_tag_mode(mode: &str) -> bool {
+    matches!(mode, "tags" | "mixed")
+}
+
+fn append_unique(list: &mut Vec<String>, values: &[String]) -> usize {
+    let mut seen: std::collections::HashSet<String> =
+        list.iter().map(|tag| caption::normalize_key(tag)).collect();
+    let mut added = 0;
+    for value in values {
+        let key = caption::normalize_key(value);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        list.push(value.clone());
+        added += 1;
+    }
+    added
+}
+
+/// 就地替换短语，保留首次出现的位置；目标短语已存在时只删除旧短语，避免重复。
+fn replace_tag(list: &mut Vec<String>, from: &str, to: &str) -> bool {
+    let from_key = caption::normalize_key(from);
+    if from_key.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let key = caption::normalize_key(item);
+        if key == from_key {
+            changed = true;
+            if !seen.insert(caption::normalize_key(to)) {
+                continue;
+            }
+            result.push(to.to_string());
+        } else {
+            if !seen.insert(key) {
+                changed = true;
+                continue;
+            }
+            result.push(item.clone());
+        }
+    }
+    *list = result;
+    changed
+}
+
+fn scope_ids_json(asset_ids: &[String]) -> (String, i64) {
+    let scoped = !asset_ids.is_empty();
+    let json = serde_json::to_string(asset_ids).unwrap_or_else(|_| "[]".into());
+    (json, if scoped { 1 } else { 0 })
+}
+
+/// 统计范围内的提示词出现次数。只统计短语模式（tags / mixed），
+/// 自然语言模式的 tags_json 不参与展示，避免统计到未写入标注的旧标签。
+pub fn tag_totals(project: &Project, asset_ids: &[String]) -> AppResult<TagTotalsResult> {
+    let conn = project.conn();
+    let (ids_json, scoped) = scope_ids_json(asset_ids);
+    let target_assets: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assets WHERE (?2 = 0 OR id IN (SELECT value FROM json_each(?1)))",
+        params![ids_json, scoped],
+        |row| row.get(0),
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT c.mode, c.tags_json FROM assets a
+         JOIN caption_revisions c ON c.id = a.caption_revision_id
+         WHERE (?2 = 0 OR a.id IN (SELECT value FROM json_each(?1)))",
+    )?;
+    let rows = statement.query_map(params![ids_json, scoped], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    struct Acc {
+        count: i64,
+        displays: std::collections::HashMap<String, i64>,
+    }
+    let mut acc: std::collections::BTreeMap<String, Acc> = std::collections::BTreeMap::new();
+    let mut tagged_assets = 0i64;
+    for row in rows {
+        let (mode, tags_json) = row?;
+        if !is_tag_mode(&mode) {
+            continue;
+        }
+        tagged_assets += 1;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        for raw in tags {
+            let tag = raw.trim();
+            let key = caption::normalize_key(tag);
+            if key.is_empty() || !seen.insert(key.clone()) {
+                continue;
+            }
+            let entry = acc.entry(key).or_insert_with(|| Acc {
+                count: 0,
+                displays: std::collections::HashMap::new(),
+            });
+            entry.count += 1;
+            *entry.displays.entry(tag.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut tags: Vec<TagTotalEntry> = acc
+        .into_iter()
+        .map(|(key, entry)| {
+            let display = entry
+                .displays
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(tag, _)| tag)
+                .unwrap_or(key);
+            TagTotalEntry { tag: display, count: entry.count }
+        })
+        .collect();
+    tags.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
+            .then_with(|| a.tag.cmp(&b.tag))
+    });
+    let truncated = tags.len() > 5000;
+    tags.truncate(5000);
+    Ok(TagTotalsResult { target_assets, tagged_assets, tags, truncated })
+}
+
+/// 批量新增 / 重命名 / 删除短语。所有改动写入同一条历史记录，可一次撤销。
+pub fn tag_bulk(project: &Project, request: &TagBulkRequest) -> AppResult<TagBulkResult> {
+    let action = request.action.trim();
+    let values = caption::normalize_tags(request.tags.iter().cloned());
+    let from = request.from.trim().to_string();
+    let to = request.to.trim().to_string();
+    match action {
+        "add" | "remove" if values.is_empty() => {
+            return Err(AppError::new("INVALID_TAGS", "请填写要处理的提示词"));
+        }
+        "rename" if from.is_empty() || to.is_empty() => {
+            return Err(AppError::new("INVALID_TAGS", "请填写原提示词和新提示词"));
+        }
+        "add" | "remove" | "rename" => {}
+        _ => return Err(AppError::new("INVALID_ACTION", "未知的批量操作")),
+    }
+    if from.chars().count() > 2000 || to.chars().count() > 2000 {
+        return Err(AppError::new("INVALID_TAGS", "提示词长度不能超过 2000 个字符"));
+    }
+    if values.len() > 500 {
+        return Err(AppError::new("INVALID_TAGS", "单次最多处理 500 条提示词"));
+    }
+
+    let mut conn = project.conn();
+    let (ids_json, scoped) = scope_ids_json(&request.asset_ids);
+    let total_assets: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assets WHERE (?2 = 0 OR id IN (SELECT value FROM json_each(?1)))",
+        params![ids_json, scoped],
+        |row| row.get(0),
+    )?;
+    if total_assets == 0 {
+        return Ok(TagBulkResult {
+            action: action.into(),
+            total_assets: 0,
+            changed_assets: 0,
+            skipped_assets: 0,
+            history_seq: None,
+        });
+    }
+
+    let default_mode = project.default_caption_mode(&conn);
+    let targets: Vec<BulkTarget> = {
+        let sql = format!(
+            "SELECT {columns}, c.mode, c.tags_json, c.text
+             FROM assets a
+             LEFT JOIN caption_revisions c ON c.id = a.caption_revision_id
+             WHERE (?2 = 0 OR a.id IN (SELECT value FROM json_each(?1)))
+             ORDER BY a.sort_index ASC, a.id ASC",
+            columns = db::ASSET_COLUMNS
+                .split(", ")
+                .map(|column| format!("a.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params![ids_json, scoped], |row| {
+            let asset = db::asset_row(row)?;
+            let mode: Option<String> = row.get(42)?;
+            let tags_json: Option<String> = row.get(43)?;
+            let text: Option<String> = row.get(44)?;
+            Ok(BulkTarget {
+                asset,
+                mode: mode.unwrap_or_else(|| default_mode.clone()),
+                tags: tags_json
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default(),
+                text: text.unwrap_or_default(),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let now = util::now_iso();
+    let tx = conn.transaction()?;
+    let mut before_state = HistoryState::default();
+    let mut after_state = HistoryState::default();
+    let mut changed_ids: Vec<String> = Vec::new();
+    let mut changed_assets = 0i64;
+    let mut skipped_assets = 0i64;
+    let value_keys: std::collections::HashSet<String> =
+        values.iter().map(|value| caption::normalize_key(value)).collect();
+
+    for target in &targets {
+        let mut tags = target.tags.clone();
+        let mode = target.mode.clone();
+        let mut dirty = false;
+        match action {
+            "add" => {
+                if !is_tag_mode(&mode) {
+                    // 自然语言模式的 tags_json 不参与输出；新增短语时必须转换模式，
+                    // 即使旧 tags_json 里已经存在同名项也要让短语真正可见。
+                    append_unique(&mut tags, &values);
+                    dirty = true;
+                } else if append_unique(&mut tags, &values) > 0 {
+                    dirty = true;
+                }
+            }
+            "remove" => {
+                if !is_tag_mode(&mode) {
+                    skipped_assets += 1;
+                    continue;
+                }
+                let before = tags.len();
+                tags.retain(|tag| !value_keys.contains(&caption::normalize_key(tag)));
+                dirty = tags.len() != before;
+            }
+            "rename" => {
+                if !is_tag_mode(&mode) {
+                    skipped_assets += 1;
+                    continue;
+                }
+                dirty = replace_tag(&mut tags, &from, &to);
+            }
+            _ => unreachable!(),
+        }
+        if !dirty {
+            skipped_assets += 1;
+            continue;
+        }
+        let mut next_mode = mode;
+        if action == "add" && !is_tag_mode(&next_mode) {
+            // 自然语言模式新增短语后转为混合模式，正文保持原样。
+            next_mode = if target.text.trim().is_empty() { "tags".into() } else { "mixed".into() };
+        }
+
+        // 先记录改动前的完整状态（含分组顺序 / 停用项），供撤销恢复。
+        before_state
+            .assets
+            .push(history::snapshot_row_with_tag_state(&tx, &target.asset)?);
+
+        // 保持分组视图的完整顺序 / 停用列表与文件内容同步。
+        let state: Option<(String, String)> = tx
+            .query_row(
+                "SELECT order_json, disabled_json FROM caption_tag_state WHERE asset_id = ?1",
+                params![target.asset.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((order_json, disabled_json)) = state {
+            let mut order: Vec<String> = serde_json::from_str(&order_json).unwrap_or_default();
+            let mut disabled: Vec<String> = serde_json::from_str(&disabled_json).unwrap_or_default();
+            let mut state_changed = false;
+            match action {
+                "add" => {
+                    if append_unique(&mut order, &values) > 0 {
+                        state_changed = true;
+                    }
+                    let before = disabled.len();
+                    disabled.retain(|tag| !value_keys.contains(&caption::normalize_key(tag)));
+                    state_changed |= disabled.len() != before;
+                }
+                "remove" => {
+                    let before = order.len() + disabled.len();
+                    order.retain(|tag| !value_keys.contains(&caption::normalize_key(tag)));
+                    disabled.retain(|tag| !value_keys.contains(&caption::normalize_key(tag)));
+                    state_changed = order.len() + disabled.len() != before;
+                }
+                "rename" => {
+                    state_changed |= replace_tag(&mut order, &from, &to);
+                    state_changed |= replace_tag(&mut disabled, &from, &to);
+                }
+                _ => {}
+            }
+            if state_changed {
+                tx.execute(
+                    "UPDATE caption_tag_state SET order_json = ?1, disabled_json = ?2, updated_at = ?3
+                     WHERE asset_id = ?4",
+                    params![
+                        serde_json::to_string(&order)?,
+                        serde_json::to_string(&disabled)?,
+                        now,
+                        target.asset.id
+                    ],
+                )?;
+            }
+        }
+
+        let revision_no: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(revision_no),0) + 1 FROM caption_revisions WHERE asset_id = ?1",
+            params![target.asset.id],
+            |row| row.get(0),
+        )?;
+        let revision_id = util::new_id();
+        let search = caption::search_text(&next_mode, &tags, &target.text);
+        tx.execute(
+            "INSERT INTO caption_revisions(id, asset_id, revision_no, mode, tags_json, text, source, status,
+                parent_id, model_json, search_text, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'bulk', 'active', ?7, '{}', ?8, ?9)",
+            params![
+                revision_id,
+                target.asset.id,
+                revision_no,
+                next_mode,
+                serde_json::to_string(&tags)?,
+                target.text,
+                target.asset.caption_revision_id,
+                search,
+                now
+            ],
+        )?;
+        let (next_status, _) = history::review_reset_on_change(&target.asset.review_status);
+        tx.execute(
+            "UPDATE assets SET caption_revision_id = ?1, revision = revision + 1, last_human_at = ?2,
+                review_status = CASE WHEN review_status = 'approved' THEN ?3 ELSE review_status END
+             WHERE id = ?4",
+            params![revision_id, now, next_status, target.asset.id],
+        )?;
+        let mut updated = target.asset.clone();
+        updated.caption_revision_id = Some(revision_id);
+        updated.revision += 1;
+        updated.last_human_at = Some(now.clone());
+        if !next_status.is_empty() {
+            updated.review_status = next_status.to_string();
+        }
+        after_state
+            .assets
+            .push(history::snapshot_row_with_tag_state(&tx, &updated)?);
+        changed_ids.push(target.asset.id.clone());
+        changed_assets += 1;
+    }
+
+    let history_seq = if changed_assets > 0 {
+        db::mark_quality_stale(&tx)?;
+        let label = match action {
+            "add" => format!("批量添加提示词（{changed_assets} 张）"),
+            "remove" => format!("批量删除提示词（{changed_assets} 张）"),
+            _ => format!("批量重命名提示词（{changed_assets} 张）"),
+        };
+        Some(history::record(
+            &tx,
+            "caption.bulk",
+            &label,
+            &changed_ids,
+            &before_state,
+            &after_state,
+            None,
+        )?)
+    } else {
+        None
+    };
+    tx.commit()?;
+    Ok(TagBulkResult {
+        action: action.into(),
+        total_assets,
+        changed_assets,
+        skipped_assets,
+        history_seq,
+    })
 }
 
 fn project_trigger(conn: &rusqlite::Connection) -> AppResult<(String, String)> {

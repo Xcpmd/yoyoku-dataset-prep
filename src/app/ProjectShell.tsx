@@ -4,7 +4,7 @@ import { useRoot } from "./AppProvider";
 import { ProjectProvider, type LibraryView } from "./ProjectContext";
 import type { AssetFilter, AssetSort, CollectionInfo, JobInfo } from "../lib/types";
 import { api, normalizeError } from "../lib/api";
-import { emptyFilter } from "../lib/utils";
+import { classNames, emptyFilter } from "../lib/utils";
 import { S } from "../lib/strings";
 import { Icon, type IconName } from "../components/Icon";
 import { Badge, ConfirmDialog, Dropdown, IconButton, MenuItem, MenuLabel, MenuSeparator } from "../components/ui";
@@ -67,6 +67,13 @@ export function ProjectShell() {
   const [cropMode, setCropModeState] = useState<CropMode>(initialCropMode);
   // 单图裁剪页沿用原工作台；首次进入后再挂载，切回瀑布流时保持挂载以便草稿落盘。
   const [cropWorkbenchReady, setCropWorkbenchReady] = useState(initialCropMode === "single");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("yoyoku.sidebar-collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
   const [visited, setVisited] = useState<Set<string>>(() => new Set([initialPage]));
   const [selection, setSelectionState] = useState<string[]>([]);
   const [focusedId, setFocusedId] = useState<string | null>(null);
@@ -90,6 +97,13 @@ export function ProjectShell() {
 
   const selectionSet = useMemo(() => new Set(selection), [selection]);
   const runningJobs = jobs.filter((job) => ["running", "queued", "paused"].includes(job.status));
+  useEffect(() => {
+    try {
+      localStorage.setItem("yoyoku.sidebar-collapsed", sidebarCollapsed ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [sidebarCollapsed]);
 
   const navigate = useCallback((next: string) => {
     setPage(next);
@@ -629,7 +643,7 @@ export function ProjectShell() {
 
   return (
     <ProjectProvider value={contextValue}>
-      <div className="app-shell">
+      <div className={classNames("app-shell", sidebarCollapsed && "sidebar-collapsed")}>
         <header className="topbar" data-tauri-drag-region>
           <div className="topbar-left" data-tauri-drag-region="deep">
             <IconButton icon="back" label={S.nav.back} onClick={requestClose} />
@@ -738,6 +752,17 @@ export function ProjectShell() {
 
         <div className="app-body">
           <aside className="sidebar" aria-label="主导航">
+            <div className="sidebar-head">
+              <button
+                type="button"
+                className="sidebar-toggle"
+                onClick={() => setSidebarCollapsed((value) => !value)}
+                title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+                aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+              >
+                <Icon name={sidebarCollapsed ? "chevron-right" : "chevron-left"} className="sm" />
+              </button>
+            </div>
             <nav className="sidebar-nav">
               {NAV.map((item) => (
                 <button

@@ -18,6 +18,9 @@ import type {
   CaptionTagState,
   CollectionInfo,
   ConvertPreview,
+  DedupeActionResult,
+  DedupeRecycled,
+  DedupeScan,
   DuplicateGroupView,
   ExportConfig,
   ExportPreview,
@@ -45,6 +48,9 @@ import type {
   StorageStats,
   SuggestionInfo,
   SuggestionResult,
+  TagBulkRequest,
+  TagBulkResult,
+  TagTotalsResult,
   TrainingEntry,
   TransformPreview,
   TransformPlan,
@@ -227,6 +233,10 @@ export const api = {
     call<CaptionTagState>("caption_tag_state_get", { assetId }),
   captionTagStateSet: (assetId: string, tagState: CaptionTagState) =>
     call<void>("caption_tag_state_set", { assetId, tagState }),
+  captionTagTotals: (assetIds: string[]) =>
+    call<TagTotalsResult>("caption_tag_totals", { assetIds }),
+  captionTagBulk: (req: TagBulkRequest) =>
+    call<TagBulkResult>("caption_tag_bulk", { req }),
   captionSuggestions: (assetId: string) =>
     call<SuggestionInfo[]>("caption_suggestions", { assetId }),
   generateSuggestion: (req: {
@@ -259,6 +269,14 @@ export const api = {
     keptAssetId?: string | null;
   }) => call<number>("quality_duplicate_action", { req }),
   qualityOverview: () => call<QualityOverview>("quality_overview"),
+
+  dedupeScan: (threshold?: number) =>
+    call<DedupeScan>("dedupe_scan", { threshold: threshold ?? null }),
+  dedupeRecycled: () => call<DedupeRecycled[]>("dedupe_recycled"),
+  dedupeRecycle: (assetIds: string[]) =>
+    call<DedupeActionResult>("dedupe_recycle", { assetIds }),
+  dedupeRestore: (assetIds: string[]) =>
+    call<DedupeActionResult>("dedupe_restore", { assetIds }),
 
   exportPreview: (config: ExportConfig) => call<ExportPreview>("export_preview", { config }),
   exportStart: (previewId: string) => call<ExportStartResult>("export_start", { previewId }),

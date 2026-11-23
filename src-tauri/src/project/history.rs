@@ -28,6 +28,11 @@ pub struct AssetSnapshot {
     pub trigger_disabled: bool,
     pub last_human_at: Option<String>,
     pub review_note: Option<String>,
+    /// 分组视图的完整顺序 / 停用项。旧历史记录没有该字段，撤销时保持现状。
+    #[serde(default)]
+    pub tag_order: Option<Vec<String>>,
+    #[serde(default)]
+    pub tag_disabled: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +51,7 @@ pub struct HistoryState {
     pub memberships: Vec<MembershipChange>,
 }
 
-pub fn snapshot_from_row(row: &AssetRow) -> AssetSnapshot {
+fn base_snapshot(row: &AssetRow) -> AssetSnapshot {
     AssetSnapshot {
         id: row.id.clone(),
         transform_revision_id: row.transform_revision_id.clone(),
@@ -66,7 +71,34 @@ pub fn snapshot_from_row(row: &AssetRow) -> AssetSnapshot {
         trigger_disabled: row.trigger_disabled,
         last_human_at: row.last_human_at.clone(),
         review_note: row.review_note.clone(),
+        tag_order: None,
+        tag_disabled: None,
     }
+}
+
+/// 普通资产操作不携带分组视图状态，避免撤销裁剪/质检等操作时覆盖之后的标签排序。
+pub fn snapshot_from_row(row: &AssetRow) -> AssetSnapshot {
+    base_snapshot(row)
+}
+
+/// 仅批量短语编辑使用：把完整排序 / 停用项一起写入历史，撤销时同步恢复。
+pub fn snapshot_row_with_tag_state(
+    conn: &rusqlite::Connection,
+    row: &AssetRow,
+) -> AppResult<AssetSnapshot> {
+    let mut snapshot = base_snapshot(row);
+    let state: Option<(String, String)> = conn
+        .query_row(
+            "SELECT order_json, disabled_json FROM caption_tag_state WHERE asset_id = ?1",
+            params![row.id],
+            |value| Ok((value.get(0)?, value.get(1)?)),
+        )
+        .optional()?;
+    if let Some((order, disabled)) = state {
+        snapshot.tag_order = Some(serde_json::from_str(&order).unwrap_or_default());
+        snapshot.tag_disabled = Some(serde_json::from_str(&disabled).unwrap_or_default());
+    }
+    Ok(snapshot)
 }
 
 pub fn snapshot_asset(conn: &rusqlite::Connection, id: &str) -> AppResult<AssetSnapshot> {
@@ -135,6 +167,24 @@ fn apply_state(conn: &rusqlite::Connection, state: &HistoryState) -> AppResult<(
                 asset.id
             ],
         )?;
+        if asset.tag_order.is_some() || asset.tag_disabled.is_some() {
+            let order = asset.tag_order.clone().unwrap_or_default();
+            let disabled = asset.tag_disabled.clone().unwrap_or_default();
+            conn.execute(
+                "INSERT INTO caption_tag_state(asset_id, order_json, disabled_json, updated_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(asset_id) DO UPDATE SET
+                   order_json = excluded.order_json,
+                   disabled_json = excluded.disabled_json,
+                   updated_at = excluded.updated_at",
+                params![
+                    asset.id,
+                    serde_json::to_string(&order)?,
+                    serde_json::to_string(&disabled)?,
+                    util::now_iso()
+                ],
+            )?;
+        }
     }
     for change in &state.memberships {
         for asset_id in &change.asset_ids {

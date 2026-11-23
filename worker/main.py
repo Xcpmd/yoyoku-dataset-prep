@@ -179,6 +179,7 @@ def resize(im, width, height, plan):
 def render_plan(source_image, plan):
     """按处理计划生成最终画面。返回 (image, geometry)。"""
     plan = plan or {}
+    fill_transparent = bool(plan.get("fillTransparent", True))
     normalized_width, normalized_height = source_image.size
     im = rotate_flip(source_image, plan)
     rotated_width, rotated_height = im.size
@@ -189,6 +190,7 @@ def render_plan(source_image, plan):
     mode = plan.get("scaleMode") or "preserve"
     allow_upscale = bool(plan.get("allowUpscale"))
     pad_ratio = 0.0
+    padded = False
     target_width = int(plan.get("width") or 0)
     target_height = int(plan.get("height") or 0)
     longest_edge = int(plan.get("longestEdge") or 0)
@@ -212,7 +214,10 @@ def render_plan(source_image, plan):
         scaled_height = max(1, round_half_up(crop_height * scale))
         im = resize(im, scaled_width, scaled_height, plan)
         background = parse_color(plan.get("background") or "#ffffff")
-        if im.mode == "RGBA" and background[3] > 0:
+        if im.mode == "RGBA" and fill_transparent:
+            # 先按白底合成图像本身，补边仍使用用户选择的背景色。
+            im = flatten(im, "#ffffff")
+        elif im.mode == "RGBA" and background[3] > 0:
             base = Image.new("RGBA", (scaled_width, scaled_height), background)
             base.alpha_composite(im)
             im = base
@@ -228,6 +233,7 @@ def render_plan(source_image, plan):
             canvas = Image.new("RGB", (target_width, target_height), background)
         canvas.paste(im, (left, top))
         im = canvas
+        padded = True
         out_width, out_height = target_width, target_height
         pad_ratio = 1.0 - (scaled_width * scaled_height) / float(target_width * target_height)
         pad_ratio = max(0.0, min(1.0, pad_ratio))
@@ -246,9 +252,9 @@ def render_plan(source_image, plan):
         scale_ratio = scale
 
     if im.mode == "RGBA":
-        background = plan.get("background") or "#ffffff"
-        if background != "transparent":
-            im = flatten(im, background)
+        # fitPad 已在贴图前处理图像自身的透明像素；保留用户选择的补边背景。
+        if fill_transparent and not padded:
+            im = flatten(im, "#ffffff")
     elif im.mode != "RGB":
         im = im.convert("RGB")
 
@@ -286,7 +292,9 @@ def save_image(im, out_path, plan, force_format=None):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fmt = (force_format or plan.get("format") or "png").lower()
     if fmt in ("jpg", "jpeg"):
-        if im.mode != "RGB":
+        if im.mode == "RGBA":
+            im = flatten(im, "#ffffff")
+        elif im.mode != "RGB":
             im = im.convert("RGB")
         quality = int(plan.get("quality") or 95)
         im.save(out_path, format="JPEG", quality=quality, optimize=True, subsampling=0)
