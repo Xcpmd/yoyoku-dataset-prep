@@ -25,7 +25,7 @@ import { SettingsPage } from "../features/settings/SettingsPage";
 import { PromptLibraryPage } from "../features/prompts/PromptLibraryPage";
 
 const NAV: { id: string; label: string; icon: IconName }[] = [
-  { id: "library", label: S.nav.library, icon: "import" },
+  { id: "library", label: S.nav.library, icon: "grid" },
   { id: "crop", label: S.nav.crop, icon: "crop" },
   { id: "tag", label: S.nav.tag, icon: "tag" },
   { id: "export", label: S.nav.export, icon: "export" },
@@ -86,6 +86,7 @@ export function ProjectShell() {
   const [sequenceLabel, setSequenceLabel] = useState<string>(S.workbench.sequenceLibrary);
   const [workbenchId, setWorkbenchId] = useState<string | null>(stored.workbenchId || null);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [librarySignal, setLibrarySignal] = useState(0);
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
   const [jobs, setJobs] = useState<JobInfo[]>([]);
   const [jobsOpen, setJobsOpen] = useState(false);
@@ -276,12 +277,16 @@ export function ProjectShell() {
             tone: "danger",
             title: S.jobs.importSuccess,
             message: job.error?.message || "导入失败",
+            actionLabel: "查看任务",
+            onAction: () => setJobsOpen(true),
           });
         } else {
           notify({
             tone: failed > 0 ? "danger" : "success",
             title: S.jobs.importSuccess,
             message: S.jobs.importSummary(success, skipped, failed),
+            actionLabel: "查看任务",
+            onAction: () => setJobsOpen(true),
           });
         }
       } else if (job.kind === "export") {
@@ -329,6 +334,15 @@ export function ProjectShell() {
       unlisteners.push(jobUnlisten);
       const assetsUnlisten = await listen("assets:changed", () => scheduleRefresh());
       unlisteners.push(assetsUnlisten);
+      // 导入批次提交只推入图库的增量刷新渠道，避免每个批次重算项目总计与去重。
+      const importCommitUnlisten = await listen<{ projectId: string }>(
+        "assets:import-committed",
+        (event) => {
+          if (event.payload?.projectId !== project.id) return;
+          setLibrarySignal((value) => value + 1);
+        },
+      );
+      unlisteners.push(importCommitUnlisten);
     };
     void setup();
 
@@ -599,6 +613,7 @@ export function ProjectShell() {
       searchSignal,
       requestSearch,
       navigateToLibrary,
+      librarySignal,
       notify,
     }),
     [
@@ -619,6 +634,7 @@ export function ProjectShell() {
       filter,
       sort,
       view,
+      librarySignal,
       sequence,
       sequenceLabel,
       setSequence,
@@ -707,8 +723,8 @@ export function ProjectShell() {
             <button
               type="button"
               className="btn icon task-button"
-              aria-label={S.nav.tasks}
-              title={S.nav.tasks}
+              aria-label={runningJobs.length > 0 ? `${S.nav.tasks} · ${runningJobs.length} 项进行中` : S.nav.tasks}
+              title={runningJobs.length > 0 ? `${runningJobs.length} 项任务进行中` : S.nav.tasks}
               onClick={() => setJobsOpen(true)}
             >
               <Icon name="tasks" />
@@ -720,7 +736,7 @@ export function ProjectShell() {
             </button>
             <button
               type="button"
-              className={`btn icon ${page === "prompts" ? "active" : ""}`}
+              className={`btn icon topbar-secondary ${page === "prompts" ? "active" : ""}`}
               aria-label={S.nav.prompts}
               title={S.nav.prompts}
               onClick={() => navigate("prompts")}
@@ -729,7 +745,7 @@ export function ProjectShell() {
             </button>
             <button
               type="button"
-              className={`btn icon ${page === "quality" ? "active" : ""}`}
+              className={`btn icon topbar-secondary ${page === "quality" ? "active" : ""}`}
               aria-label={S.nav.quality}
               title={S.nav.quality}
               onClick={() => navigate("quality")}
@@ -738,13 +754,56 @@ export function ProjectShell() {
             </button>
             <button
               type="button"
-              className={`btn icon ${page === "settings" ? "active" : ""}`}
+              className={`btn icon topbar-secondary ${page === "settings" ? "active" : ""}`}
               aria-label={S.nav.settings}
               title={S.nav.settings}
               onClick={() => navigate("settings")}
             >
               <Icon name="settings" />
             </button>
+            <Dropdown
+              width={220}
+              align="end"
+              renderTrigger={(toggle) => (
+                <button
+                  type="button"
+                  className="btn icon topbar-more"
+                  aria-label="更多"
+                  aria-haspopup="menu"
+                  title="更多"
+                  onClick={toggle}
+                >
+                  <Icon name="more" />
+                  {runningJobs.length > 0 ? <span className="task-dot running" /> : null}
+                </button>
+              )}
+            >
+              {(close) => (
+                <>
+                  <MenuLabel>更多</MenuLabel>
+                  <MenuItem
+                    icon="tasks"
+                    hint={runningJobs.length > 0 ? `${runningJobs.length} 项进行中` : jobs.length > 0 ? `${jobs.length} 项记录` : undefined}
+                    onClick={() => {
+                      close();
+                      setJobsOpen(true);
+                    }}
+                  >
+                    {S.nav.tasks}
+                  </MenuItem>
+                  <MenuSeparator />
+                  <MenuItem icon="quality" onClick={() => { close(); navigate("quality"); }}>
+                    {S.nav.quality}
+                  </MenuItem>
+                  <MenuItem icon="library" onClick={() => { close(); navigate("prompts"); }}>
+                    {S.nav.prompts}
+                  </MenuItem>
+                  <MenuItem icon="settings" onClick={() => { close(); navigate("settings"); }}>
+                    {S.nav.settings}
+                  </MenuItem>
+                </>
+              )}
+            </Dropdown>
             <span className="topbar-controls-sep" />
             <WindowControls />
           </div>
@@ -875,6 +934,18 @@ export function ProjectShell() {
               <span>{item.label}</span>
             </button>
           ))}
+          <button
+            type="button"
+            className={classNames("bottom-nav-item", jobsOpen && "active")}
+            onClick={() => setJobsOpen(true)}
+            aria-label={runningJobs.length > 0 ? `任务 · ${runningJobs.length} 项进行中` : "任务"}
+          >
+            <span className="bottom-nav-icon">
+              <Icon name="tasks" />
+              {runningJobs.length > 0 ? <span className="bottom-nav-dot" /> : null}
+            </span>
+            <span>任务</span>
+          </button>
         </nav>
 
         <JobsDrawer />

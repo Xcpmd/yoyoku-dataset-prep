@@ -96,8 +96,7 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
     <Modal
       open={open}
       onClose={onClose}
-      title="设置"
-      subtitle="应用外观、运行时与本地模型。项目级设置请在打开项目后进入设置。"
+      title="应用设置"
       width="wide"
       footer={
         <button type="button" className="btn primary" onClick={onClose}>
@@ -166,7 +165,7 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
         <section className="settings-card">
           <h3><Icon name="sparkles" />提示词翻译</h3>
           <p className="hint">
-            打标页的「翻译标签」和提示词翻译使用此设置。留空时使用 MyMemory 免费接口；填入百度翻译 AppID 与密钥后优先使用百度，失败时自动回退。
+            未配置百度翻译时使用 MyMemory，百度请求失败时也会回退。
           </p>
           <div className="grid-2">
             <Field label="百度翻译 AppID">
@@ -222,7 +221,7 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
             </div>
           </div>
           <p className="hint">
-            本地模型只在本机运行，不上传图片。WD14 读取 model.onnx 与 selected_tags.csv；下载在后台继续，右下角显示进度，完成后模型列表自动刷新。
+            本地模型只在本机运行，不上传图片。下载将继续，可在右下角查看进度。
           </p>
           {modelError ? <Notice tone="danger">{modelError}</Notice> : null}
           {downloadOpen ? (
@@ -272,7 +271,7 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
                   <div style={{ minWidth: 0 }}>
                     <div style={{ fontWeight: 600 }}>{item.name}</div>
                     <div className="hint">
-                      {item.kind === "wd14-tagger" ? "标签建议" : "自然语言描述"} · {item.version} ·{" "}
+                      {item.kind === "wd14-tagger" ? "短语标签" : "自然语言描述"} · {item.version} ·{" "}
                       {item.sizeBytes > 0 ? formatBytes(item.sizeBytes) : "未安装"}
                     </div>
                   </div>

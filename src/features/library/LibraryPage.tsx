@@ -10,10 +10,10 @@ import {
   filterActiveCount,
   formatBytes,
   formatNumber,
+  gridThumbUrl,
+  lowThumbUrl,
   statusLabel,
   statusTone,
-  sourceThumbUrl,
-  thumbUrl,
 } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import {
@@ -39,6 +39,89 @@ import { BatchDialog } from "./BatchDialog";
 
 const PAGE_SIZE = 200;
 const GAP = 12;
+/** 卡片缩略图之外的固定高度：内边距、间距与两行标注文字。 */
+const GRID_CARD_EXTRA = 86;
+/** 瀑布流上下额外挂载的像素范围。 */
+const MASONRY_OVERSCAN = 720;
+
+interface MasonryLayout {
+  columns: number[][];
+  tops: number[][];
+  heights: number[];
+  columnOf: number[];
+  indexInColumn: number[];
+  maxHeight: number;
+  total: number;
+}
+
+/**
+ * 按源图比例计算每张卡片高度，依次放入当前最短的列。
+ * 列内纵向紧密排列，不再为同行水平对齐保留空隙。
+ */
+function buildMasonryLayout(
+  items: AssetSummary[],
+  columns: number,
+  cardWidth: number,
+): MasonryLayout {
+  const columnCount = Math.max(1, columns);
+  const inner = Math.max(60, cardWidth - 14);
+  const columnsList: number[][] = Array.from({ length: columnCount }, () => []);
+  const topsList: number[][] = Array.from({ length: columnCount }, () => []);
+  const columnHeights = new Array<number>(columnCount).fill(0);
+  const columnOf = new Array<number>(items.length).fill(0);
+  const indexInColumn = new Array<number>(items.length).fill(0);
+  const heights = new Array<number>(items.length).fill(0);
+  let maxHeight = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    const asset = items[index];
+    const width = Math.max(1, asset.width);
+    const height = Math.max(1, asset.height);
+    const cardHeight = Math.ceil((inner * height) / width) + GRID_CARD_EXTRA;
+    heights[index] = cardHeight;
+    maxHeight = Math.max(maxHeight, cardHeight);
+    let target = 0;
+    for (let column = 1; column < columnCount; column += 1) {
+      if (columnHeights[column] < columnHeights[target]) target = column;
+    }
+    columnOf[index] = target;
+    indexInColumn[index] = columnsList[target].length;
+    columnsList[target].push(index);
+    topsList[target].push(columnHeights[target]);
+    columnHeights[target] += cardHeight + GAP;
+  }
+  let total = 0;
+  for (const height of columnHeights) total = Math.max(total, height - GAP);
+  return {
+    columns: columnsList,
+    tops: topsList,
+    heights,
+    columnOf,
+    indexInColumn,
+    maxHeight,
+    total: Math.max(0, total),
+  };
+}
+
+/** 二分查找第一个 >= target 的位置。 */
+function lowerBound(values: number[], target: number): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (values[mid] < target) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+/** 命中点下最近的图片卡片；选区工具条等浮层不会挡住拖选。 */
+function assetIdAtPoint(x: number, y: number): string | null {
+  for (const element of document.elementsFromPoint(x, y)) {
+    const card = element.closest<HTMLElement>("[data-asset-id]");
+    if (card?.dataset.assetId) return card.dataset.assetId;
+  }
+  return null;
+}
 
 export function LibraryPage({ active }: { active: boolean }) {
   const {
@@ -61,6 +144,7 @@ export function LibraryPage({ active }: { active: boolean }) {
     openWorkbench,
     refreshToken,
     bumpRefresh,
+    librarySignal,
     collections,
     reloadCollections,
     importSignal,
@@ -76,8 +160,17 @@ export function LibraryPage({ active }: { active: boolean }) {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [nextOffset, setNextOffset] = useState<number | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const dragSelectRef = useRef<boolean | null>(null);
+  const dragSelectRef = useRef<{
+    value: boolean;
+    startIndex: number;
+    base: string[];
+  } | null>(null);
+  const dragPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const dragAutoScrollFrame = useRef<number | null>(null);
+  const dragEnterRef = useRef<(id: string) => void>(() => {});
+  const dragAutoScrollRef = useRef<() => void>(() => {});
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
   const [searchInput, setSearchInput] = useState(filter.query);
@@ -99,6 +192,10 @@ export function LibraryPage({ active }: { active: boolean }) {
   const [importOpen, setImportOpen] = useState(false);
   const [importPaths, setImportPaths] = useState<string[]>([]);
   const [dedupeOpen, setDedupeOpen] = useState(false);
+  const [duplicateCount, setDuplicateCount] = useState(0);
+  const dedupeNoticeRef = useRef<string | null>(null);
+  const dedupeSeq = useRef(0);
+  const metricsRequested = useRef(false);
   const [batchOpen, setBatchOpen] = useState(false);
   const [excludeTargets, setExcludeTargets] = useState<string[] | null>(null);
   const [collectionPrompt, setCollectionPrompt] = useState<"new" | "smart" | null>(null);
@@ -117,6 +214,57 @@ export function LibraryPage({ active }: { active: boolean }) {
   const widthRef = useRef(inspectorWidth);
   widthRef.current = inspectorWidth;
 
+  useEffect(() => {
+    if (!active) return;
+    const seq = ++dedupeSeq.current;
+    const timer = window.setTimeout(() => {
+      api
+        .dedupeSummary(project.settings.thresholds?.duplicateDistance ?? 8)
+        .then((summary) => {
+          if (seq !== dedupeSeq.current) return;
+          setDuplicateCount(summary.duplicates);
+          if (summary.duplicates > 0 && dedupeNoticeRef.current !== project.id) {
+            dedupeNoticeRef.current = project.id;
+            notify({
+              tone: "warning",
+              title: "发现疑似重复图片",
+              message: `${summary.duplicates} 张图片可能重复，可在「去重」中处理。`,
+              actionLabel: "去重",
+              onAction: () => setDedupeOpen(true),
+            });
+          }
+        })
+        .catch(() => undefined);
+    }, 500);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, project.id, project.counts.total, project.counts.excluded, project.settings.thresholds?.duplicateDistance]);
+
+  useEffect(() => {
+    metricsRequested.current = false;
+  }, [project.id]);
+
+  const ensureMetrics = useCallback(async () => {
+    if (metricsRequested.current) return;
+    metricsRequested.current = true;
+    try {
+      const result = await api.backfillMetrics();
+      if (result.total > 0) {
+        notify({
+          message: `正在后台分析 ${result.total} 张图片的颜色 / 曝光指标，完成后自动刷新`,
+        });
+      }
+    } catch {
+      metricsRequested.current = false;
+    }
+  }, [notify]);
+
+  useEffect(() => {
+    if (["exposure", "colorfulness", "contrast", "saturation"].includes(sort.field)) {
+      void ensureMetrics();
+    }
+  }, [sort.field, ensureMetrics]);
+
   const filterKey = useMemo(() => JSON.stringify({ filter, sort }), [filter, sort]);
   const filterCount = filterActiveCount(filter);
 
@@ -130,6 +278,7 @@ export function LibraryPage({ active }: { active: boolean }) {
       setItems(page.items);
       setTotal(page.total);
       setNextOffset(page.nextOffset);
+      setNextCursor(page.nextCursor);
       if (scrollerRef.current) scrollerRef.current.scrollTop = 0;
       setScrollTop(0);
     } catch (error) {
@@ -151,25 +300,60 @@ export function LibraryPage({ active }: { active: boolean }) {
       const page = await api.queryAssets(filter, sort, 0, limit);
       if (seq !== requestSeq.current) return;
       setItems((current) => {
+        if (page.nextOffset === null) return page.items;
         if (current.length <= page.items.length) return page.items;
-        return [...page.items, ...current.slice(page.items.length)];
+        // 新记录插入后旧尾部可能已前移，按 ID 去重，避免滚动时出现重复卡片。
+        const seen = new Set(page.items.map((item) => item.id));
+        return [...page.items, ...current.slice(page.items.length).filter((item) => !seen.has(item.id))];
       });
       setTotal(page.total);
       setNextOffset(page.nextOffset);
+      setNextCursor(page.nextCursor);
     } catch {
       // 保留现有内容
     }
   }, [filter, sort, items.length, loadFirst]);
 
+  // 页面隐藏时停止查询；返回时按筛选是否变化选择首屏或可见窗口刷新。
+  const lastFilterKey = useRef(filterKey);
   useEffect(() => {
-    void loadFirst();
+    if (!active) return;
+    const changed = lastFilterKey.current !== filterKey;
+    lastFilterKey.current = filterKey;
+    if (changed || items.length === 0) {
+      void loadFirst();
+    } else {
+      void refreshLoaded();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterKey]);
+  }, [filterKey, active]);
 
   useEffect(() => {
+    if (!active) return;
     if (refreshToken > 0) void refreshLoaded();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshToken]);
+
+  // 导入批次提交后的增量刷新：空图库立即取首屏，其余合并 250 ms 内的多次提交。
+  const lastLibrarySignal = useRef(librarySignal);
+  const libraryRefreshTimer = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (librarySignal === lastLibrarySignal.current) return;
+    lastLibrarySignal.current = librarySignal;
+    if (!active) return;
+    if (libraryRefreshTimer.current) window.clearTimeout(libraryRefreshTimer.current);
+    if (items.length === 0) {
+      void loadFirst();
+      return;
+    }
+    libraryRefreshTimer.current = window.setTimeout(() => {
+      void refreshLoaded();
+    }, 250);
+    return () => {
+      if (libraryRefreshTimer.current) window.clearTimeout(libraryRefreshTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [librarySignal, active]);
 
   useEffect(() => {
     setSearchInput(filter.query);
@@ -198,38 +382,55 @@ export function LibraryPage({ active }: { active: boolean }) {
       ? Math.max(112, Math.floor((viewportWidth - GAP * (columns - 1)) / columns))
       : viewportWidth;
   const rowHeight = view === "grid" ? cardWidth + 88 : 70;
+  const masonry = useMemo(
+    () => (view === "grid" ? buildMasonryLayout(items, columns, cardWidth) : null),
+    [view, items, columns, cardWidth],
+  );
 
   const loadMore = useCallback(async () => {
-    if (loadingMoreRef.current || nextOffset === null || loading) return;
+    if (loadingMoreRef.current || loading || (nextOffset === null && nextCursor === null)) return;
     loadingMoreRef.current = true;
     setLoadingMore(true);
     const seq = requestSeq.current;
     try {
-      const page = await api.queryAssets(filter, sort, nextOffset, PAGE_SIZE);
+      // 优先从上一页服务端返回的游标继续；失效时回退到最后一张或偏移分页。
+      const cursor = nextCursor || items[items.length - 1]?.id;
+      let page = cursor
+        ? await api.queryAssets(filter, sort, 0, PAGE_SIZE, cursor)
+        : await api.queryAssets(filter, sort, nextOffset ?? 0, PAGE_SIZE);
       if (seq !== requestSeq.current) return;
-      setItems((current) => [...current, ...page.items]);
+      if (cursor && page.items.length === 0 && items.length > 0) {
+        page = await api.queryAssets(filter, sort, items.length, PAGE_SIZE);
+        if (seq !== requestSeq.current) return;
+      }
+      setItems((current) => {
+        const seen = new Set(current.map((item) => item.id));
+        return [...current, ...page.items.filter((item) => !seen.has(item.id))];
+      });
       setTotal(page.total);
       setNextOffset(page.nextOffset);
+      setNextCursor(page.nextCursor);
     } catch (error) {
       notify({ tone: "danger", title: S.errors.generic, message: normalizeError(error).message });
     } finally {
       loadingMoreRef.current = false;
       setLoadingMore(false);
     }
-  }, [filter, sort, nextOffset, loading, notify]);
+  }, [filter, sort, nextOffset, nextCursor, items, loading, notify]);
 
   useEffect(() => {
-    if (!loading && nextOffset !== null && items.length > 0) {
+    if (!loading && (nextOffset !== null || nextCursor !== null) && items.length > 0) {
       const element = scrollerRef.current;
       if (element && element.scrollHeight <= element.clientHeight + 200) {
         void loadMore();
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items.length, loading, nextOffset, viewportHeight, view]);
+  }, [items.length, loading, nextOffset, nextCursor, viewportHeight, view]);
 
   // Selection visibility for hidden count
   useEffect(() => {
+    if (!active) return;
     if (selection.length === 0) {
       setVisibleIds(null);
       return;
@@ -248,7 +449,7 @@ export function LibraryPage({ active }: { active: boolean }) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selection.length, filterKey, refreshToken]);
+  }, [selection.length, filterKey, refreshToken, active]);
 
   const hiddenSelected = useMemo(() => {
     if (!visibleIds) return 0;
@@ -385,58 +586,183 @@ export function LibraryPage({ active }: { active: boolean }) {
       setFocusedId(asset.id);
       return;
     }
+    const current = selectionRef.current;
+    // 已有多个选中时，点击其他图片继续并入选区，避免误清空之前的选择。
+    if (current.length > 1 && !current.includes(asset.id)) {
+      const next = [...current, asset.id];
+      selectionRef.current = next;
+      setSelection(next);
+      setFocusedId(asset.id);
+      if (window.innerWidth >= 1280) setInspectorOpen(true);
+      return;
+    }
     setSelection([asset.id]);
     setFocusedId(asset.id);
     if (window.innerWidth >= 1280) setInspectorOpen(true);
   };
 
-  const setAssetSelected = useCallback(
-    (id: string, value: boolean) => {
-      const current = selectionRef.current;
-      if (value ? current.includes(id) : !current.includes(id)) return;
-      const next = value
-        ? Array.from(new Set([...current, id]))
-        : current.filter((item) => item !== id);
+  const toggleSelectAll = async () => {
+    if (total > 0 && selection.length >= total) {
+      clearSelection();
+      return;
+    }
+    try {
+      const ids = await api.assetIds(filter);
+      setSelection(ids);
+    } catch (error) {
+      notify({ tone: "danger", title: S.errors.generic, message: normalizeError(error).message });
+    }
+  };
+
+  const startDragSelect = useCallback(
+    (id: string, value: boolean, x?: number, y?: number) => {
+      const index = items.findIndex((item) => item.id === id);
+      if (index < 0) return;
+      dragPointerRef.current =
+        typeof x === "number" && typeof y === "number" ? { x, y } : null;
+      const base = selectionRef.current;
+      dragSelectRef.current = { value, startIndex: index, base };
+      const nextSet = new Set(base);
+      if (value) nextSet.add(id);
+      else nextSet.delete(id);
+      const next = Array.from(nextSet);
       selectionRef.current = next;
       setSelection(next);
     },
-    [setSelection],
-  );
-
-  const startDragSelect = useCallback(
-    (id: string, value: boolean) => {
-      dragSelectRef.current = value;
-      setAssetSelected(id, value);
-    },
-    [setAssetSelected],
+    [items, setSelection],
   );
 
   const dragSelectEnter = useCallback(
     (id: string) => {
-      if (dragSelectRef.current !== null) setAssetSelected(id, dragSelectRef.current);
+      const drag = dragSelectRef.current;
+      if (!drag || !masonry) return;
+      const index = items.findIndex((item) => item.id === id);
+      if (index < 0) return;
+      const startColumn = masonry.columnOf[drag.startIndex] ?? 0;
+      const startRow = masonry.indexInColumn[drag.startIndex] ?? 0;
+      const currentColumn = masonry.columnOf[index] ?? 0;
+      const currentRow = masonry.indexInColumn[index] ?? 0;
+      const startLeft = startColumn * (cardWidth + GAP);
+      const currentLeft = currentColumn * (cardWidth + GAP);
+      const startTop = masonry.tops[startColumn]?.[startRow] ?? 0;
+      const currentTop = masonry.tops[currentColumn]?.[currentRow] ?? 0;
+      const startHeight = masonry.heights[drag.startIndex] ?? 0;
+      const currentHeight = masonry.heights[index] ?? 0;
+      // 以起始卡片与当前卡片的矩形包络作为范围；列间不会为了对齐而误选。
+      const left = Math.min(startLeft, currentLeft);
+      const right = Math.max(startLeft + cardWidth, currentLeft + cardWidth);
+      const top = Math.min(startTop, currentTop);
+      const bottom = Math.max(startTop + startHeight, currentTop + currentHeight);
+      const nextSet = new Set(drag.base);
+      for (let cursor = 0; cursor < items.length; cursor += 1) {
+        const column = masonry.columnOf[cursor] ?? 0;
+        const row = masonry.indexInColumn[cursor] ?? 0;
+        const itemLeft = column * (cardWidth + GAP);
+        const itemTop = masonry.tops[column]?.[row] ?? 0;
+        const itemHeight = masonry.heights[cursor] ?? 0;
+        const intersects =
+          itemLeft < right &&
+          itemLeft + cardWidth > left &&
+          itemTop < bottom &&
+          itemTop + itemHeight > top;
+        if (!intersects) continue;
+        const assetId = items[cursor]?.id;
+        if (!assetId) continue;
+        if (drag.value) nextSet.add(assetId);
+        else nextSet.delete(assetId);
+      }
+      const next = Array.from(nextSet);
+      selectionRef.current = next;
+      setSelection(next);
     },
-    [setAssetSelected],
+    [items, masonry, cardWidth, setSelection],
   );
+
+  dragEnterRef.current = dragSelectEnter;
+
+  const stopDragAutoScroll = () => {
+    if (dragAutoScrollFrame.current !== null) {
+      window.cancelAnimationFrame(dragAutoScrollFrame.current);
+      dragAutoScrollFrame.current = null;
+    }
+  };
+
+  // 拖选时指针停在滚动区域上下边缘，持续滚动并把经过的图片纳入范围。
+  dragAutoScrollRef.current = () => {
+    dragAutoScrollFrame.current = null;
+    if (!dragSelectRef.current) return;
+    const scroller = scrollerRef.current;
+    const pointer = dragPointerRef.current;
+    if (!scroller || !pointer) return;
+    const rect = scroller.getBoundingClientRect();
+    const edge = 56;
+    let delta = 0;
+    if (pointer.y < rect.top + edge) {
+      delta = -Math.max(8, Math.ceil((rect.top + edge - pointer.y) / 3));
+    } else if (pointer.y > rect.bottom - edge) {
+      delta = Math.max(8, Math.ceil((pointer.y - (rect.bottom - edge)) / 3));
+    }
+    if (delta === 0) return;
+    const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    const nextTop = Math.max(0, Math.min(maxTop, scroller.scrollTop + delta));
+    if (nextTop === scroller.scrollTop) return;
+    scroller.scrollTop = nextTop;
+    setScrollTop(nextTop);
+    const hitId = assetIdAtPoint(pointer.x, pointer.y);
+    if (hitId) dragEnterRef.current(hitId);
+    dragAutoScrollFrame.current = window.requestAnimationFrame(() =>
+      dragAutoScrollRef.current(),
+    );
+  };
 
   useEffect(() => {
     const end = () => {
       dragSelectRef.current = null;
+      dragPointerRef.current = null;
+      stopDragAutoScroll();
+    };
+    const move = (event: PointerEvent) => {
+      if (!dragSelectRef.current) return;
+      dragPointerRef.current = { x: event.clientX, y: event.clientY };
+      const scroller = scrollerRef.current;
+      if (!scroller) return;
+      const rect = scroller.getBoundingClientRect();
+      const inside =
+        event.clientX >= rect.left &&
+        event.clientX <= rect.right &&
+        event.clientY >= rect.top &&
+        event.clientY <= rect.bottom;
+      if (!inside) {
+        stopDragAutoScroll();
+        return;
+      }
+      const hitId = assetIdAtPoint(event.clientX, event.clientY);
+      if (hitId) dragEnterRef.current(hitId);
+      if (dragAutoScrollFrame.current === null) {
+        dragAutoScrollFrame.current = window.requestAnimationFrame(() =>
+          dragAutoScrollRef.current(),
+        );
+      }
     };
     const visibility = () => {
       if (document.visibilityState === "hidden") end();
     };
+    window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
     window.addEventListener("mouseup", end);
     window.addEventListener("pointercancel", end);
     window.addEventListener("blur", end);
     document.addEventListener("visibilitychange", visibility);
     return () => {
+      window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", end);
       window.removeEventListener("mouseup", end);
       window.removeEventListener("pointercancel", end);
       window.removeEventListener("blur", end);
       document.removeEventListener("visibilitychange", visibility);
+      stopDragAutoScroll();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -456,11 +782,27 @@ export function LibraryPage({ active }: { active: boolean }) {
     let nextIndex = currentIndex;
     if (event.key === "ArrowRight") nextIndex = Math.min(items.length - 1, currentIndex + 1);
     else if (event.key === "ArrowLeft") nextIndex = Math.max(0, currentIndex - 1);
-    else if (event.key === "ArrowDown")
-      nextIndex = Math.min(items.length - 1, (currentIndex < 0 ? 0 : currentIndex) + columns);
-    else if (event.key === "ArrowUp")
-      nextIndex = Math.max(0, (currentIndex < 0 ? 0 : currentIndex) - columns);
-    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "ArrowDown") {
+      if (view === "grid" && masonry && currentIndex >= 0) {
+        const column = masonry.columnOf[currentIndex] ?? 0;
+        const row = masonry.indexInColumn[currentIndex] ?? 0;
+        nextIndex =
+          masonry.columns[column]?.[row + 1] ?? Math.min(items.length - 1, currentIndex + 1);
+      } else {
+        nextIndex = Math.min(
+          items.length - 1,
+          (currentIndex < 0 ? 0 : currentIndex) + columns,
+        );
+      }
+    } else if (event.key === "ArrowUp") {
+      if (view === "grid" && masonry && currentIndex >= 0) {
+        const column = masonry.columnOf[currentIndex] ?? 0;
+        const row = masonry.indexInColumn[currentIndex] ?? 0;
+        nextIndex = masonry.columns[column]?.[row - 1] ?? Math.max(0, currentIndex - 1);
+      } else {
+        nextIndex = Math.max(0, (currentIndex < 0 ? 0 : currentIndex) - columns);
+      }
+    } else if (event.key === "Home") nextIndex = 0;
     else if (event.key === "End") nextIndex = items.length - 1;
     else if (event.key === "Enter" && focusedId) {
       event.preventDefault();
@@ -483,9 +825,30 @@ export function LibraryPage({ active }: { active: boolean }) {
     setFocusedId(target.id);
     setSelection([target.id]);
     const element = scrollerRef.current;
-    if (view === "grid") {
-      const node = element?.querySelector<HTMLElement>(`[data-asset-id="${target.id}"]`);
-      node?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    if (view === "grid" && masonry) {
+      const column = masonry.columnOf[nextIndex] ?? 0;
+      const row = masonry.indexInColumn[nextIndex] ?? 0;
+      const top = masonry.tops[column]?.[row] ?? 0;
+      if (element) {
+        const visibleTop = element.scrollTop;
+        const visibleBottom = visibleTop + element.clientHeight;
+        if (top < visibleTop + 12 || top > visibleBottom - 80) {
+          const nextTop = Math.max(0, top - 48);
+          element.scrollTop = nextTop;
+          setScrollTop(nextTop);
+          window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+              element
+                .querySelector<HTMLElement>(`[data-asset-id="${target.id}"]`)
+                ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+            });
+          });
+          return;
+        }
+        element
+          .querySelector<HTMLElement>(`[data-asset-id="${target.id}"]`)
+          ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
       return;
     }
     const row = Math.floor(nextIndex / columns);
@@ -518,6 +881,36 @@ export function LibraryPage({ active }: { active: boolean }) {
             await api.undo();
             bumpRefresh();
             notify({ message: "已撤销" });
+          } catch (error) {
+            notify({ tone: "danger", message: normalizeError(error).message });
+          }
+        },
+      });
+    } catch (error) {
+      notify({ tone: "danger", title: S.errors.generic, message: normalizeError(error).message });
+    }
+  };
+
+  const recycleSelection = async () => {
+    if (selection.length === 0) return;
+    const ids = [...selection];
+    try {
+      const result = await api.recycleAssets(ids);
+      // 立即从图库移除，避免刷新合并旧尾部时暂时保留已回收图片。
+      const recycled = new Set(ids);
+      setItems((current) => current.filter((item) => !recycled.has(item.id)));
+      setTotal((current) => Math.max(0, current - result.moved));
+      clearSelection();
+      bumpRefresh();
+      notify({
+        tone: "success",
+        title: "已移至回收区",
+        message: `共 ${result.moved} 张，可在「去重 → 回收区」恢复`,
+        actionLabel: S.common.undo,
+        onAction: async () => {
+          try {
+            await api.undo();
+            bumpRefresh();
           } catch (error) {
             notify({ tone: "danger", message: normalizeError(error).message });
           }
@@ -724,10 +1117,18 @@ export function LibraryPage({ active }: { active: boolean }) {
           <div>
             <h1 className="page-title">{S.library.title}</h1>
             <div className="head-count">
-              <strong>{formatNumber(total)}</strong>
-              <span>{S.library.validCount}</span>
-              <span>·</span>
-              <span>项目共 {formatNumber(project.counts.total)} 张</span>
+              {filterCount > 0 || filter.query.trim() ? (
+                <>
+                  <span>找到</span>
+                  <strong>{formatNumber(total)}</strong>
+                  <span>张 · 共 {formatNumber(project.counts.valid)} 张</span>
+                </>
+              ) : (
+                <>
+                  <strong>{formatNumber(project.counts.valid)}</strong>
+                  <span>张图片</span>
+                </>
+              )}
             </div>
           </div>
           <div className="library-actions">
@@ -737,9 +1138,15 @@ export function LibraryPage({ active }: { active: boolean }) {
               active={inspectorOpen}
               onClick={() => setInspectorOpen((value) => !value)}
             />
-            <button type="button" className="btn subtle" onClick={() => setDedupeOpen(true)}>
+            <button
+              type="button"
+              className="btn subtle"
+              onClick={() => setDedupeOpen(true)}
+              title={duplicateCount > 0 ? `${duplicateCount} 张疑似重复` : "按内容去重"}
+            >
               <Icon name="copy" />
               去重
+              {duplicateCount > 0 ? <span className="count warning">{duplicateCount}</span> : null}
             </button>
             <button type="button" className="btn primary" onClick={() => { setImportPaths([]); setImportOpen(true); }}>
               <Icon name="import" />
@@ -1084,6 +1491,9 @@ export function LibraryPage({ active }: { active: boolean }) {
             onChange={(value) => {
               const [field, direction] = value.split(":");
               setSort({ field: field as AssetSort["field"], direction: direction as AssetSort["direction"] });
+              if (["exposure", "colorfulness", "contrast", "saturation"].includes(field)) {
+                void ensureMetrics();
+              }
             }}
             options={[
               { value: "import:asc", label: S.library.sortImport },
@@ -1093,6 +1503,20 @@ export function LibraryPage({ active }: { active: boolean }) {
               { value: "edge:asc", label: `${S.library.sortEdge} ↑` },
               { value: "status:asc", label: S.library.sortStatus },
               { value: "date:desc", label: S.library.smartRecent },
+              { value: "width:desc", label: "宽度 ↓" },
+              { value: "width:asc", label: "宽度 ↑" },
+              { value: "height:desc", label: "高度 ↓" },
+              { value: "height:asc", label: "高度 ↑" },
+              { value: "ratio:desc", label: "宽高比 ↓" },
+              { value: "ratio:asc", label: "宽高比 ↑" },
+              { value: "exposure:desc", label: "曝光度 ↓" },
+              { value: "exposure:asc", label: "曝光度 ↑" },
+              { value: "colorfulness:desc", label: "颜色丰富度 ↓" },
+              { value: "colorfulness:asc", label: "颜色丰富度 ↑" },
+              { value: "contrast:desc", label: "对比度 ↓" },
+              { value: "contrast:asc", label: "对比度 ↑" },
+              { value: "saturation:desc", label: "饱和度 ↓" },
+              { value: "saturation:asc", label: "饱和度 ↑" },
             ]}
           />
 
@@ -1205,29 +1629,57 @@ export function LibraryPage({ active }: { active: boolean }) {
                     }
                   />
                 )
-              ) : view === "grid" ? (
-                <div
-                  className="library-grid"
-                  style={{
-                    gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
-                    gap: GAP,
-                  }}
-                >
-                  {items.map((asset) => (
-                    <AssetCard
-                      key={asset.id}
-                      asset={asset}
-                      selected={selectionSet.has(asset.id)}
-                      focused={focusedId === asset.id}
-                      onClick={(event) => handleCardClick(asset, event)}
-                      onToggle={() => toggleSelected(asset.id)}
-                      onOpen={() => void openAsset(asset.id)}
-                      onDragSelect={(value) => startDragSelect(asset.id, value)}
-                      onDragEnter={() => dragSelectEnter(asset.id)}
-                    />
-                  ))}
+              ) : view === "grid" && masonry ? (
+                <div className="grid-sizer masonry-sizer" style={{ height: masonry.total }}>
+                  {masonry.columns.map((indices, column) => {
+                    const tops = masonry.tops[column];
+                    const start = Math.max(
+                      0,
+                      lowerBound(tops, scrollTop - MASONRY_OVERSCAN - masonry.maxHeight),
+                    );
+                    const end = Math.min(
+                      indices.length,
+                      lowerBound(tops, scrollTop + viewportHeight + MASONRY_OVERSCAN) + 1,
+                    );
+                    if (end <= start) return null;
+                    return (
+                      <div
+                        className="masonry-col"
+                        key={column}
+                        style={{ left: column * (cardWidth + GAP), width: cardWidth }}
+                      >
+                        {indices.slice(start, end).map((itemIndex, offset) => {
+                          const asset = items[itemIndex];
+                          if (!asset) return null;
+                          return (
+                            <div
+                              className="masonry-item"
+                              key={asset.id}
+                              style={{ top: tops[start + offset] }}
+                            >
+                              <AssetCard
+                                asset={asset}
+                                selected={selectionSet.has(asset.id)}
+                                focused={focusedId === asset.id}
+                                onClick={(event) => handleCardClick(asset, event)}
+                                onToggle={() => toggleSelected(asset.id)}
+                                onOpen={() => void openAsset(asset.id)}
+                                onDragSelect={(value, event) =>
+                                  startDragSelect(asset.id, value, event.clientX, event.clientY)
+                                }
+                                onDragEnter={() => dragSelectEnter(asset.id)}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
                   {loadingMore ? (
-                    <div className="loading-line library-grid-loading">
+                    <div
+                      className="loading-line library-grid-loading"
+                      style={{ position: "absolute", bottom: 8, left: 0, right: 0, justifyContent: "center" }}
+                    >
                       <Spinner /> {S.library.loadingMore}
                     </div>
                   ) : null}
@@ -1275,6 +1727,15 @@ export function LibraryPage({ active }: { active: boolean }) {
                   {hiddenSelected > 0 ? <span>{S.library.hiddenSelected(hiddenSelected)}</span> : null}
                 </div>
                 <div className="selection-actions">
+                  <button
+                    type="button"
+                    className="btn subtle"
+                    onClick={() => void toggleSelectAll()}
+                    title={S.library.selectAll}
+                  >
+                    <Icon name="check-circle" className="sm" />
+                    <span>{total > 0 && selection.length >= total ? "取消全选" : "全选"}</span>
+                  </button>
                   <Dropdown
                     width={240}
                     align="end"
@@ -1311,6 +1772,17 @@ export function LibraryPage({ active }: { active: boolean }) {
                     <Icon name="tag" className="sm" />
                     <span>{S.library.batchEdit}</span>
                   </button>
+                  {!filter.recycledOnly ? (
+                    <button
+                      type="button"
+                      className="btn subtle"
+                      onClick={() => void recycleSelection()}
+                      title="将选中图片移至回收区，可撤销"
+                    >
+                      <Icon name="trash" className="sm" />
+                      <span>回收</span>
+                    </button>
+                  ) : null}
                   <Dropdown
                     width={240}
                     align="end"
@@ -1507,7 +1979,7 @@ function AssetCard({
   onClick: (event: React.MouseEvent) => void;
   onToggle: () => void;
   onOpen: () => void;
-  onDragSelect: (value: boolean) => void;
+  onDragSelect: (value: boolean, event: React.PointerEvent<HTMLButtonElement>) => void;
   onDragEnter: () => void;
 }) {
   const [failed, setFailed] = useState(false);
@@ -1543,7 +2015,7 @@ function AssetCard({
       >
         {!failed ? (
           <img
-            src={sourceThumbUrl(asset)}
+            src={gridThumbUrl(asset)}
             alt={asset.name}
             loading="lazy"
             draggable={false}
@@ -1569,7 +2041,7 @@ function AssetCard({
             if (event.button !== 0) return;
             event.preventDefault();
             event.stopPropagation();
-            onDragSelect(!selected);
+            onDragSelect(!selected, event);
           }}
           onClick={(event) => event.stopPropagation()}
           onKeyDown={(event) => {
@@ -1656,19 +2128,19 @@ function AssetListRow({
     >
       <button
         type="button"
-        className={classNames("card-check", "checked", "static")}
-        style={{ position: "static", opacity: 1, width: 22, height: 22, borderRadius: 6, flex: "none" }}
+        className={classNames("card-check", "static", selected && "checked")}
         onClick={(event) => {
           event.stopPropagation();
           onToggle();
         }}
         aria-label={selected ? "取消选择" : "选择图片"}
+        aria-pressed={selected}
       >
         {selected ? <Icon name="check" size={14} /> : null}
       </button>
       <span className="list-thumb checker">
         {failed ? <Icon name="image" className="sm" style={{ margin: 14, color: "var(--faint)" }} /> : (
-          <img src={thumbUrl(asset)} alt="" loading="lazy" onError={() => setFailed(true)} />
+          <img src={lowThumbUrl(asset)} alt="" loading="lazy" onError={() => setFailed(true)} />
         )}
       </span>
       <div className="list-main">

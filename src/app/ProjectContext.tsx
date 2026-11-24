@@ -52,6 +52,8 @@ export interface ProjectContextValue {
 
   refreshToken: number;
   bumpRefresh: () => void;
+  /** 导入批次提交后的增量刷新信号；只用于图库，不触发项目与去重重算。 */
+  librarySignal: number;
 
   collections: CollectionInfo[];
   reloadCollections: () => Promise<void>;

@@ -21,6 +21,8 @@ import type {
   DedupeActionResult,
   DedupeRecycled,
   DedupeScan,
+  DedupeSummary,
+  MetricsBackfillResult,
   DuplicateGroupView,
   ExportConfig,
   ExportPreview,
@@ -152,12 +154,30 @@ export const api = {
     }),
 
   scanImport: (req: ScanRequest) => call<ScanPreview>("import_scan", { req }),
-  startImport: (scanId: string, collectionId?: string | null) =>
-    call<ImportResult>("import_start", { scanId, collectionId: collectionId || null }),
+  startImport: (
+    scanId: string,
+    collectionId?: string | null,
+    mode?: "copy" | "reference",
+    duplicatePolicy?: "skip" | "keep",
+  ) =>
+    call<ImportResult>("import_start", {
+      scanId,
+      collectionId: collectionId || null,
+      mode: mode || null,
+      duplicatePolicy: duplicatePolicy || null,
+    }),
   retryImport: (jobId: string) => call<ImportResult>("import_retry", { jobId }),
 
-  queryAssets: (filter: AssetFilter, sort: AssetSort, offset: number, limit: number) =>
-    call<AssetsPage>("assets_query", { req: { filter, sort, offset, limit } }),
+  queryAssets: (
+    filter: AssetFilter,
+    sort: AssetSort,
+    offset: number,
+    limit: number,
+    cursor?: string | null,
+  ) =>
+    call<AssetsPage>("assets_query", {
+      req: { filter, sort, offset, limit, cursor: cursor || null },
+    }),
   assetIds: (filter: AssetFilter) => call<string[]>("assets_ids", { filter }),
   getAsset: (id: string) => call<AssetDetail>("asset_get", { id }),
   assetSummaries: (ids: string[]) => call<AssetSummary[]>("assets_summaries", { ids }),
@@ -272,11 +292,17 @@ export const api = {
 
   dedupeScan: (threshold?: number) =>
     call<DedupeScan>("dedupe_scan", { threshold: threshold ?? null }),
+  dedupeSummary: (threshold?: number) =>
+    call<DedupeSummary>("dedupe_summary", { threshold: threshold ?? null }),
   dedupeRecycled: () => call<DedupeRecycled[]>("dedupe_recycled"),
   dedupeRecycle: (assetIds: string[]) =>
     call<DedupeActionResult>("dedupe_recycle", { assetIds }),
   dedupeRestore: (assetIds: string[]) =>
     call<DedupeActionResult>("dedupe_restore", { assetIds }),
+  recycleAssets: (assetIds: string[]) =>
+    call<DedupeActionResult>("assets_recycle", { assetIds }),
+  backfillMetrics: () =>
+    call<MetricsBackfillResult>("assets_metrics_backfill"),
 
   exportPreview: (config: ExportConfig) => call<ExportPreview>("export_preview", { config }),
   exportStart: (previewId: string) => call<ExportStartResult>("export_start", { previewId }),

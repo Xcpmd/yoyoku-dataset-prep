@@ -320,6 +320,13 @@ export function RootProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // 启动后用一次真实 ping 验证解释器与 Pillow，避免未检测时误报就绪。
+  useEffect(() => {
+    if (!ready) return;
+    void pingWorker();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
   const value = useMemo<RootContextValue>(
     () => ({
       settings,

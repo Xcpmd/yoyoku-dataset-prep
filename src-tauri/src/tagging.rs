@@ -81,14 +81,10 @@ pub fn download_root(state: &AppState) -> PathBuf {
     state.data_dir.join("models")
 }
 
-fn tagger_python() -> String {
-    if let Some(root) = tagger_root() {
-        let embedded = root.join("python31010").join("python.exe");
-        if embedded.exists() {
-            return embedded.to_string_lossy().to_string();
-        }
-    }
-    "python".to_string()
+/// WD14 与基础图像工作进程共用设置中的 Python 运行时；
+/// 未配置时按 `YOYOKU_PYTHON`、开发机候选、PATH 的顺序解析。
+fn tagger_python(state: &AppState) -> String {
+    crate::state::resolve_python(state.settings().python_path.as_deref())
 }
 
 fn model_dirs(state: &AppState) -> Vec<PathBuf> {
@@ -152,10 +148,16 @@ fn florence_model_dir(state: &AppState) -> Option<PathBuf> {
  * system Python from PATH.
  */
 fn florence_python(state: &AppState) -> String {
-    state
+    if let Some(path) = state
         .settings()
         .python_path
         .filter(|path| !path.trim().is_empty())
+    {
+        return path;
+    }
+    std::env::var("YOYOKU_PYTHON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "python".to_string())
 }
 
@@ -631,7 +633,7 @@ pub fn generate(
             )
         } else {
             let model_dir = resolve_model_dir(state, model_id)?;
-            let python = tagger_python();
+            let python = tagger_python(state);
             let result =
                 run_tagger(&source, &model_dir, threshold, character_threshold, &script, &python)?;
             let mode = {

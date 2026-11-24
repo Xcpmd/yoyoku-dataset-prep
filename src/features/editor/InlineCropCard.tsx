@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AssetSummary, CropRect, TransformPlan } from "../../lib/types";
-import { classNames, displayUrl } from "../../lib/utils";
+import { classNames, displayUrl, gridThumbUrl } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import { Spinner } from "../../components/ui";
 
@@ -49,8 +49,16 @@ export function InlineCropCard({
   const viewRef = useRef(view);
   viewRef.current = view;
   const [imageReady, setImageReady] = useState(false);
+  const [highResRequested, setHighResRequested] = useState(false);
+  const [highResReady, setHighResReady] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
   const [dirty, setDirty] = useState(false);
+
+  // 裁剪板默认只加载 256 px 原图代理；交互或进入选中后升级到 1600 px 大图。
+  const requestHighRes = () => setHighResRequested(true);
+  useEffect(() => {
+    if (selected) setHighResRequested(true);
+  }, [selected]);
 
   useEffect(() => {
     const element = stageRef.current;
@@ -129,6 +137,7 @@ export function InlineCropCard({
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       event.stopPropagation();
+      requestHighRes();
       const current = viewRef.current;
       const factor = Math.exp(-event.deltaY * 0.0015);
       const next = clampView({
@@ -208,6 +217,7 @@ export function InlineCropCard({
   const imageW = geometry.baseW * view.zoom;
   const imageH = geometry.baseH * view.zoom;
   const source = displayUrl(asset.id, asset.displayVersion || `card-${asset.thumbVersion}`);
+  const preview = gridThumbUrl(asset);
   const imageLeft = stageSize.width / 2 + view.panX - imageW / 2;
   const imageTop = stageSize.height / 2 + view.panY - imageH / 2;
 
@@ -219,13 +229,30 @@ export function InlineCropCard({
         style={{ aspectRatio: `${asset.width} / ${asset.height}` }}
       >
         <img
-          src={source}
-          alt={asset.name}
+          src={preview}
+          alt=""
           className="crop-card-full"
           draggable={false}
           onLoad={() => setImageReady(true)}
           style={{ width: imageW, height: imageH, left: imageLeft, top: imageTop }}
         />
+        {highResRequested ? (
+          <img
+            src={source}
+            alt={asset.name}
+            className="crop-card-full"
+            draggable={false}
+            onLoad={() => setHighResReady(true)}
+            style={{
+              width: imageW,
+              height: imageH,
+              left: imageLeft,
+              top: imageTop,
+              opacity: highResReady ? 1 : 0,
+              transition: "opacity 180ms var(--ease, ease)",
+            }}
+          />
+        ) : null}
         <div
           className="crop-card-frame"
           style={{
@@ -241,6 +268,7 @@ export function InlineCropCard({
           className="crop-card-drag-layer"
           onPointerDown={(event) => {
             if (event.button !== 0) return;
+            requestHighRes();
             event.preventDefault();
             event.currentTarget.setPointerCapture(event.pointerId);
             dragRef.current = { startX: event.clientX, startY: event.clientY, view: viewRef.current };

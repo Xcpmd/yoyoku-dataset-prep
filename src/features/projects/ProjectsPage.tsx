@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api, normalizeError } from "../../lib/api";
 import type { ProjectInfo, RecentProject } from "../../lib/types";
 import { useRoot } from "../../app/AppProvider";
@@ -35,6 +35,7 @@ const TEMPLATES: { value: Template; label: string; hint: string }[] = [
 export function ProjectsPage() {
   const { recents, reloadRecents, adoptProject, notify, appInfo, pingWorker } = useRoot();
   const [search, setSearch] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -238,11 +239,25 @@ export function ProjectsPage() {
             <div className="search-box" style={{ maxWidth: "none" }}>
               <Icon name="search" className="sm" />
               <input
+                ref={searchRef}
                 className="input"
                 placeholder={S.projects.searchPlaceholder}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
               />
+              {search ? (
+                <button
+                  type="button"
+                  className="search-clear"
+                  aria-label="清除搜索"
+                  onClick={() => {
+                    setSearch("");
+                    searchRef.current?.focus();
+                  }}
+                >
+                  <Icon name="x" className="sm" />
+                </button>
+              ) : null}
             </div>
           </div>
         </div>
@@ -253,7 +268,7 @@ export function ProjectsPage() {
               <Icon name={recents.length === 0 ? "layers" : "search"} size={28} />
             </div>
             <h2>{recents.length === 0 ? S.projects.emptyTitle : S.projects.noResults}</h2>
-            <p>{recents.length === 0 ? S.projects.emptyBody : S.projects.searchPlaceholder}</p>
+            <p>{recents.length === 0 ? S.projects.emptyBody : "试试其他关键词，或清除搜索查看全部项目。"}</p>
             {recents.length === 0 ? (
               <div className="row-wrap" style={{ justifyContent: "center", marginTop: 8 }}>
                 <button type="button" className="btn primary" onClick={() => setCreateOpen(true)}>

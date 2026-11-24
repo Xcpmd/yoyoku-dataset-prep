@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AssetDetail, TransformPlan, CropRect } from "../../lib/types";
 import { S } from "../../lib/strings";
-import { classNames, clamp, displayUrl, previewUrl as previewSrc } from "../../lib/utils";
+import { classNames, clamp, displayUrl, lowThumbUrl, previewUrl as previewSrc } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import { Dropdown, IconButton, MenuItem, MenuLabel, Segmented, Spinner } from "../../components/ui";
 
@@ -555,6 +555,22 @@ export function CanvasStage({
                 boxShadow: "0 12px 42px rgba(0,0,0,.22)",
               }}
             >
+              {!imageReady && !imageFailed ? (
+                <img
+                  className="canvas-image canvas-image-low"
+                  src={lowThumbUrl(asset.summary)}
+                  alt=""
+                  draggable={false}
+                  style={{
+                    width: imageWidth,
+                    height: imageHeight,
+                    transform: imageTransform,
+                    filter: colorFilter,
+                    opacity: 0.65,
+                    pointerEvents: "none",
+                  }}
+                />
+              ) : null}
               {!imageFailed ? (
                 <img
                   className="canvas-image"

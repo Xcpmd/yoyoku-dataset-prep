@@ -13,6 +13,7 @@ pub mod collections;
 pub mod history;
 pub mod import;
 pub mod jobs;
+pub mod metrics;
 pub mod prompt_library;
 pub mod quality;
 pub mod sample;
@@ -138,7 +139,7 @@ impl Project {
     pub fn display_path(&self, asset_id: &str, version: &str) -> PathBuf {
         self.displays_dir()
             .join(asset_id)
-            .join(format!("{version}.png"))
+            .join(format!("{version}.webp"))
     }
 
     pub fn ensure_layout(&self) -> AppResult<()> {

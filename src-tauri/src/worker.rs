@@ -12,6 +12,13 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// 图像处理请求优先级：正在浏览的图片优先于导入、指标回填和导出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    Interactive,
+    Background,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzeInfo {
@@ -30,6 +37,14 @@ pub struct AnalyzeInfo {
     pub blur: f64,
     pub dark_ratio: f64,
     pub bright_ratio: f64,
+    #[serde(default)]
+    pub exposure: f64,
+    #[serde(default)]
+    pub contrast: f64,
+    #[serde(default)]
+    pub saturation: f64,
+    #[serde(default)]
+    pub colorfulness: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,12 +229,19 @@ impl Drop for Worker {
 /// 固定图像处理槽位（默认 2 个），任务与命令共享。
 pub struct WorkerPool {
     slots: Vec<Arc<Mutex<Option<Worker>>>>,
-    idle: Mutex<VecDeque<usize>>,
+    state: Mutex<PoolState>,
     cv: Condvar,
     python: String,
     script: PathBuf,
     log_path: PathBuf,
     last_error: Mutex<Option<String>>,
+    verified: std::sync::atomic::AtomicBool,
+}
+
+struct PoolState {
+    idle: VecDeque<usize>,
+    waiting_interactive: usize,
+    waiting_background: usize,
 }
 
 impl WorkerPool {
@@ -231,12 +253,17 @@ impl WorkerPool {
         }
         Self {
             slots: (0..count).map(|_| Arc::new(Mutex::new(None))).collect(),
-            idle: Mutex::new(queue),
+            state: Mutex::new(PoolState {
+                idle: queue,
+                waiting_interactive: 0,
+                waiting_background: 0,
+            }),
             cv: Condvar::new(),
             python,
             script,
             log_path,
             last_error: Mutex::new(None),
+            verified: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -256,38 +283,96 @@ impl WorkerPool {
         self.last_error.lock().clone()
     }
 
+    /// 是否已通过一次真实图像操作验证运行时；未检测过时返回 false。
+    pub fn verified(&self) -> bool {
+        self.verified.load(Ordering::Relaxed)
+    }
+
     pub fn worker_count(&self) -> usize {
         self.slots.len()
     }
 
     pub fn ping(&self) -> AppResult<PingInfo> {
-        let value = self.call("ping", json!({}), Duration::from_secs(30))?;
+        let value = self.call_priority(
+            "ping",
+            json!({}),
+            Duration::from_secs(30),
+            Priority::Interactive,
+        )?;
         let info: PingInfo = serde_json::from_value(value)
             .map_err(|e| AppError::new("WORKER_PROTOCOL", format!("工作进程响应异常：{e}")))?;
         Ok(info)
     }
 
     pub fn call(&self, op: &str, params: Value, timeout: Duration) -> AppResult<Value> {
-        let index = self.acquire()?;
+        self.call_priority(op, params, timeout, Priority::Background)
+    }
+
+    pub fn call_priority(
+        &self,
+        op: &str,
+        params: Value,
+        timeout: Duration,
+        priority: Priority,
+    ) -> AppResult<Value> {
+        let index = self.acquire(priority)?;
         let slot = self.slots[index].clone();
         let result = self.call_slot(&slot, op, params, timeout);
-        if let Err(error) = &result {
-            *self.last_error.lock() = Some(error.message.clone());
+        match &result {
+            Ok(_) => {
+                self.verified.store(true, Ordering::Relaxed);
+            }
+            Err(error) => {
+                *self.last_error.lock() = Some(error.message.clone());
+                if matches!(
+                    error.code.as_str(),
+                    "WORKER_UNAVAILABLE"
+                        | "WORKER_INTERRUPTED"
+                        | "WORKER_TIMEOUT"
+                        | "WORKER_PROTOCOL"
+                ) {
+                    self.verified.store(false, Ordering::Relaxed);
+                }
+            }
         }
-        self.idle.lock().push_back(index);
-        self.cv.notify_one();
+        self.release(index);
         result
     }
 
-    fn acquire(&self) -> AppResult<usize> {
+    fn acquire(&self, priority: Priority) -> AppResult<usize> {
         let deadline = Instant::now() + Duration::from_secs(180);
-        let mut queue = self.idle.lock();
+        let mut state = self.state.lock();
+        let mut waiting = false;
         loop {
-            if let Some(index) = queue.pop_front() {
-                return Ok(index);
+            // 交互请求可以使用任意空闲槽位；后台请求只在没有交互等待者时取槽位，
+            // 避免导入和指标回填在用户切换图片时占满队列。
+            let blocked = matches!(priority, Priority::Background) && state.waiting_interactive > 0;
+            if !blocked {
+                if let Some(index) = state.idle.pop_front() {
+                    if waiting {
+                        match priority {
+                            Priority::Interactive => state.waiting_interactive -= 1,
+                            Priority::Background => state.waiting_background -= 1,
+                        }
+                    }
+                    return Ok(index);
+                }
+            }
+            if !waiting {
+                match priority {
+                    Priority::Interactive => state.waiting_interactive += 1,
+                    Priority::Background => state.waiting_background += 1,
+                }
+                waiting = true;
             }
             let now = Instant::now();
             if now >= deadline {
+                if waiting {
+                    match priority {
+                        Priority::Interactive => state.waiting_interactive -= 1,
+                        Priority::Background => state.waiting_background -= 1,
+                    }
+                }
                 return Err(AppError::new(
                     "WORKER_BUSY",
                     "图像处理队列繁忙，请稍后重试",
@@ -296,9 +381,15 @@ impl WorkerPool {
             }
             if self
                 .cv
-                .wait_for(&mut queue, deadline - now)
+                .wait_for(&mut state, deadline - now)
                 .timed_out()
             {
+                if waiting {
+                    match priority {
+                        Priority::Interactive => state.waiting_interactive -= 1,
+                        Priority::Background => state.waiting_background -= 1,
+                    }
+                }
                 return Err(AppError::new(
                     "WORKER_BUSY",
                     "图像处理队列繁忙，请稍后重试",
@@ -306,6 +397,11 @@ impl WorkerPool {
                 .retryable(true));
             }
         }
+    }
+
+    fn release(&self, index: usize) {
+        self.state.lock().idle.push_back(index);
+        self.cv.notify_all();
     }
 
     fn call_slot(
@@ -332,12 +428,17 @@ impl WorkerPool {
         }
     }
 
-    pub fn analyze(&self, path: &Path) -> AppResult<AnalyzeInfo> {
-        let value = self.call(
-            "analyze",
-            json!({ "path": path.to_string_lossy() }),
-            Duration::from_secs(120),
-        )?;
+    pub fn analyze(
+        &self,
+        path: &Path,
+        thumb: Option<(&Path, u32)>,
+    ) -> AppResult<AnalyzeInfo> {
+        let mut params = json!({ "path": path.to_string_lossy() });
+        if let Some((out, size)) = thumb {
+            params["thumbOut"] = json!(out.to_string_lossy());
+            params["thumbSize"] = json!(size);
+        }
+        let value = self.call("analyze", params, Duration::from_secs(120))?;
         serde_json::from_value(value)
             .map_err(|e| AppError::new("WORKER_PROTOCOL", format!("分析结果异常：{e}")))
     }
@@ -350,6 +451,50 @@ impl WorkerPool {
         max_side: Option<u32>,
         format: Option<&str>,
         timeout_secs: u64,
+    ) -> AppResult<RenderInfo> {
+        self.render_priority(
+            source,
+            plan,
+            out,
+            max_side,
+            format,
+            timeout_secs,
+            Priority::Background,
+        )
+    }
+
+    /// 预览等交互渲染使用交互优先级，避免排在大批导入之后。
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_interactive(
+        &self,
+        source: &Path,
+        plan: &crate::model::TransformPlan,
+        out: &Path,
+        max_side: Option<u32>,
+        format: Option<&str>,
+        timeout_secs: u64,
+    ) -> AppResult<RenderInfo> {
+        self.render_priority(
+            source,
+            plan,
+            out,
+            max_side,
+            format,
+            timeout_secs,
+            Priority::Interactive,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_priority(
+        &self,
+        source: &Path,
+        plan: &crate::model::TransformPlan,
+        out: &Path,
+        max_side: Option<u32>,
+        format: Option<&str>,
+        timeout_secs: u64,
+        priority: Priority,
     ) -> AppResult<RenderInfo> {
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)?;
@@ -365,7 +510,12 @@ impl WorkerPool {
         if let Some(format) = format {
             params["format"] = json!(format);
         }
-        let value = self.call("render", params, Duration::from_secs(timeout_secs))?;
+        let value = self.call_priority(
+            "render",
+            params,
+            Duration::from_secs(timeout_secs),
+            priority,
+        )?;
         serde_json::from_value(value)
             .map_err(|e| AppError::new("WORKER_PROTOCOL", format!("渲染结果异常：{e}")))
     }
@@ -388,7 +538,12 @@ impl WorkerPool {
         if let Some(plan) = plan {
             params["plan"] = serde_json::to_value(plan)?;
         }
-        self.call("thumbnail", params, Duration::from_secs(120))?;
+        self.call_priority(
+            "thumbnail",
+            params,
+            Duration::from_secs(120),
+            Priority::Interactive,
+        )?;
         Ok(())
     }
 
@@ -396,7 +551,7 @@ impl WorkerPool {
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        self.call(
+        self.call_priority(
             "display",
             json!({
                 "path": source.to_string_lossy(),
@@ -404,6 +559,7 @@ impl WorkerPool {
                 "maxSide": max_side,
             }),
             Duration::from_secs(120),
+            Priority::Interactive,
         )
     }
 

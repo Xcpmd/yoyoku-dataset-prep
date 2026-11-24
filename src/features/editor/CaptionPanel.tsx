@@ -757,9 +757,11 @@ export function CaptionPanel({
             {S.caption.saveNow}
           </button>
         </div>
-        <p className="hint" style={{ marginTop: 6 }}>
-          短语与自然语言描述都显示为短语，并一起参与翻译；触发词由项目设置自动添加到导出文本开头。
-        </p>
+        {triggerWord ? (
+          <p className="hint" style={{ marginTop: 6 }}>
+            导出触发词 · {triggerWord}
+          </p>
+        ) : null}
         <div className="caption-ai-row">
           <span className="caption-ai-label">
             <Icon name="sparkles" className="sm" />
@@ -1018,9 +1020,7 @@ export function CaptionPanel({
           </div>
         )}
         <div className="row" style={{ justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-          <span className="hint">
-            Enter 添加一条短语；自然语言整句会作为一条短语，与标签一起翻译。
-          </span>
+          <span className="hint">Enter 添加短语</span>
           <div className="row" style={{ gap: 8, marginLeft: "auto", flexWrap: "wrap" }}>
             <Dropdown
               width={280}

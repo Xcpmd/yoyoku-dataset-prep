@@ -312,6 +312,8 @@ pub struct AssetsPage {
     pub items: Vec<AssetSummary>,
     pub total: i64,
     pub next_offset: Option<i64>,
+    /// 稳定游标：下一页从该资产之后开始；排序键变化或该资产消失时前端回退到偏移分页。
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

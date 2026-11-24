@@ -149,6 +149,7 @@ export interface AssetsPage {
   items: AssetSummary[];
   total: number;
   nextOffset: number | null;
+  nextCursor: string | null;
 }
 
 export interface IssueInfo {
@@ -252,7 +253,19 @@ export interface AssetFilter {
 }
 
 export interface AssetSort {
-  field: "import" | "name" | "edge" | "status" | "date";
+  field:
+    | "import"
+    | "name"
+    | "edge"
+    | "status"
+    | "date"
+    | "width"
+    | "height"
+    | "ratio"
+    | "exposure"
+    | "colorfulness"
+    | "contrast"
+    | "saturation";
   direction: "asc" | "desc";
 }
 
@@ -443,6 +456,19 @@ export interface DedupeScan {
   threshold: number;
   scanned: number;
   groups: DedupeGroup[];
+  recycled: number;
+}
+
+export interface MetricsBackfillResult {
+  jobId: string;
+  total: number;
+}
+
+export interface DedupeSummary {
+  threshold: number;
+  scanned: number;
+  groups: number;
+  duplicates: number;
   recycled: number;
 }
 

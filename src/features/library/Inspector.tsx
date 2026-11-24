@@ -13,7 +13,8 @@ import {
   splitLabel,
   statusLabel,
   statusTone,
-  sourceThumbUrl,
+  lowSourceThumbRaw,
+  displayUrl,
 } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import {
@@ -64,6 +65,11 @@ export function Inspector({
   const [busy, setBusy] = useState(false);
   const [excludeOpen, setExcludeOpen] = useState(false);
   const [note, setNote] = useState("");
+  const [fullReady, setFullReady] = useState(false);
+
+  useEffect(() => {
+    setFullReady(false);
+  }, [detail?.summary.id]);
 
   useEffect(() => {
     if (!open || !targetId) {
@@ -311,8 +317,16 @@ export function Inspector({
               }}
             >
               <img
-                src={sourceThumbUrl(detail.summary)}
+                className="low"
+                src={lowSourceThumbRaw(detail.summary.id, detail.summary.displayVersion)}
                 alt={detail.summary.name}
+                onDoubleClick={() => onOpenWorkbench(detail.summary.id)}
+              />
+              <img
+                className={classNames("full", fullReady && "ready")}
+                src={displayUrl(detail.summary.id, detail.summary.displayVersion)}
+                alt={detail.summary.name}
+                onLoad={() => setFullReady(true)}
                 onDoubleClick={() => onOpenWorkbench(detail.summary.id)}
               />
             </div>

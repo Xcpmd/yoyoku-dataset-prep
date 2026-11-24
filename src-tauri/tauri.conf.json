@@ -47,7 +47,11 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../worker": "worker"
+      "../worker/main.py": "worker/main.py",
+      "../worker/translate.py": "worker/translate.py",
+      "../worker/tagging/download_model.py": "worker/tagging/download_model.py",
+      "../worker/tagging/florence_infer.py": "worker/tagging/florence_infer.py",
+      "../worker/tagging/wd14_infer.py": "worker/tagging/wd14_infer.py"
     },
     "windows": {
       "nsis": {

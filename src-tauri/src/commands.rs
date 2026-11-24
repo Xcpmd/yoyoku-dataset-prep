@@ -24,7 +24,7 @@ pub async fn app_info(state: State<'_, AppState>) -> AppResult<AppInfo> {
     Ok(AppInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         data_dir: state.data_dir.to_string_lossy().to_string(),
-        worker_ready: state.worker.last_error().is_none(),
+        worker_ready: state.worker.verified() && state.worker.last_error().is_none(),
         worker_python: state.python.clone(),
         worker_script: state.worker_script.to_string_lossy().to_string(),
         worker_log: state.worker_log.to_string_lossy().to_string(),
@@ -367,8 +367,14 @@ pub async fn asset_relink_root(
 #[tauri::command]
 pub async fn import_scan(state: State<'_, AppState>, req: ScanRequest) -> AppResult<ScanPreview> {
     let project = state.project()?;
-    let cache = import::scan(&project, &req)?;
-    let preview = import::preview_of(&cache);
+    // 目录遍历与文件头读取放到阻塞线程，避免扫描期间占用异步运行时。
+    let (cache, preview) = tauri::async_runtime::spawn_blocking(move || {
+        let cache = import::scan(&project, &req)?;
+        let preview = import::preview_of(&cache);
+        Ok::<_, AppError>((cache, preview))
+    })
+    .await
+    .map_err(|error| AppError::new("WORKER_INTERRUPTED", format!("扫描中断：{error}")))??;
     let mut scans = state.scans.lock();
     scans.clear();
     scans.insert(cache.id.clone(), cache);
@@ -381,6 +387,8 @@ pub async fn import_start(
     state: State<'_, AppState>,
     scan_id: String,
     collection_id: Option<String>,
+    mode: Option<String>,
+    duplicate_policy: Option<String>,
 ) -> AppResult<ImportResult> {
     let project = state.project()?;
     let mut cache = state
@@ -390,6 +398,13 @@ pub async fn import_start(
         .or_else(|| import::load_scan(&project, &scan_id).ok())
         .ok_or_else(|| AppError::new("SCAN_EXPIRED", "扫描结果已过期，请重新扫描"))?;
     cache.options.collection_id = collection_id.filter(|value| !value.trim().is_empty());
+    // 复制方式与重复策略不影响扫描结果，可在提交时直接覆盖旧扫描选项。
+    if let Some(mode) = mode.filter(|value| value == "copy" || value == "reference") {
+        cache.options.mode = mode;
+    }
+    if let Some(policy) = duplicate_policy.filter(|value| value == "skip" || value == "keep") {
+        cache.options.duplicate_policy = policy;
+    }
     let total = cache.entries.iter().filter(|e| e.status == "ok").count() as i64;
     let job_id = import::start_import(app, project, cache)?;
     Ok(ImportResult { job_id, total })
@@ -408,7 +423,16 @@ pub async fn import_retry(
         .get("scanId")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::new("SCAN_EXPIRED", "任务没有可重试的扫描结果"))?;
-    let cache = import::load_scan(&project, scan_id)?;
+    let mut cache = import::load_scan(&project, scan_id)?;
+    // 重试沿用创建任务时最终生效的分组，避免后续选组丢失。
+    if let Some(collection_id) = job
+        .input
+        .get("collectionId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    {
+        cache.options.collection_id = Some(collection_id.to_string());
+    }
     let total = cache.entries.iter().filter(|e| e.status == "ok").count() as i64;
     let new_job = import::start_import(app, project, cache)?;
     Ok(ImportResult { job_id: new_job, total })
@@ -425,12 +449,21 @@ pub struct AssetsQueryRequest {
     pub sort: AssetSort,
     pub offset: i64,
     pub limit: i64,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[tauri::command]
 pub async fn assets_query(state: State<'_, AppState>, req: AssetsQueryRequest) -> AppResult<AssetsPage> {
     let project = state.project()?;
-    assets::query(&project, &req.filter, &req.sort, req.offset, req.limit)
+    assets::query(
+        &project,
+        &req.filter,
+        &req.sort,
+        req.offset,
+        req.limit,
+        req.cursor.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -841,7 +874,47 @@ pub async fn dedupe_scan(
     threshold: Option<u32>,
 ) -> AppResult<quality::DedupeScan> {
     let project = state.project()?;
-    quality::dedupe_scan(&project, threshold)
+    tauri::async_runtime::spawn_blocking(move || quality::dedupe_scan(&project, threshold))
+        .await
+        .map_err(|error| {
+            AppError::new("WORKER_INTERRUPTED", format!("去重扫描中断：{error}"))
+        })?
+}
+
+#[tauri::command]
+pub async fn dedupe_summary(
+    state: State<'_, AppState>,
+    threshold: Option<u32>,
+) -> AppResult<quality::DedupeSummary> {
+    let project = state.project()?;
+    // 短锁读取指纹与有效阈值后立即释放，分组计算放到阻塞线程。
+    let (fingerprint, effective) = {
+        let conn = project.conn();
+        (
+            quality::dedupe_fingerprint(&conn)?,
+            quality::effective_threshold(&conn, threshold),
+        )
+    };
+    if let Some(entry) = state.dedupe_cache.lock().get(&project.id) {
+        if entry.threshold == effective && entry.fingerprint == fingerprint {
+            return Ok(entry.summary.clone());
+        }
+    }
+    let project_for_task = project.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        quality::dedupe_summary(&project_for_task, Some(effective))
+    })
+    .await
+    .map_err(|error| AppError::new("WORKER_INTERRUPTED", format!("去重扫描中断：{error}")))??;
+    state.dedupe_cache.lock().insert(
+        project.id.clone(),
+        state::DedupeCacheEntry {
+            fingerprint,
+            threshold: effective,
+            summary: summary.clone(),
+        },
+    );
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -866,6 +939,24 @@ pub async fn dedupe_restore(
 ) -> AppResult<quality::DedupeActionResult> {
     let project = state.project()?;
     quality::dedupe_restore(&project, &asset_ids)
+}
+
+#[tauri::command]
+pub async fn assets_metrics_backfill(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<project::metrics::MetricsBackfillResult> {
+    let project = state.project()?;
+    project::metrics::start_backfill(app, project)
+}
+
+#[tauri::command]
+pub async fn assets_recycle(
+    state: State<'_, AppState>,
+    asset_ids: Vec<String>,
+) -> AppResult<quality::DedupeActionResult> {
+    let project = state.project()?;
+    quality::assets_recycle(&project, &asset_ids)
 }
 
 // ---------------------------------------------------------------------------

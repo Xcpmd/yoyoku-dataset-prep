@@ -3,7 +3,7 @@ use crate::model::{AppSettings, RecentProject, RecentStore};
 use crate::project::Project;
 use crate::util;
 use crate::worker::WorkerPool;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -12,6 +12,52 @@ use std::sync::Arc;
 pub struct JobControl {
     pub cancel: AtomicBool,
     pub pause: AtomicBool,
+}
+
+/// 去重摘要缓存：按项目、候选指纹和阈值复用，避免图库角标重复扫描整库。
+#[derive(Clone)]
+pub struct DedupeCacheEntry {
+    pub fingerprint: String,
+    pub threshold: u32,
+    pub summary: crate::project::quality::DedupeSummary,
+}
+
+/// 有界并发闸门：超过容量的图片协议请求排队，避免快速滚动时线程持续堆积。
+pub struct ImageGate {
+    capacity: usize,
+    active: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl ImageGate {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            active: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub fn acquire(&self) -> ImageGateGuard<'_> {
+        let mut active = self.active.lock();
+        while *active >= self.capacity {
+            self.cv.wait(&mut active);
+        }
+        *active += 1;
+        ImageGateGuard { gate: self }
+    }
+}
+
+pub struct ImageGateGuard<'a> {
+    gate: &'a ImageGate,
+}
+
+impl Drop for ImageGateGuard<'_> {
+    fn drop(&mut self) {
+        let mut active = self.gate.active.lock();
+        *active = active.saturating_sub(1);
+        self.gate.cv.notify_one();
+    }
 }
 
 impl Default for JobControl {
@@ -33,6 +79,11 @@ pub struct AppState {
     pub batch_previews: Mutex<HashMap<String, crate::project::assets::PendingBatch>>,
     pub export_previews: Mutex<HashMap<String, crate::exports::PendingExport>>,
     pub job_controls: Mutex<HashMap<String, Arc<JobControl>>>,
+    pub dedupe_cache: Mutex<HashMap<String, DedupeCacheEntry>>,
+    /// 图片协议中同一张图的并发请求合并；键为项目/资产/变体/版本。
+    pub asset_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 限制图片协议同时等待图像槽位的请求数，避免快速滚动时线程堆积。
+    pub protocol_gate: std::sync::Arc<ImageGate>,
     pub python: String,
     pub worker_script: PathBuf,
     pub worker_log: PathBuf,
@@ -51,11 +102,12 @@ impl AppState {
         );
         let worker_script = resolve_worker_script(resource_dir.as_deref())?;
         let worker_log = data_dir.join("logs").join("worker.log");
+        let image_slots = settings.image_slots.clamp(1, 8) as usize;
         let worker = WorkerPool::new(
             python.clone(),
             worker_script.clone(),
             worker_log.clone(),
-            settings.image_slots.clamp(1, 8) as usize,
+            image_slots,
         );
         Ok(Self {
             data_dir,
@@ -67,6 +119,9 @@ impl AppState {
             batch_previews: Mutex::new(HashMap::new()),
             export_previews: Mutex::new(HashMap::new()),
             job_controls: Mutex::new(HashMap::new()),
+            dedupe_cache: Mutex::new(HashMap::new()),
+            asset_locks: Mutex::new(HashMap::new()),
+            protocol_gate: std::sync::Arc::new(ImageGate::new(image_slots * 2 + 2)),
             python,
             worker_script,
             worker_log,
@@ -220,7 +275,12 @@ pub fn upsert_recent(store: &mut RecentStore, info: &crate::model::ProjectInfo, 
     }
 }
 
+/// 开发机上的候选运行时。发布构建不应探测构建机的绝对路径与 wd14Tagger，
+/// 否则同机测试会掩盖目标机缺少 Python / Pillow 的问题。
 fn existing_python(script_root: &Path) -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
     let candidates = [
         script_root.join("runtime").join("python").join("python.exe"),
         script_root.join("python").join("python.exe"),
@@ -242,6 +302,8 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 图像工作进程、WD14 与 Florence 共用的解释器解析顺序：
+/// 设置中的 Python → `YOYOKU_PYTHON` → 开发机候选 → PATH 中的 `python`。
 pub fn resolve_python(preferred: Option<&str>) -> String {
     if let Some(path) = preferred {
         let trimmed = path.trim();
@@ -272,7 +334,10 @@ pub fn resolve_worker_script(resource_dir: Option<&Path>) -> AppResult<PathBuf> 
         candidates.push(resource.join("worker").join("main.py"));
         candidates.push(resource.join("_up_").join("worker").join("main.py"));
     }
-    candidates.push(workspace_root().join("worker").join("main.py"));
+    if cfg!(debug_assertions) {
+        // 仅在开发构建中使用仓库内的脚本，避免发布版误用构建机源码。
+        candidates.push(workspace_root().join("worker").join("main.py"));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             candidates.push(parent.join("worker").join("main.py"));

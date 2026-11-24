@@ -15,7 +15,7 @@ import {
   formatNumber,
   statusLabel,
   statusTone,
-  thumbUrlRaw,
+  lowThumbRaw,
   prettyPath,
 } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
@@ -43,6 +43,7 @@ export function QualityPage({ active }: { active: boolean }) {
   const [selectedRule, setSelectedRule] = useState<string | null>(null);
   const [issues, setIssues] = useState<QualityIssues | null>(null);
   const [issuesLoading, setIssuesLoading] = useState(false);
+  const [issueLimit, setIssueLimit] = useState(100);
   const [duplicates, setDuplicates] = useState<DuplicateGroupView[] | null>(null);
   const [duplicatesLoading, setDuplicatesLoading] = useState(false);
   const [duplicateSelection, setDuplicateSelection] = useState<Set<string>>(new Set());
@@ -51,6 +52,11 @@ export function QualityPage({ active }: { active: boolean }) {
   const [ignoreTarget, setIgnoreTarget] = useState<IssueRow | null>(null);
   const [dismissTarget, setDismissTarget] = useState<DuplicateGroupView | null>(null);
   const [rescanning, setRescanning] = useState(false);
+
+  // 同一规则的问题可能上千条，先渲染前 100 条，避免一次挂载整页卡片。
+  useEffect(() => {
+    setIssueLimit(100);
+  }, [issues]);
 
   const loadSummary = useCallback(async () => {
     setSummaryLoading(true);
@@ -421,10 +427,10 @@ export function QualityPage({ active }: { active: boolean }) {
                       />
                     ) : (
                       <div className="issue-rows">
-                        {issues.rows.map((row) => (
+                        {issues.rows.slice(0, issueLimit).map((row) => (
                           <div className="issue-row" key={row.id}>
                             <div className="issue-thumb">
-                              <img src={thumbUrlRaw(row.assetId, row.thumbVersion)} alt="" loading="lazy" />
+                              <img src={lowThumbRaw(row.assetId, row.thumbVersion)} alt="" loading="lazy" />
                             </div>
                             <div className="issue-main">
                               <div className="issue-name">{row.assetName}</div>
@@ -464,6 +470,17 @@ export function QualityPage({ active }: { active: boolean }) {
                             </div>
                           </div>
                         ))}
+                        {issues.rows.length > issueLimit ? (
+                          <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
+                            <button
+                              type="button"
+                              className="btn subtle sm"
+                              onClick={() => setIssueLimit((current) => current + 200)}
+                            >
+                              显示更多（剩余 {issues.rows.length - issueLimit} 张）
+                            </button>
+                          </div>
+                        ) : null}
                       </div>
                     )}
                   </div>
@@ -477,7 +494,29 @@ export function QualityPage({ active }: { active: boolean }) {
           duplicatesLoading && duplicates === null ? (
             <div className="loading-line"><Spinner size="lg" /> 正在载入重复组…</div>
           ) : !duplicates || duplicates.length === 0 ? (
-            <EmptyState icon="copy" title={S.quality.noDuplicates} body="精确重复与感知近似重复会按组展示，并可在导出时保持一致分割。" />
+            <EmptyState
+              icon="copy"
+              title={
+                summary?.scannedAt && !summary.stale
+                  ? "未发现重复图片"
+                  : summary?.scannedAt
+                    ? "重复检查结果已过期"
+                    : "尚未检查重复图片"
+              }
+              body={
+                summary?.scannedAt && !summary.stale
+                  ? undefined
+                  : "运行一次质量检查后，这里会列出完全相同或高度相似的图片组。"
+              }
+              actions={
+                summary?.scannedAt && !summary.stale ? undefined : (
+                  <button type="button" className="btn primary" onClick={() => void rescan()} disabled={rescanning}>
+                    {rescanning ? <Spinner /> : <Icon name="shield" />}
+                    开始检查
+                  </button>
+                )
+              }
+            />
           ) : (
             <div className="dup-grid">
               <div className="row" style={{ justifyContent: "space-between" }}>
@@ -522,7 +561,7 @@ export function QualityPage({ active }: { active: boolean }) {
                         key={member.assetId}
                       >
                         <div className="dup-thumb checker">
-                          <img src={thumbUrlRaw(member.assetId, member.thumbVersion)} alt="" loading="lazy" />
+                          <img src={lowThumbRaw(member.assetId, member.thumbVersion)} alt="" loading="lazy" />
                         </div>
                         <div className="row" style={{ gap: 6 }}>
                           <input

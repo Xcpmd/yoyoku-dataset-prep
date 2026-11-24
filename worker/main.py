@@ -15,7 +15,7 @@ import os
 import sys
 import traceback
 
-from PIL import Image, ImageCms, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", newline="\n")
@@ -26,6 +26,17 @@ RESAMPLE = {
     "lanczos": Image.Resampling.LANCZOS,
     "bicubic": Image.Resampling.BICUBIC,
 }
+
+# 所有会实际解码原图的入口共用同一个像素上限；与 Rust 侧的 80 MP 约束一致。
+MAX_PIXELS = 80_000_000
+
+
+class OpError(Exception):
+    """带协议错误码的操作异常。"""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 
 def round_half_up(value):
@@ -65,11 +76,29 @@ def has_alpha(im):
     return im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
 
 
-def load_normalized(path):
-    """解码、EXIF 归正、ICC 转 sRGB。返回 (image, meta)。"""
-    source = Image.open(path)
+def load_normalized(path, draft_max=None, max_pixels=MAX_PIXELS, single_frame=False):
+    """解码、EXIF 归正、ICC 转 sRGB。返回 (image, meta)。
+
+    draft_max 仅用于分析/缩略统计：JPEG 让解码器直接输出较低分辨率，
+    避免为 32x32 哈希和 512 统计解码整张 4K 图片。归一化尺寸仍按原图计算。
+
+    max_pixels 与 single_frame 在真正解码之前检查，覆盖扫描后路径被替换的情况；
+    导出、显示与缩略图的入口都走同一份约束。
+    """
+    source = None
+    try:
+        source = Image.open(path)
+    except Image.DecompressionBombError as error:
+        raise OpError("TOO_LARGE", "图片像素超过上限 80 MP") from error
     frames = int(getattr(source, "n_frames", 1) or 1)
     raw_width, raw_height = source.size
+    if max_pixels and raw_width * raw_height > max_pixels:
+        raise OpError(
+            "TOO_LARGE",
+            f"图片像素超过上限 80 MP（当前 {raw_width}×{raw_height}）",
+        )
+    if single_frame and frames > 1:
+        raise OpError("UNSUPPORTED_FORMAT", "多帧图片不支持导入")
     orientation = 1
     icc_bytes = source.info.get("icc_profile")
     try:
@@ -79,6 +108,11 @@ def load_normalized(path):
 
     alpha_source = has_alpha(source)
     source_format = source.format or os.path.splitext(path)[1].lstrip(".").upper()
+    if draft_max and str(source_format).upper() in ("JPEG", "MPO"):
+        try:
+            source.draft("RGB", (int(draft_max), int(draft_max)))
+        except Exception:
+            pass
 
     im = ImageOps.exif_transpose(source)
     im.load()
@@ -109,11 +143,14 @@ def load_normalized(path):
     elif im.mode == "LA":
         im = im.convert("RGBA")
 
+    normalized_width, normalized_height = (
+        (raw_height, raw_width) if orientation in (5, 6, 7, 8) else (raw_width, raw_height)
+    )
     meta = {
         "rawWidth": raw_width,
         "rawHeight": raw_height,
-        "width": im.width,
-        "height": im.height,
+        "width": normalized_width,
+        "height": normalized_height,
         "format": str(source_format).upper(),
         "mode": im.mode,
         "frames": frames,
@@ -298,14 +335,17 @@ def save_image(im, out_path, plan, force_format=None):
             im = im.convert("RGB")
         quality = int(plan.get("quality") or 95)
         im.save(out_path, format="JPEG", quality=quality, optimize=True, subsampling=0)
+    elif fmt == "webp":
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGBA" if has_alpha(im) else "RGB")
+        im.save(out_path, format="WEBP", lossless=True, quality=100, method=3)
     else:
         if im.mode not in ("RGB", "RGBA"):
             im = im.convert("RGBA" if has_alpha(im) else "RGB")
         im.save(out_path, format="PNG", optimize=True)
 
 
-def analyze_image(path):
-    im, meta = load_normalized(path)
+def analyze_loaded(im, meta):
     # 透明像素按白底参与哈希与统计
     flat = flatten(im, "#ffffff") if im.mode == "RGBA" else im.convert("RGB")
 
@@ -325,13 +365,37 @@ def analyze_image(path):
     dark_ratio = sum(histogram[0:13]) / total
     bright_ratio = sum(histogram[243:256]) / total
 
+    # 排序指标：曝光（平均亮度）、对比度（亮度标准差）、饱和度与颜色丰富度。
+    gray_stat = ImageStat.Stat(gray)
+    exposure = float(gray_stat.mean[0]) / 255.0
+    contrast = float(gray_stat.stddev[0]) / 255.0
+    saturation = float(ImageStat.Stat(proxy.convert("HSV")).mean[1]) / 255.0
+    r, g, b = proxy.split()
+    rg_diff = ImageChops.difference(r, g)
+    rg_mean = float(ImageStat.Stat(r).mean[0]) - float(ImageStat.Stat(g).mean[0])
+    rg_std = float(ImageStat.Stat(rg_diff).stddev[0])
+    avg_rg = ImageChops.add(r, g, scale=2.0)
+    yb_diff = ImageChops.difference(avg_rg, b)
+    yb_mean = float(ImageStat.Stat(avg_rg).mean[0]) - float(ImageStat.Stat(b).mean[0])
+    yb_std = float(ImageStat.Stat(yb_diff).stddev[0])
+    colorfulness = (math.hypot(rg_std, yb_std) + 0.3 * math.hypot(rg_mean, yb_mean)) / 255.0
+
     return {
         **meta,
         "phash": perceptual_hash(flat),
         "blur": blur,
         "darkRatio": dark_ratio,
         "brightRatio": bright_ratio,
+        "exposure": round(exposure, 5),
+        "contrast": round(contrast, 5),
+        "saturation": round(saturation, 5),
+        "colorfulness": round(colorfulness, 5),
     }
+
+
+def analyze_image(path):
+    im, meta = load_normalized(path, draft_max=1024, single_frame=True)
+    return analyze_loaded(im, meta)
 
 
 _DCT_TABLE = None
@@ -386,7 +450,19 @@ def perceptual_hash(im):
 
 def op_analyze(params):
     path = params["path"]
-    info = analyze_image(path)
+    im, meta = load_normalized(path, draft_max=1024, single_frame=True)
+    info = analyze_loaded(im, meta)
+    thumb_out = params.get("thumbOut")
+    if thumb_out:
+        try:
+            size = int(params.get("thumbSize") or 256)
+            rendered = flatten(im, "#ffffff") if im.mode == "RGBA" else im.convert("RGB")
+            rendered.thumbnail((size, size), Image.Resampling.LANCZOS)
+            os.makedirs(os.path.dirname(thumb_out) or ".", exist_ok=True)
+            save_image(rendered, thumb_out, {"format": "jpg", "quality": 86})
+        except Exception:
+            # 缩略图失败不阻塞导入，图库请求时会再次按需生成。
+            pass
     return info
 
 
@@ -415,7 +491,7 @@ def op_thumbnail(params):
     size = int(params.get("size") or 384)
     path = params["path"]
     out = params["out"]
-    im, _ = load_normalized(path)
+    im, _ = load_normalized(path, draft_max=max(512, size * 2))
     if plan:
         rendered, _geometry = render_plan(im, plan)
     else:
@@ -433,7 +509,7 @@ def op_display(params):
     max_side = int(params.get("maxSide") or 2048)
     im, meta = load_normalized(path)
     im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-    save_image(im, out, {"format": "png"})
+    save_image(im, out, {"format": "webp"})
     return {
         "width": im.width,
         "height": im.height,
@@ -682,7 +758,8 @@ def main():
             respond(request_id, True, result)
         except Exception as error:  # noqa: BLE001
             traceback.print_exc()
-            respond(request_id, False, error={"code": "WORKER_OP_FAILED", "message": str(error)})
+            code = getattr(error, "code", "WORKER_OP_FAILED")
+            respond(request_id, False, error={"code": code, "message": str(error)})
 
 
 if __name__ == "__main__":

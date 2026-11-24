@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, normalizeError } from "../../lib/api";
 import type { ScanPreview, ScanRequest } from "../../lib/types";
 import { useProject } from "../../app/ProjectContext";
@@ -21,6 +21,13 @@ const STATUS_LABEL: Record<string, string> = {
   error: S.importDialog.statusError,
 };
 
+/** 单个文件显示文件名，目录显示压缩后的路径。 */
+function sourceLabel(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const base = trimmed.split(/[\\/]/).pop() || trimmed;
+  return /\.(jpe?g|png|webp|bmp|tiff?)$/i.test(base) ? base : shortPath(path, 28);
+}
+
 export function ImportDialog({ open, initialPaths, onClose }: Props) {
   const { project, notify, reloadJobs, setJobsOpen, bumpRefresh, collections, reloadCollections } = useProject();
   const [paths, setPaths] = useState<string[]>([]);
@@ -37,6 +44,9 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const scanSeq = useRef(0);
+  const openRef = useRef(open);
+  openRef.current = open;
 
   const options: ScanRequest = useMemo(
     () => ({
@@ -52,10 +62,13 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
   );
 
   useEffect(() => {
+    // 打开或关闭都会让进行中的扫描结果失效。
+    scanSeq.current += 1;
     if (!open) return;
     setError(null);
     setPreview(null);
     setDirty(false);
+    setScanning(false);
     setCollectionId("");
     setNewGroupName("");
     if (initialPaths && initialPaths.length > 0) {
@@ -67,17 +80,20 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
 
   const runScan = async (targetPaths: string[], useOptions: ScanRequest) => {
     if (targetPaths.length === 0) return;
+    const seq = ++scanSeq.current;
     setScanning(true);
     setError(null);
     setPreview(null);
     setDirty(false);
     try {
       const result = await api.scanImport({ ...useOptions, paths: targetPaths });
+      if (seq !== scanSeq.current || !openRef.current) return;
       setPreview(result);
     } catch (error) {
+      if (seq !== scanSeq.current || !openRef.current) return;
       setError(normalizeError(error).message);
     } finally {
-      setScanning(false);
+      if (seq === scanSeq.current) setScanning(false);
     }
   };
 
@@ -103,9 +119,23 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
     }
   };
 
-  const updateOption = <T,>(setter: (value: T) => void) => (value: T) => {
+  /** 会改变扫描结果的选项：修改后必须重新扫描。 */
+  const updateScanOption = <T,>(setter: (value: T) => void) => (value: T) => {
     setter(value);
-    if (preview) setDirty(true);
+    if (scanning) {
+      // 扫描中使用旧选项的请求结果不能回填到新选项。
+      scanSeq.current += 1;
+      setScanning(false);
+      setPreview(null);
+      setDirty(false);
+    } else if (preview) {
+      setDirty(true);
+    }
+  };
+
+  /** 复制方式与重复策略在提交时随任务传入，不需要重新扫描。 */
+  const updateImportOption = <T,>(setter: (value: T) => void) => (value: T) => {
+    setter(value);
   };
 
   const createGroup = async () => {
@@ -130,7 +160,7 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
     setStarting(true);
     setError(null);
     try {
-      const result = await api.startImport(preview.id, collectionId || null);
+      const result = await api.startImport(preview.id, collectionId || null, mode, duplicatePolicy);
       notify({
         tone: "success",
         title: S.importDialog.title,
@@ -150,6 +180,35 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
 
   const summary = preview?.summary;
   const candidates = summary?.candidates || 0;
+  const importReady = Boolean(preview) && !dirty && !scanning && candidates > 0;
+  const primaryMode = starting
+    ? "starting"
+    : scanning
+      ? "scanning"
+      : dirty || (preview && candidates === 0)
+        ? "rescan"
+        : importReady
+          ? "import"
+          : "scan";
+  const primaryLabel =
+    primaryMode === "starting"
+      ? S.importDialog.starting
+      : primaryMode === "scanning"
+        ? S.importDialog.scanning
+        : primaryMode === "rescan"
+          ? S.importDialog.rescan
+          : primaryMode === "import"
+            ? `导入 ${candidates} 张`
+            : "扫描文件";
+  const primaryIcon = primaryMode === "import" ? "import" : primaryMode === "rescan" ? "refresh" : "search";
+  const primaryDisabled = Boolean(starting || scanning) || (primaryMode === "scan" && paths.length === 0);
+  const runPrimary = () => {
+    if (primaryMode === "import") {
+      void start();
+    } else if (primaryMode !== "scanning" && primaryMode !== "starting") {
+      void runScan(paths, options);
+    }
+  };
 
   return (
     <Modal
@@ -161,30 +220,19 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
       closeOnBackdrop={!scanning && !starting}
       footer={
         <>
-          <div className="left hint">{S.importDialog.preserveNote}</div>
+          <div className="left hint import-foot-note">{S.importDialog.preserveNote}</div>
           <button type="button" className="btn ghost" onClick={onClose} disabled={starting}>
             {S.common.cancel}
           </button>
-          {preview && dirty ? (
-            <button
-              type="button"
-              className="btn subtle"
-              onClick={() => void runScan(paths, options)}
-              disabled={scanning}
-            >
-              {scanning ? <Spinner /> : <Icon name="refresh" />}
-              {S.importDialog.rescan}
-            </button>
-          ) : null}
+          {primaryMode === "rescan" ? <span className="tiny faint">需重新扫描</span> : null}
           <button
             type="button"
-            className="btn primary"
-            onClick={() => void start()}
-            disabled={!preview || candidates === 0 || scanning || starting || dirty}
+            className="btn primary import-foot-primary"
+            onClick={runPrimary}
+            disabled={primaryDisabled}
           >
-            {starting ? <Spinner /> : <Icon name="import" />}
-            {starting ? S.importDialog.starting : S.importDialog.start}
-            {preview ? <span style={{ opacity: 0.8 }}>· {candidates}</span> : null}
+            {starting || scanning ? <Spinner /> : <Icon name={primaryIcon} />}
+            {primaryLabel}
           </button>
         </>
       }
@@ -206,23 +254,40 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
               {S.importDialog.chooseFolder}
             </button>
           </div>
-          <span className="hint">{S.importDialog.dropTitle} · 支持 JPG / PNG / 静态 WebP / BMP / TIFF</span>
+          <span className="hint">也可拖入图片或文件夹 · 支持 JPG / PNG / 静态 WebP / BMP / TIFF</span>
         </div>
 
         {paths.length > 0 ? (
           <div className="stack" style={{ gap: 6 }}>
-            <div className="group-title">{S.importDialog.sourceRoots}</div>
-            <div className="row-wrap">
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <div className="group-title">{S.importDialog.sourceRoots} · {paths.length} 项</div>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => {
+                  scanSeq.current += 1;
+                  setPaths([]);
+                  setPreview(null);
+                  setDirty(false);
+                  setScanning(false);
+                }}
+              >
+                清空
+              </button>
+            </div>
+            <div className="row-wrap source-chips">
               {paths.map((path) => (
-                <span className="chip" key={path} title={path}>
+                <span className="chip source-chip" key={path} title={path}>
                   <Icon name="folder" className="sm" />
-                  {shortPath(path, 42)}
+                  <span className="source-chip-name">{sourceLabel(path)}</span>
                   <button
                     type="button"
                     className="x"
                     aria-label="移除路径"
                     onClick={() => {
                       const next = paths.filter((item) => item !== path);
+                      scanSeq.current += 1;
+                      setScanning(false);
                       setPaths(next);
                       setPreview(null);
                       setDirty(false);
@@ -233,6 +298,16 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
                 </span>
               ))}
             </div>
+            <details className="source-paths">
+              <summary className="tiny faint">查看完整路径</summary>
+              <div className="stack" style={{ gap: 3, marginTop: 6 }}>
+                {paths.map((path) => (
+                  <div key={path} className="tiny faint mono truncate" title={path}>
+                    {path}
+                  </div>
+                ))}
+              </div>
+            </details>
           </div>
         ) : null}
 
@@ -241,7 +316,7 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
             <div className="group-title">{S.importDialog.options}</div>
             <Field
               label="导入分组"
-              hint="同一分组的图片在裁剪页共享目标尺寸；也可以稍后在裁剪页调整。"
+              hint="分组可共享裁剪尺寸。"
             >
               <div className="stack" style={{ gap: 8 }}>
                 <Select
@@ -290,7 +365,7 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
             <Field label={S.importDialog.mode} hint={mode === "copy" ? S.importDialog.copyModeHint : S.importDialog.referenceHint}>
               <Segmented
                 value={mode}
-                onChange={updateOption(setMode)}
+                onChange={updateImportOption(setMode)}
                 options={[
                   { value: "copy", label: S.importDialog.copyMode, icon: "copy" },
                   { value: "reference", label: S.importDialog.referenceMode, icon: "link" },
@@ -300,7 +375,7 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
             <Field label={S.importDialog.sidecar} hint={S.importDialog.sidecarPriority}>
               <Segmented
                 value={sidecarPriority}
-                onChange={updateOption(setSidecarPriority)}
+                onChange={updateScanOption(setSidecarPriority)}
                 options={[
                   { value: "txt", label: S.importDialog.sidecarTxt },
                   { value: "caption", label: S.importDialog.sidecarCaption },
@@ -310,29 +385,17 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
           </div>
           <div className="stack" style={{ gap: 12 }}>
             <div className="group-title">&nbsp;</div>
-            <Toggle checked={recursive} onChange={updateOption(setRecursive)} label={S.importDialog.recursive} />
+            <Toggle checked={recursive} onChange={updateScanOption(setRecursive)} label={S.importDialog.recursive} />
             <Field label={S.importDialog.duplicates}>
               <Segmented
                 value={duplicatePolicy}
-                onChange={updateOption(setDuplicatePolicy)}
+                onChange={updateImportOption(setDuplicatePolicy)}
                 options={[
                   { value: "skip", label: S.importDialog.duplicateSkip },
                   { value: "keep", label: S.importDialog.duplicateKeep },
                 ]}
               />
             </Field>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <span className="hint">扫描与导入分两步，导入任务在后台运行。</span>
-              <button
-                type="button"
-                className="btn sm subtle"
-                onClick={() => void runScan(paths, options)}
-                disabled={paths.length === 0 || scanning}
-              >
-                {scanning ? <Spinner /> : <Icon name="search" className="sm" />}
-                {preview ? S.importDialog.rescan : S.importDialog.scan}
-              </button>
-            </div>
           </div>
         </div>
 
@@ -388,20 +451,25 @@ export function ImportDialog({ open, initialPaths, onClose }: Props) {
 
             {summary.conflicts > 0 ? (
               <Notice tone="warning">
-                发现 {summary.conflicts} 个标注候选冲突。导入后会保留优先选择的标注，并在任务报告中列出冲突文件。
+                {summary.conflicts} 张图片同时有 .txt 和 .caption，优先使用 .{sidecarPriority}。完整清单见候选文件与导入任务报告。
               </Notice>
             ) : null}
-            {dirty ? <Notice tone="warning">导入选项已修改，请重新扫描后再开始导入。</Notice> : null}
+            {dirty ? <Notice tone="warning">包含子目录或标注优先级已修改，请重新扫描后再开始导入。</Notice> : null}
 
             <div className="stack" style={{ gap: 6 }}>
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <div className="group-title">{S.importDialog.filesList}</div>
                 {preview.entries.length > 12 ? (
                   <button type="button" className="btn ghost sm" onClick={() => setShowAll((value) => !value)}>
-                    {showAll ? "收起" : `显示全部 ${preview.entries.length}`}
+                    {showAll ? "收起预览" : `展开全部 ${preview.entries.length} 条预览`}
                   </button>
                 ) : null}
               </div>
+              {summary.truncated > 0 ? (
+                <div className="tiny faint">
+                  另有 {formatNumber(summary.truncated)} 项未在预览中，完整清单与异常报告会在导入任务中给出。
+                </div>
+              ) : null}
               <div className="stack" style={{ gap: 4, maxHeight: 300, overflow: "auto" }}>
                 {(showAll ? preview.entries : preview.entries.slice(0, 12)).map((entry) => (
                   <div

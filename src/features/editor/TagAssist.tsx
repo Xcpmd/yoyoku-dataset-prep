@@ -328,10 +328,20 @@ export function TagAssist({
     if (!current || !commit) return;
     const next = current.value.trim();
     if (!next) {
-      void runBulk("remove", { assetIds: selectedIds, tags: [current.tag] }, "stats");
-    } else if (next !== current.tag) {
+      // 空文本不执行删除；删除只走编辑行里的显式按钮。
+      report("标签不能为空，已保留原值", "stats");
+      return;
+    }
+    if (next !== current.tag) {
       void runBulk("rename", { assetIds: selectedIds, from: current.tag, to: next }, "stats");
     }
+  };
+
+  const deleteEditing = (tag: string) => {
+    editRef.current = null;
+    setEditingTag(null);
+    setEditValue("");
+    void runBulk("remove", { assetIds: selectedIds, tags: [tag] }, "stats");
   };
 
   const settleDraft = (commit: boolean) => {
@@ -583,6 +593,18 @@ export function TagAssist({
                     }}
                     onBlur={() => settleEdit(true)}
                   />
+                  <span className="tiny faint stat-edit-scope">{scopeLabel}</span>
+                  <button
+                    type="button"
+                    className="stat-delete"
+                    title={`从 ${scopeLabel} 删除「${entry.tag}」`}
+                    aria-label={`删除标签 ${entry.tag}`}
+                    disabled={bulkBusy}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => deleteEditing(entry.tag)}
+                  >
+                    <Icon name="trash" className="sm" />
+                  </button>
                 </div>
               );
             }
@@ -605,7 +627,7 @@ export function TagAssist({
                   type="button"
                   className="stat-edit"
                   onClick={() => startEdit(entry)}
-                  title="编辑（清空后保存即删除）"
+                  title="编辑标签"
                   aria-label={`编辑 ${entry.tag}`}
                   disabled={bulkBusy}
                 >

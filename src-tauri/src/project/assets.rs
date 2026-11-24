@@ -152,12 +152,14 @@ fn build_filter(filter: &AssetFilter) -> FilterParts {
         }
     }
     if filter.recycled_only {
-        where_parts.push("a.review_status = 'excluded' AND a.excluded_reason = ?".into());
+        where_parts.push("a.review_status = 'excluded' AND a.excluded_reason IN (?, ?)".into());
         values.push(Value::Text(crate::project::quality::DEDUPE_REASON.into()));
-    } else if filter.statuses.is_empty() {
-        // 去重回收的图片默认从图库主视图隐藏，只在回收区筛选中出现。
-        where_parts.push("COALESCE(a.excluded_reason, '') <> ?".into());
+        values.push(Value::Text(crate::project::quality::RECYCLE_REASON.into()));
+    } else {
+        // 回收区图片不属于图库视图；即使状态筛选包含“已排除”也只在回收区出现。
+        where_parts.push("COALESCE(a.excluded_reason, '') NOT IN (?, ?)".into());
         values.push(Value::Text(crate::project::quality::DEDUPE_REASON.into()));
+        values.push(Value::Text(crate::project::quality::RECYCLE_REASON.into()));
     }
     if !filter.orientations.is_empty() {
         let mut parts = Vec::new();
@@ -278,19 +280,43 @@ fn build_filter(filter: &AssetFilter) -> FilterParts {
     }
 }
 
-fn order_sql(sort: &AssetSort) -> String {
-    let direction = if sort.direction.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" };
+fn order_parts(sort: &AssetSort) -> (String, bool) {
     let primary = match sort.field.as_str() {
         "name" => "lower(a.original_name)",
         "edge" => "max(a.norm_width, a.norm_height)",
         "status" => "CASE a.review_status WHEN 'pending' THEN 0 WHEN 'review' THEN 1 WHEN 'approved' THEN 2 ELSE 3 END",
         "date" => "a.imported_at",
+        "width" => "a.norm_width",
+        "height" => "a.norm_height",
+        "ratio" => "(CAST(a.norm_width AS REAL) / MAX(a.norm_height, 1))",
+        "exposure" => "COALESCE(json_extract(a.analysis_json, '$.exposure'), 0.5 + 0.5 * (COALESCE(a.bright_ratio, 0.0) - COALESCE(a.dark_ratio, 0.0)))",
+        "colorfulness" => "COALESCE(json_extract(a.analysis_json, '$.colorfulness'), 0.0)",
+        "contrast" => "COALESCE(json_extract(a.analysis_json, '$.contrast'), MIN(1.0, COALESCE(a.blur_score, 0.0) / 1000.0))",
+        "saturation" => "COALESCE(json_extract(a.analysis_json, '$.saturation'), 0.0)",
         _ => "a.sort_index",
     };
-    format!("{primary} {direction}, a.id ASC")
+    (
+        primary.to_string(),
+        sort.direction.eq_ignore_ascii_case("desc"),
+    )
 }
 
-pub fn query(project: &Project, filter: &AssetFilter, sort: &AssetSort, offset: i64, limit: i64) -> AppResult<AssetsPage> {
+fn order_sql(sort: &AssetSort) -> String {
+    let (primary, descending) = order_parts(sort);
+    format!(
+        "{primary} {}, a.id ASC",
+        if descending { "DESC" } else { "ASC" }
+    )
+}
+
+pub fn query(
+    project: &Project,
+    filter: &AssetFilter,
+    sort: &AssetSort,
+    offset: i64,
+    limit: i64,
+    cursor: Option<&str>,
+) -> AppResult<AssetsPage> {
     let conn = project.conn();
     let cfg = caption_config(&conn)?;
     let parts = build_filter(filter);
@@ -304,6 +330,24 @@ pub fn query(project: &Project, filter: &AssetFilter, sort: &AssetSort, offset: 
     )?;
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
+    let (primary, descending) = order_parts(sort);
+    let cursor_id = cursor.filter(|value| !value.is_empty() && value.len() <= 160);
+    // 稳定游标：用上一页最后一张的排序值与 ID 继续，避免深页 OFFSET 扫描；
+    // 同值排序时以 `a.id ASC` 作为稳定次级键。
+    let (where_sql, cursor_values) = if let Some(id) = cursor_id {
+        let comparison = if descending { "<" } else { ">" };
+        let cursor_expr = primary.replace("a.", "a2.");
+        let sub = format!("(SELECT {cursor_expr} FROM assets a2 WHERE a2.id = ?)");
+        (
+            format!(
+                "({}) AND ({primary} {comparison} {sub} OR ({primary} = {sub} AND a.id > ?))",
+                parts.where_sql
+            ),
+            vec![id.to_string(), id.to_string(), id.to_string()],
+        )
+    } else {
+        (parts.where_sql.clone(), Vec::new())
+    };
     let sql = format!(
         "SELECT {columns} FROM assets a {joins} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
         columns = db::ASSET_COLUMNS
@@ -312,15 +356,18 @@ pub fn query(project: &Project, filter: &AssetFilter, sort: &AssetSort, offset: 
             .collect::<Vec<_>>()
             .join(", "),
         joins = parts.joins,
-        where_sql = parts.where_sql,
+        where_sql = where_sql,
         order = order_sql(sort)
     );
     let mut values: Vec<Box<dyn ToSql>> = Vec::new();
     for value in &parts.params {
         values.push(Box::new(value.clone()));
     }
+    for value in &cursor_values {
+        values.push(Box::new(value.clone()));
+    }
     values.push(Box::new(limit));
-    values.push(Box::new(offset));
+    values.push(Box::new(if cursor_id.is_some() { 0 } else { offset }));
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter().map(|v| v.as_ref())), db::asset_row)?;
     let mut items = Vec::new();
@@ -328,12 +375,24 @@ pub fn query(project: &Project, filter: &AssetFilter, sort: &AssetSort, offset: 
         let asset = row?;
         items.push(summary_from_row(&conn, &asset, &cfg)?);
     }
-    let next_offset = if offset + (items.len() as i64) < total {
+    let next_offset = if cursor_id.is_some() {
+        None
+    } else if offset + (items.len() as i64) < total {
         Some(offset + items.len() as i64)
     } else {
         None
     };
-    Ok(AssetsPage { items, total, next_offset })
+    let next_cursor = if items.len() as i64 == limit {
+        items.last().map(|item| item.id.clone())
+    } else {
+        None
+    };
+    Ok(AssetsPage {
+        items,
+        total,
+        next_offset,
+        next_cursor,
+    })
 }
 
 pub fn resolve_ids(conn: &rusqlite::Connection, filter: &AssetFilter) -> AppResult<Vec<String>> {
@@ -1076,4 +1135,117 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
         history_seq: seq,
         label: pending.label,
     })
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use crate::project::CreateProjectRequest;
+    use std::path::PathBuf;
+
+    fn project_with_assets() -> (Project, PathBuf) {
+        let parent = std::env::temp_dir().join(format!("yk-query-test-{}", util::short_id(8)));
+        std::fs::create_dir_all(&parent).unwrap();
+        let project = crate::project::create_project(&CreateProjectRequest {
+            name: format!("query-test-{}", util::short_id(6)),
+            parent_dir: parent.to_string_lossy().to_string(),
+            model: "sdxl".into(),
+            template: "character".into(),
+            trigger_word: String::new(),
+            default_caption_mode: "tags".into(),
+        })
+        .unwrap();
+        {
+            let conn = project.conn();
+            let rows = [
+                ("a", 250u32),
+                ("b", 200),
+                ("c", 150),
+                ("d", 120),
+                ("e", 100),
+            ];
+            for (index, (name, width)) in rows.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO assets(id, content_hash, source_root_id, rel_path, original_name,
+                        ext, format, bytes, orig_width, orig_height, norm_width, norm_height,
+                        out_width, out_height, imported_at, sort_index)
+                     VALUES(?1, ?2, NULL, ?3, ?4, 'jpg', 'JPEG', 100, ?5, 100, ?5, 100, ?5, 100, ?6, ?7)",
+                    params![
+                        format!("asset-{index}"),
+                        format!("hash-{index}"),
+                        format!("{name}.jpg"),
+                        name,
+                        width,
+                        util::now_iso(),
+                        index as i64 + 1
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        (project, parent)
+    }
+
+    #[test]
+    fn cursor_pagination_matches_order_without_duplicates() {
+        let (project, parent) = project_with_assets();
+        let filter = AssetFilter::default();
+        let sort = AssetSort {
+            field: "width".into(),
+            direction: "desc".into(),
+        };
+        let first = query(&project, &filter, &sort, 0, 2, None).unwrap();
+        assert_eq!(
+            first.items.iter().map(|asset| asset.width).collect::<Vec<_>>(),
+            vec![250, 200]
+        );
+        assert_eq!(first.next_offset, Some(2));
+        assert_eq!(
+            first.next_cursor.as_deref(),
+            Some(first.items[1].id.as_str())
+        );
+
+        let second = query(
+            &project,
+            &filter,
+            &sort,
+            0,
+            2,
+            first.next_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            second.items.iter().map(|asset| asset.width).collect::<Vec<_>>(),
+            vec![150, 120]
+        );
+        assert_eq!(second.next_offset, None);
+
+        let third = query(
+            &project,
+            &filter,
+            &sort,
+            0,
+            2,
+            second.next_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            third.items.iter().map(|asset| asset.width).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(third.next_cursor, None);
+
+        // 指标值相同时按 ID 稳定前进；COALESCE 表达式不会让游标条件变成 NULL。
+        let tied = AssetSort {
+            field: "exposure".into(),
+            direction: "asc".into(),
+        };
+        let page = query(&project, &filter, &tied, 0, 5, None).unwrap();
+        assert_eq!(page.items.len(), 5);
+        let mut seen = std::collections::HashSet::new();
+        assert!(page.items.iter().all(|asset| seen.insert(asset.id.clone())));
+
+        drop(project);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 }

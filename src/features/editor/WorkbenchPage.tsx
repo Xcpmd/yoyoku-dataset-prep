@@ -23,8 +23,8 @@ import {
   formatBytes,
   isEditableElement,
   normalizeKey,
+  lowThumbRaw,
   normalizeTagList,
-  thumbUrlRaw,
 } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import {
@@ -44,7 +44,7 @@ import { InfoPanel } from "./InfoPanel";
 import { CropModeSwitch, type CropMode } from "./CropModeSwitch";
 
 type Tab = "crop" | "caption" | "info";
-type MobileSection = "image" | "crop" | "caption";
+type MobileSection = "image" | "crop" | "caption" | "info";
 
 export function WorkbenchPage({
   active,
@@ -90,6 +90,7 @@ export function WorkbenchPage({
   const [activeTab, setActiveTab] = useState<Tab>(workspace === "tag" ? "caption" : "crop");
   const [sideOpen, setSideOpen] = useState(() => window.innerWidth >= 960);
   const [mobileSection, setMobileSection] = useState<MobileSection>("image");
+  const [mobileRailOpen, setMobileRailOpen] = useState(false);
   const [cropSelection, setCropSelection] = useState<string[]>([]);
   const [linked, setLinked] = useState(false);
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
@@ -126,6 +127,17 @@ export function WorkbenchPage({
     reason?: string;
     next: boolean;
   } | null>(null);
+  const reviewActionLabel = pendingReview
+    ? pendingReview.status === "approved"
+      ? pendingReview.next
+        ? "通过并下一张"
+        : "通过"
+      : pendingReview.status === "review"
+        ? "标记复核"
+        : pendingReview.status === "excluded"
+          ? "排除"
+          : "审核"
+    : "审核";
   const [filmSummaries, setFilmSummaries] = useState<Record<string, AssetSummary>>({});
   const [filmWindow, setFilmWindow] = useState({ start: 0, end: 0 });
 
@@ -613,6 +625,8 @@ export function WorkbenchPage({
     setFilmWindow({ start, end });
     const ids = sequence.slice(start, end);
     if (currentId && !ids.includes(currentId)) ids.push(currentId);
+    // 页面隐藏时停止拉取素材摘要，返回本页时再按当前窗口刷新。
+    if (!active) return;
     let cancelled = false;
     api
       .assetSummaries(ids)
@@ -629,7 +643,7 @@ export function WorkbenchPage({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sequence, currentId, refreshToken]);
+  }, [sequence, currentId, refreshToken, active]);
 
   useEffect(() => {
     const element = filmRef.current?.querySelector<HTMLElement>(`[data-film-id="${currentId}"]`);
@@ -1251,11 +1265,12 @@ export function WorkbenchPage({
 
   const selectMobile = (section: MobileSection) => {
     setMobileSection(section);
+    setMobileRailOpen(false);
     if (section === "image") {
       setSideOpen(false);
     } else {
       setSideOpen(true);
-      setActiveTab(section === "caption" ? "caption" : "crop");
+      setActiveTab(section === "caption" ? "caption" : section === "info" ? "info" : "crop");
     }
   };
 
@@ -1455,18 +1470,25 @@ export function WorkbenchPage({
         <button type="button" className={mobileSection === "image" ? "active" : ""} onClick={() => selectMobile("image")}>
           图片
         </button>
-        <button type="button" className={mobileSection === "crop" ? "active" : ""} onClick={() => selectMobile("crop")}>
-          {workspace === "tag" ? "打标" : "裁剪"}
-        </button>
         {workspace === "tag" ? (
-          <button type="button" className={mobileSection === "caption" ? "active" : ""} onClick={() => selectMobile("caption")}>
-            标注
+          <>
+            <button type="button" className={mobileSection === "info" ? "active" : ""} onClick={() => selectMobile("info")}>
+              统计与词库
+            </button>
+            <button type="button" className={mobileSection === "caption" ? "active" : ""} onClick={() => selectMobile("caption")}>
+              标注
+            </button>
+          </>
+        ) : (
+          <button type="button" className={mobileSection === "crop" ? "active" : ""} onClick={() => selectMobile("crop")}>
+            裁剪
           </button>
-        ) : null}
+        )}
       </div>
 
       <div className="wb-body">
-        <aside className="wb-asset-rail" aria-label="全部图片">
+        {mobileRailOpen ? <div className="wb-rail-backdrop" onClick={() => setMobileRailOpen(false)} /> : null}
+        <aside className={classNames("wb-asset-rail", mobileRailOpen && "mobile-open")} aria-label="全部图片">
           <div className="wb-rail-head">
             <div className="wb-rail-heading">
               <span>全部图片</span>
@@ -1505,6 +1527,13 @@ export function WorkbenchPage({
                 disabled={railSelection.length === 0}
               >
                 清空
+              </button>
+              <button
+                type="button"
+                className="btn subtle sm wb-rail-close"
+                onClick={() => setMobileRailOpen(false)}
+              >
+                完成
               </button>
             </div>
           </div>
@@ -1548,9 +1577,9 @@ export function WorkbenchPage({
                   >
                     {checked ? <Icon name="check" className="sm" /> : null}
                   </button>
-                  <button type="button" className="wb-rail-main" onClick={() => openWorkbench(id)} title={summary?.name || id}>
+                  <button type="button" className="wb-rail-main" onClick={() => { openWorkbench(id); setMobileRailOpen(false); }} title={summary?.name || id}>
                     <span className="wb-rail-thumb">
-                      {summary ? <img src={thumbUrlRaw(summary.id, summary.thumbVersion)} alt="" loading="lazy" /> : null}
+                      {summary ? <img src={lowThumbRaw(summary.id, summary.thumbVersion)} alt="" loading="lazy" /> : null}
                       <span className="wb-rail-index">{filmWindow.start + index + 1}</span>
                       {aiActive ? (
                         <span className="wb-rail-ai-badge active" aria-label="AI 打标中">
@@ -1583,6 +1612,10 @@ export function WorkbenchPage({
           {workspace === "crop" ? (
             <div className="crop-batch-bar">
               <span className="crop-batch-count"><strong>{linkedTargets.length}</strong> 张</span>
+              <button type="button" className="btn subtle sm batch-pick" onClick={() => setMobileRailOpen(true)}>
+                <Icon name="image" className="sm" />
+                {railSelection.length > 0 ? `已选 ${railSelection.length} 张` : "选图片"}
+              </button>
               <button
                 type="button"
                 className={classNames("btn sm", linked ? "secondary" : "subtle")}
@@ -1594,7 +1627,11 @@ export function WorkbenchPage({
                 {linked ? "联动已开启" : "联动调整"}
               </button>
               <span className="hint">
-                {linked ? "应用时会同步到全部选中图片" : "只应用当前图片；勾选多张可联动"}
+                {linkedTargets.length < 2
+                  ? "先选同组至少 2 张"
+                  : linked
+                    ? `联动同组 ${linkedTargets.length} 张`
+                    : `将应用到 ${linkedTargets.length} 张`}
               </span>
               <div className="spacer" />
               {batchProgress ? <span className="tiny mono">{batchProgress.done}/{batchProgress.total}</span> : null}
@@ -1610,6 +1647,15 @@ export function WorkbenchPage({
               >
                 <strong>{tagSelection.length}</strong> 张
               </span>
+              <button type="button" className="btn subtle sm batch-pick" onClick={() => setMobileRailOpen(true)}>
+                <Icon name="image" className="sm" />
+                {tagSelection.length > 0 ? `已选 ${tagSelection.length} 张` : "选图片"}
+              </button>
+              {tagSelection.length > 0 ? (
+                <button type="button" className="btn ghost sm" onClick={clearRailSelection}>
+                  清空
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="btn secondary sm"
@@ -1843,12 +1889,12 @@ export function WorkbenchPage({
       <Modal
         open={pendingReview !== null}
         onClose={() => setPendingReview(null)}
-        title={S.workbench.drafts}
-        subtitle="当前裁剪配方尚未应用，审核会关联已确认的版本。"
+        title="应用草稿后再审核？"
+        subtitle="本图有未应用的裁剪草稿。"
         footer={
           <>
             <button type="button" className="btn ghost" onClick={() => setPendingReview(null)}>
-              {S.common.cancel}
+              返回编辑
             </button>
             <button
               type="button"
@@ -1862,7 +1908,7 @@ export function WorkbenchPage({
                 })();
               }}
             >
-              {S.workbench.discardDraft}
+              放弃草稿，{reviewActionLabel}
             </button>
             <button
               type="button"
@@ -1880,7 +1926,7 @@ export function WorkbenchPage({
               }}
             >
               {applying ? <Spinner /> : null}
-              {S.workbench.applyDraft}
+              应用裁剪，{reviewActionLabel}
             </button>
           </>
         }
@@ -1896,8 +1942,8 @@ export function WorkbenchPage({
         onClose={() => {
           if (!tagBatchRunning) setTagBatchOpen(false);
         }}
-        title="批量一键打标"
-        subtitle={`为选中的 ${tagSelection.length} 张图片生成并追加短语标签或自然语言描述。`}
+        title="批量打标"
+        subtitle={`向 ${tagSelection.length} 张图片追加标注，自动去重。`}
         width="wide"
         footer={
           <>
@@ -1921,9 +1967,24 @@ export function WorkbenchPage({
             <Spinner /> 正在读取本地 WD14 模型…
           </div>
         ) : tagModels.length === 0 ? (
-          <Notice tone="warning">
-            未找到可用的 WD14 标签模型。请先在设置中下载或指定模型目录；Florence-2 权重可单独下载，但当前批量打标使用 WD14。
-          </Notice>
+          <>
+            <Notice tone="warning">
+              暂无可用模型。请先下载 WD14 标签模型，或打开模型设置指定模型目录。
+            </Notice>
+            <div className="row" style={{ justifyContent: "flex-end", marginTop: 10 }}>
+              <button
+                type="button"
+                className="btn subtle"
+                onClick={() => {
+                  setTagBatchOpen(false);
+                  navigate("settings");
+                }}
+              >
+                <Icon name="settings" className="sm" />
+                打开模型设置
+              </button>
+            </div>
+          </>
         ) : (
           <div className="model-download-list">
             {tagModels.map((item) => (

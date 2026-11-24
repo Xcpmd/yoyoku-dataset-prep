@@ -192,7 +192,7 @@ pub fn preview(
     let out = project.previews_dir().join(format!("{hash}.jpg"));
     let cached = out.exists();
     if !cached {
-        worker.render(
+        worker.render_interactive(
             &source,
             &plan,
             &out,
@@ -432,9 +432,9 @@ pub fn ensure_display(project: &Project, worker: &WorkerPool, asset: &AssetRow) 
     let path = project.display_path(&asset.id, &version);
     if !path.exists() {
         let source = project.require_source(asset)?;
-        worker.display(&source, &path, 2048)?;
+        worker.display(&source, &path, 1600)?;
     }
-    Ok(format!("/display/{}/{}.png", asset.id, version))
+    Ok(format!("/display/{}/{}.webp", asset.id, version))
 }
 
 pub fn insert_initial_revision(

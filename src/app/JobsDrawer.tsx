@@ -10,6 +10,7 @@ import { S } from "../lib/strings";
 function kindLabel(kind: string): string {
   if (kind === "import") return "导入";
   if (kind === "export") return "导出";
+  if (kind === "metrics") return "指标";
   return kind;
 }
 

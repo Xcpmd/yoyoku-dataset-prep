@@ -20,6 +20,28 @@ export function sourceThumbUrl(
   return `${ASSET_BASE}/thumb/${asset.id}/source-${asset.displayVersion}`;
 }
 
+/** 图库网格使用的 256 px 原图缩略图，减少首屏解码与传输。 */
+export function gridThumbUrl(
+  asset: Pick<AssetSummary, "id" | "displayVersion">,
+): string {
+  return `${ASSET_BASE}/thumb/${asset.id}/low-source-${asset.displayVersion}`;
+}
+
+/** 处理后的 256 px 缩略图，用于列表、素材栏等小尺寸位置。 */
+export function lowThumbUrl(
+  asset: Pick<AssetSummary, "id" | "thumbVersion">,
+): string {
+  return `${ASSET_BASE}/thumb/${asset.id}/low-${asset.thumbVersion}`;
+}
+
+export function lowThumbRaw(assetId: string, version: string): string {
+  return `${ASSET_BASE}/thumb/${assetId}/low-${version}`;
+}
+
+export function lowSourceThumbRaw(assetId: string, displayVersion: string): string {
+  return `${ASSET_BASE}/thumb/${assetId}/low-source-${displayVersion}`;
+}
+
 export function thumbUrlRaw(assetId: string, version: string): string {
   return `${ASSET_BASE}/thumb/${assetId}/${version}`;
 }

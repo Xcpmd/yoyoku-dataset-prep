@@ -42,6 +42,16 @@ interface Preset {
   config: ExportConfig;
 }
 
+/** 按预检问题类型给出可执行的入口文案。 */
+function issueActionLabel(code: string, message: string): string {
+  const text = `${code} ${message}`;
+  if (/标注|caption|tag/i.test(text)) return "补标注";
+  if (/裁剪|crop|尺寸|分辨率|upscale/i.test(text)) return "调整裁剪";
+  if (/失联|缺失|missing|丢失/i.test(text)) return "定位图片";
+  if (/范围|scope/i.test(text)) return "修改导出范围";
+  return "处理图片";
+}
+
 function loadPresets(): Preset[] {
   try {
     const raw = localStorage.getItem("yoyoku.exportPresets");
@@ -119,6 +129,7 @@ export function ExportPage({ active }: { active: boolean }) {
   const [result, setResult] = useState<Record<string, any> | null>(null);
   const [records, setRecords] = useState<ExportRecordInfo[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [summaryExpanded, setSummaryExpanded] = useState(false);
   const [report, setReport] = useState<ExportRecordInfo | null>(null);
   const [presets, setPresets] = useState<Preset[]>(loadPresets);
   const [presetPrompt, setPresetPrompt] = useState(false);
@@ -413,7 +424,7 @@ export function ExportPage({ active }: { active: boolean }) {
                   <div className="choice-grid">
                     {(
                       [
-                        ["all", S.export.scopeAll, S.export.restrictApproved, "layers"],
+                        ["all", S.export.scopeAll, "包含待审核图片", "layers"],
                         ["approved", S.export.scopeApproved, "仅审核通过的素材", "check-circle"],
                         ["collection", S.export.scopeCollection, "使用手动或智能集合", "folder"],
                         [
@@ -662,7 +673,7 @@ export function ExportPage({ active }: { active: boolean }) {
                         <option value="original">{S.export.namingOriginal}</option>
                       </select>
                     </Field>
-                    <Field label={S.export.imageFormat}>
+                    <Field label={S.export.imageFormat} hint="PNG 为无损输出；JPEG 为有损、体积更小。">
                       <Segmented
                         value={config.imageFormat}
                         onChange={(value) => patch({ imageFormat: value as "png" | "jpg" })}
@@ -1065,6 +1076,15 @@ export function ExportPage({ active }: { active: boolean }) {
               </>
             ) : null}
 
+            {step === 2 && !preview && !previewLoading ? (
+              <Notice tone="warning">
+                配置已修改，需要重新预检后才能导出。
+                <button type="button" className="btn sm subtle" onClick={() => setStep(1)}>
+                  返回重新预检
+                </button>
+              </Notice>
+            ) : null}
+
             {step === 2 && preview ? (
               <>
                 <section className="export-section">
@@ -1084,10 +1104,6 @@ export function ExportPage({ active }: { active: boolean }) {
                     <span className="v mono" style={{ fontSize: 11 }}>{prettyPath(preview.outputPath)}</span>
                   </div>
                   <div className="summary-row">
-                    <span className="k">{S.export.adapter}</span>
-                    <span className="v">{preview.adapterVersion}</span>
-                  </div>
-                  <div className="summary-row">
                     <span className="k">{S.export.splitNote}</span>
                     <span className="v">
                       {preview.split.enabled
@@ -1095,10 +1111,17 @@ export function ExportPage({ active }: { active: boolean }) {
                         : "仅训练集"}
                     </span>
                   </div>
-                  <div className="summary-row">
-                    <span className="k">{S.export.preflightFingerprint}</span>
-                    <span className="v mono" style={{ fontSize: 10.5 }}>{preview.fingerprint.slice(0, 20)}…</span>
-                  </div>
+                  <details className="export-tech">
+                    <summary className="small muted">技术详情</summary>
+                    <div className="summary-row">
+                      <span className="k">{S.export.adapter}</span>
+                      <span className="v">{preview.adapterVersion}</span>
+                    </div>
+                    <div className="summary-row">
+                      <span className="k">{S.export.preflightFingerprint}</span>
+                      <span className="v mono" style={{ fontSize: 10.5 }}>{preview.fingerprint.slice(0, 20)}…</span>
+                    </div>
+                  </details>
                   {preview.warnings.map((warning, index) => (
                     <Notice tone="warning" key={index}>{warning}</Notice>
                   ))}
@@ -1125,7 +1148,12 @@ export function ExportPage({ active }: { active: boolean }) {
                               }
                             >
                               <Icon name="workbench" className="sm" />
-                              处理图片
+                              {issueActionLabel(issue.code, issue.message)}
+                            </button>
+                          ) : /范围|scope/i.test(`${issue.code} ${issue.message}`) ? (
+                            <button type="button" className="btn sm subtle" onClick={() => setStep(0)}>
+                              <Icon name="filter" className="sm" />
+                              修改导出范围
                             </button>
                           ) : (
                             <button type="button" className="btn sm subtle" onClick={() => navigate("quality")}>
@@ -1361,25 +1389,10 @@ export function ExportPage({ active }: { active: boolean }) {
                     </div>
                   </section>
                 ) : null}
-
-                {!result ? (
-                  <div className="row" style={{ justifyContent: "flex-end" }}>
-                    <button
-                      type="button"
-                      className="btn primary"
-                      onClick={() => void start()}
-                      disabled={starting || blockingIssues.length > 0 || Boolean(runningJob)}
-                      title={blockingIssues.length > 0 ? S.export.blockedHint : undefined}
-                    >
-                      {starting || runningJob ? <Spinner /> : <Icon name="export" />}
-                      {runningJob ? S.export.exporting : S.export.startExport}
-                    </button>
-                  </div>
-                ) : null}
               </>
             ) : null}
 
-            <div className="row" style={{ justifyContent: "space-between", marginTop: 4 }}>
+            <div className="export-foot">
               <button
                 type="button"
                 className="btn ghost"
@@ -1389,6 +1402,7 @@ export function ExportPage({ active }: { active: boolean }) {
                 <Icon name="arrow-left" />
                 {S.export.back}
               </button>
+              <div className="spacer" />
               {step < 2 ? (
                 <button
                   type="button"
@@ -1400,11 +1414,42 @@ export function ExportPage({ active }: { active: boolean }) {
                   {step === 1 ? S.export.preflightTitle : S.export.next}
                   <Icon name="arrow-right" />
                 </button>
+              ) : !result ? (
+                <div className="export-foot-primary">
+                  {preview ? <span className="tiny faint">本次导出使用预检时确认的版本</span> : null}
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() => void start()}
+                    disabled={!preview || starting || blockingIssues.length > 0 || Boolean(runningJob)}
+                    title={
+                      !preview
+                        ? "请先完成预检"
+                        : blockingIssues.length > 0
+                          ? S.export.blockedHint
+                          : undefined
+                    }
+                  >
+                    {starting || runningJob ? <Spinner /> : <Icon name="export" />}
+                    {runningJob ? S.export.exporting : S.export.startExport}
+                  </button>
+                </div>
               ) : null}
             </div>
           </div>
 
           <aside className="export-side">
+            <button
+              type="button"
+              className="export-summary-toggle"
+              onClick={() => setSummaryExpanded((value) => !value)}
+              aria-expanded={summaryExpanded}
+            >
+              <Icon name="list" className="sm" />
+              导出摘要
+              <span className="tiny faint">{summaryExpanded ? "收起" : "展开"}</span>
+            </button>
+            <div className={classNames("export-summary-body", !summaryExpanded && "is-collapsed")}>
             <h3>{S.export.summary}</h3>
             <div className="summary-list">
               <div className="summary-row">
@@ -1444,7 +1489,11 @@ export function ExportPage({ active }: { active: boolean }) {
               </div>
               <div className="summary-row">
                 <span className="k">{S.export.imageFormat}</span>
-                <span className="v">{config.imageFormat.toUpperCase()} · {config.quality}</span>
+                <span className="v">
+                  {config.imageFormat === "jpg"
+                    ? `JPEG · ${config.quality}`
+                    : "PNG · 无损"}
+                </span>
               </div>
               <div className="summary-row">
                 <span className="k">{S.export.validationTitle}</span>
@@ -1466,11 +1515,12 @@ export function ExportPage({ active }: { active: boolean }) {
                 <div className="tiny faint">{S.export.estimatedSize}</div>
                 <div style={{ fontSize: 20, fontWeight: 700 }}>{formatBytes(preview.estimatedBytes)}</div>
                 <div className="tiny faint" style={{ marginTop: 4 }}>
-                  {preview.counts.eligible} 张 · {preview.counts.train} 训练 / {preview.counts.val} 验证
+                  共 {preview.counts.eligible} 张
                 </div>
               </div>
             ) : null}
             <Notice tone="info">{S.export.targetHint}</Notice>
+            </div>
           </aside>
         </div>
       </div>
@@ -1482,7 +1532,7 @@ export function ExportPage({ active }: { active: boolean }) {
         width="wide"
       >
         {records.length === 0 ? (
-          <EmptyState icon="archive" title={S.export.historyEmpty} body="完成一次导出后会在这里保留输出路径、计数与校验结果。" />
+          <EmptyState icon="archive" title={S.export.historyEmpty} />
         ) : (
           <div className="record-list">
             {records.map((record) => {

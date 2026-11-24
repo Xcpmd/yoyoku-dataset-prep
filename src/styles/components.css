@@ -710,10 +710,62 @@ button.chip {
   padding: 16px 24px 22px;
   border-top: 1px solid var(--line);
   background: color-mix(in srgb, var(--surface) 55%, transparent);
+  flex-wrap: wrap;
 }
 
 .modal-foot .left {
   margin-right: auto;
+}
+
+/* 导入弹窗的来源标签与完整路径展开。 */
+.source-chips {
+  min-width: 0;
+}
+
+.source-chip {
+  max-width: 100%;
+}
+
+.source-chip-name {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-paths {
+  min-width: 0;
+}
+
+.source-paths summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.source-paths .truncate {
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 639.98px) {
+  .modal-foot {
+    padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
+    gap: 8px;
+  }
+
+  .modal-foot .left {
+    display: none;
+  }
+
+  .modal-foot .btn {
+    flex: 1 1 auto;
+    min-height: 40px;
+  }
+
+  .modal-foot .import-foot-primary {
+    flex: 1.5 1 auto;
+  }
 }
 
 @keyframes modal-in {

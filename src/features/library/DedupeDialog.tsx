@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { api, normalizeError } from "../../lib/api";
-import type { DedupeGroup, DedupeMember, DedupeRecycled, DedupeScan } from "../../lib/types";
+import type { DedupeMember, DedupeRecycled, DedupeScan } from "../../lib/types";
 import { useProject } from "../../app/ProjectContext";
-import { classNames, displayUrl, formatBytes, formatDate, sourceThumbUrl } from "../../lib/utils";
+import { classNames, displayUrl, formatBytes, formatDate, lowSourceThumbRaw } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import { EmptyState, Modal, Spinner } from "../../components/ui";
 
@@ -22,8 +22,7 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
 
   const [threshold, setThreshold] = useState(defaultThreshold);
   const [scan, setScan] = useState<DedupeScan | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [keeps, setKeeps] = useState<Record<string, string>>({});
+  const [kept, setKept] = useState<Set<string>>(new Set());
   const [recycled, setRecycled] = useState<DedupeRecycled[] | null>(null);
   const [tab, setTab] = useState<"groups" | "recycle">("groups");
   const [loading, setLoading] = useState(false);
@@ -34,18 +33,38 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
   const [preview, setPreview] = useState<DedupeMember | null>(null);
   const [previewReady, setPreviewReady] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [groupLimit, setGroupLimit] = useState(60);
+  const [recycleLimit, setRecycleLimit] = useState(60);
   const dragRef = useRef<boolean | null>(null);
-  const keepsRef = useRef<Record<string, string>>({});
-  keepsRef.current = keeps;
   const seq = useRef(0);
   const openRef = useRef(false);
   openRef.current = open;
 
   const groups = scan?.groups ?? [];
-  const duplicateCount = useMemo(
-    () => groups.reduce((sum, group) => sum + Math.max(0, group.members.length - 1), 0),
+  const visibleGroups = useMemo(() => groups.slice(0, groupLimit), [groups, groupLimit]);
+  const totalMembers = useMemo(
+    () => groups.reduce((sum, group) => sum + group.members.length, 0),
     [groups],
   );
+  const recycleIds = useMemo(
+    () =>
+      groups.flatMap((group) =>
+        group.members
+          .filter((member) => !kept.has(member.assetId))
+          .map((member) => member.assetId),
+      ),
+    [groups, kept],
+  );
+  const recycleCount = recycleIds.length;
+  const keptCount = totalMembers - recycleCount;
+
+  // 新扫描结果或回收区重载后回到首屏数量，避免一次挂载全部分组/回收项。
+  useEffect(() => {
+    setGroupLimit(60);
+  }, [scan]);
+  useEffect(() => {
+    setRecycleLimit(60);
+  }, [recycled]);
 
   const runScan = useCallback(async (value: number) => {
     const seqId = ++seq.current;
@@ -55,17 +74,12 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
       const result = await api.dedupeScan(value);
       if (seqId !== seq.current || !openRef.current) return;
       setScan(result);
-      const next = new Set<string>();
-      const nextKeeps: Record<string, string> = {};
+      const nextKept = new Set<string>();
       for (const group of result.groups) {
-        const keep = group.members.find((member) => member.keepRecommended) || group.members[0];
-        if (keep) nextKeeps[group.id] = keep.assetId;
-        for (const member of group.members) {
-          if (member.assetId !== keep?.assetId) next.add(member.assetId);
-        }
+        const recommended = group.members.find((member) => member.keepRecommended) || group.members[0];
+        if (recommended) nextKept.add(recommended.assetId);
       }
-      setKeeps(nextKeeps);
-      setSelected(next);
+      setKept(nextKept);
     } catch (error) {
       if (seqId === seq.current) setError(normalizeError(error).message);
     } finally {
@@ -88,8 +102,7 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
     setStatus(null);
     setError(null);
     setScan(null);
-    setSelected(new Set());
-    setKeeps({});
+    setKept(new Set());
     setExpanded(new Set());
     setPreview(null);
     setThreshold(defaultThreshold);
@@ -108,8 +121,8 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
     setPreviewReady(false);
   }, [preview]);
 
-  const setMemberSelected = (assetId: string, value: boolean) => {
-    setSelected((current) => {
+  const setMemberKept = (assetId: string, value: boolean) => {
+    setKept((current) => {
       if (value === current.has(assetId)) return current;
       const next = new Set(current);
       if (value) next.add(assetId);
@@ -118,45 +131,30 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
     });
   };
 
-  const toggleMember = (group: DedupeGroup, assetId: string) => {
-    if (keeps[group.id] === assetId) return;
-    setMemberSelected(assetId, !selected.has(assetId));
-  };
-
-  const chooseKeep = (group: DedupeGroup, assetId: string) => {
-    const previous = keeps[group.id];
-    if (previous === assetId) return;
-    setKeeps({ ...keeps, [group.id]: assetId });
-    setSelected((current) => {
+  const toggleMember = (assetId: string) => {
+    setKept((current) => {
       const next = new Set(current);
-      if (previous) next.add(previous);
-      next.delete(assetId);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
       return next;
     });
   };
 
-  const beginDrag = (
-    event: ReactPointerEvent<HTMLButtonElement>,
-    group: DedupeGroup,
-    member: DedupeMember,
-  ) => {
-    if (event.button !== 0 || keeps[group.id] === member.assetId) return;
+  const beginDrag = (event: ReactPointerEvent<HTMLButtonElement>, member: DedupeMember) => {
+    if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
-    const value = !selected.has(member.assetId);
+    const value = !kept.has(member.assetId);
     dragRef.current = value;
     setDragging(true);
-    setMemberSelected(member.assetId, value);
+    setMemberKept(member.assetId, value);
     const move = (moveEvent: PointerEvent) => {
       if (dragRef.current === null) return;
       const target = document
         .elementFromPoint(moveEvent.clientX, moveEvent.clientY)
         ?.closest<HTMLElement>("[data-dedupe-asset]");
-      if (!target) return;
-      const assetId = target.dataset.dedupeAsset;
-      const groupId = target.dataset.dedupeGroup;
-      if (!assetId || !groupId || keepsRef.current[groupId] === assetId) return;
-      setMemberSelected(assetId, dragRef.current);
+      const assetId = target?.dataset.dedupeAsset;
+      if (assetId) setMemberKept(assetId, dragRef.current);
     };
     const finish = () => {
       dragRef.current = null;
@@ -172,19 +170,18 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
     window.addEventListener("blur", finish);
   };
 
-  const dragEnter = (group: DedupeGroup, member: DedupeMember) => {
-    if (dragRef.current === null || keeps[group.id] === member.assetId) return;
-    setMemberSelected(member.assetId, dragRef.current);
+  const dragEnter = (member: DedupeMember) => {
+    if (dragRef.current === null) return;
+    setMemberKept(member.assetId, dragRef.current);
   };
 
   const applyRecycle = async () => {
-    const ids = Array.from(selected);
-    if (ids.length === 0 || busy) return;
+    if (recycleCount === 0 || busy) return;
     setBusy(true);
     setError(null);
     setStatus(null);
     try {
-      const result = await api.dedupeRecycle(ids);
+      const result = await api.dedupeRecycle(recycleIds);
       onChanged();
       await runScan(threshold);
       await loadRecycled();
@@ -220,15 +217,13 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
       onClose={onClose}
       width="xwide"
       title="图片去重"
-      subtitle="按图片内容查找高度相似的图片。每组默认保留一张，可改选保留项；其余勾选后移入回收区，随时可以恢复。"
+      subtitle="按图片内容查找高度相似的图片。点击图片切换保留 / 回收，可保留多张；未保留的图片移入回收区后可随时恢复。"
       footer={
         <>
           <span className="hint">
             {tab === "recycle"
               ? `回收区 ${Math.max(recycled?.length ?? 0, scan?.recycled ?? 0)} 张`
-              : selected.size > 0
-                ? `已勾选 ${selected.size} 张待回收`
-                : "勾选需要移入回收区的图片"}
+              : `保留 ${keptCount} 张 · 待回收 ${recycleCount} 张`}
           </span>
           <div className="spacer" />
           <button type="button" className="btn ghost" onClick={onClose}>
@@ -237,11 +232,11 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
           <button
             type="button"
             className="btn primary"
-            disabled={tab !== "groups" || selected.size === 0 || busy || loading}
+            disabled={tab !== "groups" || recycleCount === 0 || busy || loading}
             onClick={() => void applyRecycle()}
           >
             {busy ? <Spinner /> : <Icon name="trash" />}
-            移至回收区{selected.size > 0 ? `（${selected.size}）` : ""}
+            移至回收区{recycleCount > 0 ? `（${recycleCount}）` : ""}
           </button>
         </>
       }
@@ -334,13 +329,13 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
             <>
               <div className="dedupe-summary">
                 <span>
-                  <strong>{groups.length}</strong> 组 · <strong>{duplicateCount}</strong> 张可回收
+                  <strong>{groups.length}</strong> 组 · <strong>{recycleCount}</strong> 张待回收
                 </span>
-                <span className="hint">点击图片放大比对 · 拖动回收勾选框可连续多选</span>
+                <span className="hint">点击图片切换保留 · 拖动连续切换 · 右上角看大图</span>
               </div>
               <div className={classNames("dedupe-groups", loading && "is-loading", dragging && "is-dragging")}>
-                {groups.map((group) => {
-                  const keep = group.members.find((member) => member.assetId === keeps[group.id]);
+                {visibleGroups.map((group) => {
+                  const keptInGroup = group.members.filter((member) => kept.has(member.assetId)).length;
                   return (
                     <section className="dedupe-group" key={group.id}>
                       <header className="dedupe-group-head">
@@ -348,41 +343,58 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
                           {group.kind === "exact" ? "完全相同" : "内容相似"}
                         </span>
                         <span className="hint dedupe-group-note">
-                          {group.members.length} 张 · 保留「{keep?.name || "—"}」
+                          {group.members.length} 张 · 保留 {keptInGroup} / 回收{" "}
+                          {group.members.length - keptInGroup}
                         </span>
                       </header>
                       <div className="dedupe-members">
                         {(expanded.has(group.id) ? group.members : group.members.slice(0, 40)).map((member) => {
-                          const isKeep = keeps[group.id] === member.assetId;
-                          const checked = !isKeep && selected.has(member.assetId);
+                          const isKept = kept.has(member.assetId);
                           return (
                             <div
                               key={member.assetId}
-                              className={classNames(
-                                "dedupe-member",
-                                isKeep && "keep",
-                                checked && "checked",
-                              )}
+                              className={classNames("dedupe-member", isKept ? "keep" : "recycle")}
                               data-dedupe-asset={member.assetId}
-                              data-dedupe-group={group.id}
-                              onPointerEnter={() => dragEnter(group, member)}
+                              onPointerEnter={() => dragEnter(member)}
                             >
-                              <button
-                                type="button"
-                                className="dedupe-thumb"
-                                onClick={() => setPreview(member)}
-                                title="点击放大查看"
-                                aria-label={`放大查看 ${member.name}`}
-                              >
-                                <img
-                                  src={sourceThumbUrl({
-                                    id: member.assetId,
-                                    displayVersion: member.displayVersion,
-                                  })}
-                                  alt=""
-                                  loading="lazy"
-                                />
-                              </button>
+                              <div className="dedupe-thumb-wrap">
+                                <button
+                                  type="button"
+                                  className="dedupe-thumb"
+                                  aria-pressed={isKept}
+                                  aria-label={`${isKept ? "改为回收" : "保留"} ${member.name}`}
+                                  onPointerDown={(event) => beginDrag(event, member)}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    if (event.detail === 0) toggleMember(member.assetId);
+                                  }}
+                                  title="点击切换保留 / 回收；按住拖动可连续切换"
+                                >
+                                  <img
+                                    src={lowSourceThumbRaw(member.assetId, member.displayVersion)}
+                                    alt=""
+                                    loading="lazy"
+                                  />
+                                  <span className={classNames("dedupe-state", isKept ? "keep" : "recycle")}>
+                                    {isKept ? <Icon name="check" className="sm" /> : <Icon name="trash" className="sm" />}
+                                    {isKept ? "保留" : "回收"}
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  className="dedupe-zoom"
+                                  aria-label={`查看大图 ${member.name}`}
+                                  title="查看大图"
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setPreviewReady(false);
+                                    setPreview(member);
+                                  }}
+                                >
+                                  <Icon name="zoom-in" className="sm" />
+                                </button>
+                              </div>
                               <div className="dedupe-member-main">
                                 <span className="dedupe-name" title={member.name}>
                                   {member.name}
@@ -393,34 +405,6 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
                                     : ""}
                                   {member.width}×{member.height} · {formatBytes(member.bytes)}
                                 </span>
-                              </div>
-                              <div className="dedupe-member-actions">
-                                <button
-                                  type="button"
-                                  className={classNames("dedupe-keep-btn", isKeep && "active")}
-                                  aria-pressed={isKeep}
-                                  onClick={() => chooseKeep(group, member.assetId)}
-                                  title="设为此组保留图片"
-                                >
-                                  <span className="dot" />
-                                  保留
-                                </button>
-                                {!isKeep ? (
-                                  <button
-                                    type="button"
-                                    className={classNames("dedupe-pick", checked && "checked")}
-                                    aria-pressed={checked}
-                                    aria-label={`${checked ? "取消回收" : "移入回收区"} ${member.name}`}
-                                    onPointerDown={(event) => beginDrag(event, group, member)}
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      if (event.detail === 0) toggleMember(group, member.assetId);
-                                    }}
-                                    title="移入回收区；按住拖动可连续选择"
-                                  >
-                                    {checked ? <Icon name="check" className="sm" /> : null}
-                                  </button>
-                                ) : null}
                               </div>
                             </div>
                           );
@@ -447,6 +431,17 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
                     </section>
                   );
                 })}
+                {groups.length > visibleGroups.length ? (
+                  <div style={{ flex: "1 0 100%", display: "flex", justifyContent: "center", padding: "4px 0" }}>
+                    <button
+                      type="button"
+                      className="btn subtle sm"
+                      onClick={() => setGroupLimit((current) => current + 120)}
+                    >
+                      显示更多（剩余 {groups.length - visibleGroups.length} 组）
+                    </button>
+                  </div>
+                ) : null}
               </div>
             </>
           )
@@ -466,17 +461,10 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
                 全部恢复
               </button>
             </div>
-            {recycled.map((item) => (
+            {recycled.slice(0, recycleLimit).map((item) => (
               <div className="dedupe-recycle-row" key={item.assetId}>
                 <span className="dedupe-thumb small">
-                  <img
-                    src={sourceThumbUrl({
-                      id: item.assetId,
-                      displayVersion: item.displayVersion,
-                    })}
-                    alt=""
-                    loading="lazy"
-                  />
+                  <img src={lowSourceThumbRaw(item.assetId, item.displayVersion)} alt="" loading="lazy" />
                 </span>
                 <div className="dedupe-member-main">
                   <span className="dedupe-name" title={item.name}>
@@ -496,6 +484,17 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
                 </button>
               </div>
             ))}
+            {recycled.length > recycleLimit ? (
+              <div style={{ display: "flex", justifyContent: "center", padding: "6px 0" }}>
+                <button
+                  type="button"
+                  className="btn subtle sm"
+                  onClick={() => setRecycleLimit((current) => current + 120)}
+                >
+                  显示更多（剩余 {recycled.length - recycleLimit} 张）
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : (
           <EmptyState
@@ -527,23 +526,33 @@ export function DedupeDialog({ open, onClose, onChanged }: Props) {
                 >
                   <Icon name="x" />
                 </button>
-                {!previewReady ? (
-                  <div className="dedupe-lightbox-loading">
-                    <Spinner size="lg" />
-                  </div>
-                ) : null}
-                <img
-                  src={displayUrl(preview.assetId, preview.displayVersion)}
-                  alt={preview.name}
-                  onLoad={() => setPreviewReady(true)}
-                  onError={() => setPreviewReady(true)}
-                />
+                <div className="dedupe-lightbox-image">
+                  <img
+                    className="low"
+                    src={lowSourceThumbRaw(preview.assetId, preview.displayVersion)}
+                    alt=""
+                    loading="eager"
+                  />
+                  <img
+                    className={classNames("full", previewReady && "ready")}
+                    src={displayUrl(preview.assetId, preview.displayVersion)}
+                    alt={preview.name}
+                    onLoad={() => setPreviewReady(true)}
+                    onError={() => setPreviewReady(true)}
+                  />
+                  {!previewReady ? (
+                    <div className="dedupe-lightbox-loading">
+                      <Spinner />
+                    </div>
+                  ) : null}
+                </div>
                 <div className="dedupe-lightbox-bar">
                   <span className="name">{preview.name}</span>
                   <span>
                     {preview.width}×{preview.height} · {formatBytes(preview.bytes)}
                   </span>
                   {preview.distance !== null ? <span>距离 {preview.distance}</span> : null}
+                  <span>{kept.has(preview.assetId) ? "保留" : "回收"}</span>
                 </div>
               </div>
             </div>,

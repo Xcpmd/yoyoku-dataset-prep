@@ -9,6 +9,9 @@ import { InlineCropCard } from "./InlineCropCard";
 import { CropModeSwitch, type CropMode } from "./CropModeSwitch";
 
 const UNGROUPED = "__ungrouped__";
+const LOAD_CHUNK = 200;
+/** 超过该数量的分组默认折叠，只显示组名、数量与目标尺寸。 */
+const GROUP_COLLAPSE_THRESHOLD = 48;
 
 type TargetMap = Record<string, { width: string; height: string }>;
 type PlanMap = Record<string, { plan: TransformPlan; revision: number }>;
@@ -44,7 +47,9 @@ export function CropBoardPage({
   const [targets, setTargets] = useState<TargetMap>({});
   const [savingIds, setSavingIds] = useState<Set<string>>(new Set());
   const [applyingGroup, setApplyingGroup] = useState<string | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const lastWorkbenchRef = useRef<string | null>(null);
+  const loadSeq = useRef(0);
 
   const base = snapSize64(projectBaseResolution(project), 1024);
   const groups = useMemo(() => collections.filter((collection) => collection.kind !== "query"), [collections]);
@@ -54,39 +59,49 @@ export function CropBoardPage({
   }, []);
 
   const loadAssets = useCallback(async () => {
+    const seq = ++loadSeq.current;
     setLoading(true);
     setError(null);
     try {
       const ids = Array.from(new Set(await api.assetIds(filter)));
-      const summaries: AssetSummary[] = [];
-      const nextPlans: PlanMap = {};
-      for (let index = 0; index < ids.length; index += 200) {
-        const chunk = ids.slice(index, index + 200);
-        const [chunkSummaries, chunkPlans] = await Promise.all([
+      if (seq !== loadSeq.current) return;
+      setAssets([]);
+      setPlans({});
+      // 分批载入并立即呈现，首批 200 张不再等待整库摘要与配方。
+      for (let index = 0; index < ids.length; index += LOAD_CHUNK) {
+        const chunk = ids.slice(index, index + LOAD_CHUNK);
+        const [summaries, chunkPlans] = await Promise.all([
           api.assetSummaries(chunk),
           api.assetTransformPlans(chunk),
         ]);
-        summaries.push(...chunkSummaries);
-        for (const info of chunkPlans) nextPlans[info.assetId] = { plan: info.plan, revision: info.revision };
+        if (seq !== loadSeq.current) return;
+        setAssets((current) => [...current, ...summaries]);
+        setPlans((current) => {
+          const next = { ...current };
+          for (const info of chunkPlans) next[info.assetId] = { plan: info.plan, revision: info.revision };
+          return next;
+        });
       }
-      setAssets(summaries);
-      setPlans(nextPlans);
     } catch (loadError) {
+      if (seq !== loadSeq.current) return;
       setError(normalizeError(loadError).message);
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
   }, [filter]);
 
   useEffect(() => {
+    if (!active) return;
     void loadAssets();
-  }, [loadAssets, refreshToken]);
+  }, [loadAssets, refreshToken, active]);
 
   useEffect(() => {
+    if (!active) return;
     void reloadCollections();
-  }, [reloadCollections]);
+  }, [reloadCollections, active]);
 
   useEffect(() => {
+    if (!active) return;
     let cancelled = false;
     Promise.all(
       groups.map(async (collection) => [collection.id, await api.collectionIds(collection.id)] as const),
@@ -98,7 +113,7 @@ export function CropBoardPage({
     return () => {
       cancelled = true;
     };
-  }, [groups, assets.length]);
+  }, [groups, refreshToken, active]);
 
   useEffect(() => {
     setTargets((current) => {
@@ -116,10 +131,20 @@ export function CropBoardPage({
     });
   }, [groups, base]);
 
+  // 大图库下逐资产扫描所有分组成员会变成 O(n²)，改为一次建立归属索引。
+  const memberGroup = useMemo(() => {
+    const map = new Map<string, CollectionInfo>();
+    for (const collection of groups) {
+      for (const id of members[collection.id] || []) {
+        if (!map.has(id)) map.set(id, collection);
+      }
+    }
+    return map;
+  }, [groups, members]);
+
   const assetGroup = useCallback(
-    (assetId: string): CollectionInfo | null =>
-      groups.find((collection) => (members[collection.id] || []).includes(assetId)) || null,
-    [groups, members],
+    (assetId: string): CollectionInfo | null => memberGroup.get(assetId) || null,
+    [memberGroup],
   );
 
   const grouped = useMemo(() => {
@@ -139,6 +164,21 @@ export function CropBoardPage({
     return sections;
   }, [assets, groups, members, assetGroup]);
 
+  // 初次加载完成后为每个分组确定折叠状态；之后尊重用户的展开/收起选择。
+  useEffect(() => {
+    if (loading) return;
+    setExpandedGroups((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const section of grouped) {
+        if (next[section.key] !== undefined) continue;
+        next[section.key] = section.assets.length <= GROUP_COLLAPSE_THRESHOLD;
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [loading, grouped]);
+
   const targetFor = (groupId: string | null) => {
     const target = targets[groupId || UNGROUPED] || { width: String(base), height: String(base) };
     const width = snapSize64(Number.parseInt(target.width, 10), base);
@@ -151,6 +191,13 @@ export function CropBoardPage({
     lastWorkbenchRef.current = workbenchId;
     setSelection((current) => (current.includes(workbenchId) ? current : [...current, workbenchId]));
   }, [active, workbenchId]);
+
+  // 从工作台进入的图片若位于折叠组，自动展开该组，保证当前卡片可见。
+  useEffect(() => {
+    if (!workbenchId) return;
+    const key = memberGroup.get(workbenchId)?.id || UNGROUPED;
+    setExpandedGroups((current) => (current[key] ? current : { ...current, [key]: true }));
+  }, [workbenchId, memberGroup]);
 
   const saveTarget = async (groupId: string) => {
     if (!groupId || groupId === UNGROUPED) return;
@@ -165,7 +212,11 @@ export function CropBoardPage({
   };
 
   const applyTargetToGroup = async (section: { key: string; assets: AssetSummary[] }) => {
-    if (!section.assets.length || applyingGroup) return;
+    if (applyingGroup) return;
+    if (section.key === UNGROUPED && groups.some((group) => !Array.isArray(members[group.id]))) {
+      notify({ message: "正在载入分组信息，请稍后再应用" });
+      return;
+    }
     const target = targetFor(section.key);
     setApplyingGroup(section.key);
     let applied = 0;
@@ -175,9 +226,35 @@ export function CropBoardPage({
         await api.updateCollection({ id: section.key, targetWidth: target.width, targetHeight: target.height });
         await reloadCollections();
       }
-      for (const asset of section.assets) {
+      // 折叠或尚未载入完的成员也要按同一方案处理，这里解析完整目标集合。
+      const groupedIds = new Set(Object.values(members).flat());
+      const targetIds =
+        section.key === UNGROUPED
+          ? Array.from(new Set(await api.assetIds(filter))).filter((id) => !groupedIds.has(id))
+          : await api.collectionIds(section.key);
+      if (targetIds.length === 0) return;
+      const knownAssets = new Map(assets.map((asset) => [asset.id, asset] as const));
+      const knownPlans = new Map(Object.entries(plans));
+      const missing = targetIds.filter((id) => !knownAssets.has(id) || !knownPlans.has(id));
+      for (let index = 0; index < missing.length; index += LOAD_CHUNK) {
+        const chunk = missing.slice(index, index + LOAD_CHUNK);
+        const [summaries, chunkPlans] = await Promise.all([
+          api.assetSummaries(chunk),
+          api.assetTransformPlans(chunk),
+        ]);
+        for (const summary of summaries) knownAssets.set(summary.id, summary);
+        for (const info of chunkPlans) {
+          knownPlans.set(info.assetId, { plan: info.plan, revision: info.revision });
+        }
+      }
+      for (const id of targetIds) {
+        const asset = knownAssets.get(id);
+        if (!asset) {
+          failures.push(`${id}：缺少素材信息`);
+          continue;
+        }
+        const info = knownPlans.get(id);
         try {
-          const info = plans[asset.id];
           const plan: TransformPlan = {
             ...(info?.plan || ({} as TransformPlan)),
             scaleMode: "fitCrop",
@@ -185,9 +262,9 @@ export function CropBoardPage({
             height: target.height,
             allowUpscale: true,
           };
-          const result = await api.transformSave(asset.id, plan, info?.revision ?? asset.revision);
-          setPlans((current) => ({ ...current, [asset.id]: { plan, revision: result.assetRevision } }));
-          updateSummary(asset.id, {
+          const result = await api.transformSave(id, plan, info?.revision ?? asset.revision);
+          setPlans((current) => ({ ...current, [id]: { plan, revision: result.assetRevision } }));
+          updateSummary(id, {
             revision: result.assetRevision,
             thumbVersion: result.thumbVersion,
             outWidth: result.geometry.outWidth,
@@ -348,7 +425,11 @@ export function CropBoardPage({
           {linked ? "联动已开启" : "联动编辑"}
         </button>
         <span className="hint">
-          每张卡片可直接拖动/滚轮调整：裁剪框固定，图片在框内移动缩放，框外变暗。联动只作用于同组选中图片。
+          {maxGroupSelection < 2
+            ? "先选同组至少 2 张"
+            : linked
+              ? `联动同组 ${maxGroupSelection} 张`
+              : `已选 ${maxGroupSelection} 张 · 拖动移动 / 滚轮缩放`}
         </span>
       </div>
 
@@ -360,6 +441,10 @@ export function CropBoardPage({
       <div className="crop-board-groups">
         {grouped.map((section) => {
           const target = targetFor(section.collection?.id || null);
+          const collapsible = section.assets.length > GROUP_COLLAPSE_THRESHOLD;
+          // 加载期间保持展开以便渐进呈现；加载完成后按数量初始化一次折叠状态。
+          const expanded = expandedGroups[section.key] ?? true;
+          const showToggle = collapsible || !expanded;
           return (
             <section className="crop-board-group" key={section.key}>
               <div className="crop-board-group-head">
@@ -367,6 +452,17 @@ export function CropBoardPage({
                   <Icon name={section.collection ? "layers" : "image"} className="sm" />
                   <strong>{section.name}</strong>
                   <Badge tone="neutral">{section.assets.length}</Badge>
+                  {showToggle ? (
+                    <button
+                      type="button"
+                      className="btn subtle sm"
+                      onClick={() =>
+                        setExpandedGroups((current) => ({ ...current, [section.key]: !expanded }))
+                      }
+                    >
+                      {expanded ? "收起" : `展开 ${section.assets.length} 张`}
+                    </button>
+                  ) : null}
                 </div>
                 <div className="crop-board-target">
                   <span className="tiny faint">目标尺寸</span>
@@ -439,21 +535,23 @@ export function CropBoardPage({
                   )}
                 </div>
               </div>
-              <div className="crop-masonry">
-                {section.assets.map((asset) => (
-                  <InlineCropCard
-                    key={`${asset.id}-${target.width}x${target.height}`}
-                    asset={asset}
-                    plan={plans[asset.id]?.plan || ({} as TransformPlan)}
-                    targetWidth={target.width}
-                    targetHeight={target.height}
-                    selected={selection.includes(asset.id)}
-                    saving={savingIds.has(asset.id)}
-                    onToggle={(checked) => toggleSelected(asset.id, checked)}
-                    onCommit={(plan) => void commitCard(asset, plan)}
-                  />
-                ))}
-              </div>
+              {expanded ? (
+                <div className="crop-masonry">
+                  {section.assets.map((asset) => (
+                    <InlineCropCard
+                      key={`${asset.id}-${target.width}x${target.height}`}
+                      asset={asset}
+                      plan={plans[asset.id]?.plan || ({} as TransformPlan)}
+                      targetWidth={target.width}
+                      targetHeight={target.height}
+                      selected={selection.includes(asset.id)}
+                      saving={savingIds.has(asset.id)}
+                      onToggle={(checked) => toggleSelected(asset.id, checked)}
+                      onCommit={(plan) => void commitCard(asset, plan)}
+                    />
+                  ))}
+                </div>
+              ) : null}
             </section>
           );
         })}

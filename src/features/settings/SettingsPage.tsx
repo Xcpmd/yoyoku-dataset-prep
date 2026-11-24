@@ -635,7 +635,7 @@ export function SettingsPage({ active }: { active: boolean }) {
           <section className="settings-card full">
             <h3><Icon name="sparkles" />提示词翻译</h3>
             <p className="hint">
-              打标页的标签对照与翻译使用此设置。留空时使用 MyMemory 免费接口；填写百度翻译 AppID / 密钥后优先使用百度，失败时自动回退。
+              未配置百度翻译时使用 MyMemory，百度请求失败时也会回退。
             </p>
             <div className="grid-2">
               <Field label="百度翻译 AppID">
@@ -955,7 +955,7 @@ export function SettingsPage({ active }: { active: boolean }) {
           ))}
         </div>
         <Notice tone="info">
-          点击后立即关闭此窗口，下载在后台继续；右下角会显示进度，完成后模型列表自动刷新。WD14 用于短语标签，Florence-2 用于自然语言描述；Florence-2 需要 Python 安装 torch、transformers、einops，可在设置中填写该 Python 路径。
+          下载将继续，可在右下角查看进度。WD14 用于短语标签，Florence-2 用于自然语言描述；依赖与运行库信息见对应模型详情。
         </Notice>
       </Modal>
 
