@@ -677,7 +677,7 @@ pub fn save(project: &Project, request: &CaptionSaveRequest) -> AppResult<Captio
         &[request.asset_id.clone()],
         &HistoryState { assets: vec![before], memberships: vec![] },
         &HistoryState { assets: vec![after], memberships: vec![] },
-        Some(1100),
+        if request.source.as_deref() == Some("suggestion") { None } else { Some(1100) },
     )?;
     db::mark_quality_stale(&conn)?;
     let revision = db::get_asset(&conn, &request.asset_id)?.revision;

@@ -6,6 +6,7 @@ import { S } from "../../lib/strings";
 import { classNames, formatBytes } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import { Badge, Field, Modal, Notice, Segmented, Spinner, Toggle } from "../../components/ui";
+import { VisionSettings } from "./VisionSettings";
 
 export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { settings, updateSettings, appInfo, notify, pingWorker, startModelDownload, modelRevision } = useRoot();
@@ -29,7 +30,7 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
         api.models(),
         api.modelCatalog().catch(() => [] as ModelCatalogEntry[]),
       ]);
-      setModels(list);
+      setModels(list.filter((item) => item.kind !== "vlm"));
       setCatalog(entries);
       setDownloadId((current) => current || entries.find((entry) => !entry.installed)?.id || entries[0]?.id || "");
     } catch (error) {
@@ -194,6 +195,7 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
           </div>
         </section>
 
+        <VisionSettings active={open} />
         <section className="settings-card">
           <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
             <h3><Icon name="sparkles" />{S.settings.localModels}</h3>

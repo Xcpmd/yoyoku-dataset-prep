@@ -79,9 +79,30 @@ export function ExportPage({ active }: { active: boolean }) {
 
   const defaults = project.settings.exportDefaults || {};
   const base = projectBaseResolution(project);
+  const manualGroups = useMemo(
+    () => collections.filter((collection) => collection.kind !== "query"),
+    [collections],
+  );
+  const targetName = (target: string) =>
+    target === "kohya"
+      ? S.export.targetKohya
+      : target === "imagefolder"
+        ? S.export.targetImagefolder
+        : S.export.targetLoraScript;
+  const targetShort = (target: string) =>
+    target === "kohya"
+      ? "Kohya"
+      : target === "imagefolder"
+        ? "ImageFolder"
+        : "LoRA Script";
   const [step, setStep] = useState(0);
   const [config, setConfig] = useState<ExportConfig>(() => ({
-    target: defaults.target === "imagefolder" ? "imagefolder" : "kohya",
+    target:
+      defaults.target === "imagefolder"
+        ? "imagefolder"
+        : defaults.target === "lora_script"
+          ? "lora_script"
+          : "kohya",
     package: defaults.package === "zip" ? "zip" : "folder",
     destDir: null,
     name: null,
@@ -119,6 +140,7 @@ export function ExportPage({ active }: { active: boolean }) {
       keepTokens: 0,
       subsets: [],
     },
+    loraScript: { repeats: {}, ungroupedRepeats: 1 },
   }));
   const [preview, setPreview] = useState<ExportPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -239,6 +261,9 @@ export function ExportPage({ active }: { active: boolean }) {
     }
   };
 
+  const copyLabel = (target: string) =>
+    target === "lora_script" ? S.export.copyPath : S.export.copyEntry;
+
   const copyEntry = async (record: ExportRecordInfo) => {
     try {
       if (record.target === "kohya") {
@@ -248,6 +273,12 @@ export function ExportPage({ active }: { active: boolean }) {
           tone: copied ? "success" : "danger",
           title: S.export.copyEntry,
           message: copied ? entry.command : S.errors.clipboard,
+        });
+      } else if (record.target === "lora_script") {
+        const copied = await copyText(record.outputPath);
+        notify({
+          tone: copied ? "success" : "danger",
+          message: copied ? S.export.pathCopied : S.errors.clipboard,
         });
       } else {
         const command = `accelerate launch train_text_to_image_lora_sdxl.py --train_data_dir "${record.outputPath}/train" --image_column image --caption_column text`;
@@ -280,6 +311,11 @@ export function ExportPage({ active }: { active: boolean }) {
       size: {
         ...preset.config.size,
         fillTransparent: preset.config.size.fillTransparent !== false,
+      },
+      loraScript: {
+        repeats: {},
+        ungroupedRepeats: 1,
+        ...(preset.config as Partial<ExportConfig>).loraScript,
       },
     });
     setPreview(null);
@@ -494,6 +530,12 @@ export function ExportPage({ active }: { active: boolean }) {
                   </div>
                 </section>
 
+                {config.target === "lora_script" ? (
+                  <section className="export-section">
+                    <h3><Icon name="split" />{S.export.validationTitle}</h3>
+                    <Notice tone="info">LoRA Script 结构不生成验证集，全部图片按训练分组导出。</Notice>
+                  </section>
+                ) : (
                 <section className="export-section">
                   <h3>
                     <Icon name="split" />
@@ -571,6 +613,7 @@ export function ExportPage({ active }: { active: boolean }) {
                     <p className="hint">{S.export.validationRange}</p>
                   )}
                 </section>
+                )}
               </>
             ) : null}
 
@@ -628,6 +671,23 @@ export function ExportPage({ active }: { active: boolean }) {
                       <span className="choice-icon"><Icon name="database" /></span>
                       <span><strong>{S.export.targetImagefolder}</strong><span>{S.export.targetImagefolderHint}</span></span>
                     </button>
+                    <button
+                      type="button"
+                      className={classNames("choice-card", config.target === "lora_script" && "active")}
+                      onClick={() =>
+                        patchConfig((current) => ({
+                          ...current,
+                          target: "lora_script",
+                          name: current.name?.trim() ? current.name : project.name,
+                          imageFormat: "jpg",
+                          validation: { ...current.validation, enabled: false },
+                          loraScript: current.loraScript ?? { repeats: {}, ungroupedRepeats: 1 },
+                        }))
+                      }
+                    >
+                      <span className="choice-icon"><Icon name="layers" /></span>
+                      <span><strong>{S.export.targetLoraScript}</strong><span>{S.export.targetLoraScriptHint}</span></span>
+                    </button>
                   </div>
                   <div className="export-form-grid">
                     <Field label={S.export.package}>
@@ -640,7 +700,14 @@ export function ExportPage({ active }: { active: boolean }) {
                         ]}
                       />
                     </Field>
-                    <Field label={S.export.name} hint="留空自动生成带时间戳的名称。">
+                    <Field
+                      label={config.target === "lora_script" ? "LoRA 名称" : S.export.name}
+                      hint={
+                        config.target === "lora_script"
+                          ? "作为导出根目录；每个分组会生成 {单图训练次数}_{组名} 子目录。"
+                          : "留空自动生成带时间戳的名称。"
+                      }
+                    >
                       <input
                         className="input"
                         value={config.name || ""}
@@ -865,6 +932,92 @@ export function ExportPage({ active }: { active: boolean }) {
                   </div>
                   <p className="hint">{S.export.overwriteHint}</p>
                 </section>
+
+                {config.target === "lora_script" ? (
+                  <section className="export-section">
+                    <h3>
+                      <Icon name="layers" />
+                      训练分组
+                    </h3>
+                    <p className="hint">
+                      每个分组生成独立子目录「单图训练次数_组名」，图片与同名 .txt 放在其中。
+                      同一图片属于多个分组时，按分组名称顺序取第一个。
+                    </p>
+                    <div className="export-form-grid">
+                      {manualGroups.map((group) => {
+                        const repeats =
+                          config.loraScript.repeats[group.id] ?? 1;
+                        return (
+                          <Field
+                            key={group.id}
+                            label={group.name}
+                            hint={`${group.count} 张图片`}
+                          >
+                            <div className="input-row">
+                              <input
+                                className="input number"
+                                type="number"
+                                min={1}
+                                max={1000}
+                                step={1}
+                                value={repeats}
+                                onChange={(event) => {
+                                  const value = Math.max(
+                                    1,
+                                    Math.min(1000, Math.round(Number(event.target.value) || 1)),
+                                  );
+                                  patchConfig((current) => ({
+                                    ...current,
+                                    loraScript: {
+                                      ...current.loraScript,
+                                      repeats: {
+                                        ...current.loraScript.repeats,
+                                        [group.id]: value,
+                                      },
+                                    },
+                                  }));
+                                }}
+                              />
+                              <span className="hint">次/张</span>
+                            </div>
+                          </Field>
+                        );
+                      })}
+                      <Field label="未分组" hint="不属于任何分组的图片">
+                        <div className="input-row">
+                          <input
+                            className="input number"
+                            type="number"
+                            min={1}
+                            max={1000}
+                            step={1}
+                            value={config.loraScript.ungroupedRepeats}
+                            onChange={(event) => {
+                              const value = Math.max(
+                                1,
+                                Math.min(1000, Math.round(Number(event.target.value) || 1)),
+                              );
+                              patchConfig((current) => ({
+                                ...current,
+                                loraScript: {
+                                  ...current.loraScript,
+                                  ungroupedRepeats: value,
+                                },
+                              }));
+                            }}
+                          />
+                          <span className="hint">次/张</span>
+                        </div>
+                      </Field>
+                    </div>
+                    {manualGroups.length === 0 ? (
+                      <Notice tone="info">当前项目还没有分组，全部图片会进入「未分组」子集。</Notice>
+                    ) : null}
+                    <p className="hint">
+                      LoRA Script 结构不生成验证集，导出时全部按训练分组处理；标注固定为同名 .txt。
+                    </p>
+                  </section>
+                ) : null}
 
                 {config.target === "kohya" ? (
                   <section className="export-section">
@@ -1346,7 +1499,7 @@ export function ExportPage({ active }: { active: boolean }) {
                         }
                       >
                         <Icon name="copy" />
-                        {S.export.copyEntry}
+                        {copyLabel(config.target)}
                       </button>
                       <button
                         type="button"
@@ -1454,7 +1607,7 @@ export function ExportPage({ active }: { active: boolean }) {
             <div className="summary-list">
               <div className="summary-row">
                 <span className="k">{S.export.target}</span>
-                <span className="v">{config.target === "kohya" ? S.export.targetKohya : S.export.targetImagefolder}</span>
+                <span className="v">{targetName(config.target)}</span>
               </div>
               <div className="summary-row">
                 <span className="k">{S.export.package}</span>
@@ -1542,7 +1695,7 @@ export function ExportPage({ active }: { active: boolean }) {
                   <div className="record-main">
                     <div className="record-title">
                       <Badge tone={record.target === "kohya" ? "info" : "neutral"}>
-                        {record.target === "kohya" ? "Kohya" : "ImageFolder"}
+                        {targetShort(record.target)}
                       </Badge>
                       <Badge tone={ok ? "success" : "warning"}>{ok ? S.export.validationPassed : S.export.validationFailed}</Badge>
                       <span className="small muted">{formatDate(record.createdAt)}</span>
@@ -1586,7 +1739,7 @@ export function ExportPage({ active }: { active: boolean }) {
                       className="btn ghost sm"
                       onClick={() => void copyEntry(record)}
                     >
-                      {S.export.copyEntry}
+                      {copyLabel(record.target)}
                     </button>
                     <button
                       type="button"
@@ -1623,7 +1776,7 @@ export function ExportPage({ active }: { active: boolean }) {
             <div className="summary-list">
               <div className="summary-row">
                 <span className="k">{S.export.recordTarget}</span>
-                <span className="v">{report.target === "kohya" ? S.export.targetKohya : S.export.targetImagefolder}</span>
+                <span className="v">{targetName(report.target)}</span>
               </div>
               <div className="summary-row">
                 <span className="k">{S.export.recordCount}</span>
@@ -1659,7 +1812,7 @@ export function ExportPage({ active }: { active: boolean }) {
                 onClick={() => void copyEntry(report)}
               >
                 <Icon name="copy" />
-                {S.export.copyEntry}
+                {copyLabel(report.target)}
               </button>
               <button
                 type="button"

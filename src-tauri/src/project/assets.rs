@@ -2,7 +2,9 @@ use crate::caption::{self, finalize_caption};
 use crate::db::{self, AssetRow};
 use crate::error::{AppError, AppResult};
 use crate::model::*;
+use crate::project::asset_filter::{uses_scoped_text_search, FilterSql};
 use crate::project::history::{self, snapshot_asset, AssetSnapshot, HistoryState, MembershipChange};
+use crate::project::regex_tags::RegexTags;
 use crate::project::{transform, Project};
 use crate::util;
 use rusqlite::{params, params_from_iter, OptionalExtension, ToSql};
@@ -135,10 +137,11 @@ struct FilterParts {
     params: Vec<rusqlite::types::Value>,
 }
 
-fn build_filter(filter: &AssetFilter) -> FilterParts {
+fn build_filter(filter: &AssetFilter, advanced: FilterSql) -> FilterParts {
     use rusqlite::types::Value;
     let mut where_parts: Vec<String> = vec!["1=1".into()];
     let mut values: Vec<Value> = Vec::new();
+    let join_caption = !advanced.clauses.is_empty() || !filter.query.trim().is_empty();
 
     if !filter.statuses.is_empty() {
         let placeholders: Vec<String> = filter
@@ -240,7 +243,7 @@ fn build_filter(filter: &AssetFilter) -> FilterParts {
         values.push(Value::Integer(max as i64));
     }
     let query = filter.query.trim();
-    if !query.is_empty() {
+    if !query.is_empty() && !uses_scoped_text_search(filter) {
         for term in query.split_whitespace() {
             if let Some(rest) = term.strip_prefix('-') {
                 if rest.is_empty() {
@@ -273,8 +276,10 @@ fn build_filter(filter: &AssetFilter) -> FilterParts {
         }
     }
 
+    where_parts.extend(advanced.clauses);
+    values.extend(advanced.values);
     FilterParts {
-        joins: "LEFT JOIN caption_revisions c ON c.id = a.caption_revision_id".into(),
+        joins: if join_caption { "LEFT JOIN caption_revisions c ON c.id = a.caption_revision_id".into() } else { String::new() },
         where_sql: where_parts.join(" AND "),
         params: values,
     }
@@ -317,9 +322,23 @@ pub fn query(
     limit: i64,
     cursor: Option<&str>,
 ) -> AppResult<AssetsPage> {
-    let conn = project.conn();
-    let cfg = caption_config(&conn)?;
-    let parts = build_filter(filter);
+    let conn = project.read_conn()?;
+    FilterSql::compile(filter)?.run(&conn, |advanced| {
+        query_page(&conn, build_filter(filter, advanced), sort, offset, limit, cursor)
+    })
+}
+
+fn query_page(
+    conn: &rusqlite::Connection,
+    parts: FilterParts,
+    sort: &AssetSort,
+    offset: i64,
+    limit: i64,
+    cursor: Option<&str>,
+) -> AppResult<AssetsPage> {
+    let tx = conn.unchecked_transaction()?;
+    let conn = &tx;
+    let cfg = caption_config(conn)?;
     let total: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM assets a {} WHERE {}",
@@ -373,7 +392,7 @@ pub fn query(
     let mut items = Vec::new();
     for row in rows {
         let asset = row?;
-        items.push(summary_from_row(&conn, &asset, &cfg)?);
+        items.push(summary_from_row(conn, &asset, &cfg)?);
     }
     let next_offset = if cursor_id.is_some() {
         None
@@ -396,14 +415,28 @@ pub fn query(
 }
 
 pub fn resolve_ids(conn: &rusqlite::Connection, filter: &AssetFilter) -> AppResult<Vec<String>> {
-    let parts = build_filter(filter);
-    let sql = format!(
-        "SELECT a.id FROM assets a {} WHERE {} ORDER BY a.sort_index ASC, a.id ASC",
-        parts.joins, parts.where_sql
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(params_from_iter(parts.params.iter()), |row| row.get::<_, String>(0))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    resolve_ids_within(conn, filter, None)
+}
+
+pub fn resolve_ids_within(
+    conn: &rusqlite::Connection,
+    filter: &AssetFilter,
+    within_ids: Option<&[String]>,
+) -> AppResult<Vec<String>> {
+    FilterSql::compile(filter)?.run(conn, |advanced| {
+        let mut parts = build_filter(filter, advanced);
+        if let Some(ids) = within_ids {
+            parts.where_sql.push_str(" AND a.id IN (SELECT value FROM json_each(?))");
+            parts.params.push(rusqlite::types::Value::Text(serde_json::to_string(ids)?));
+        }
+        let sql = format!(
+            "SELECT a.id FROM assets a {} WHERE {} ORDER BY a.sort_index ASC, a.id ASC",
+            parts.joins, parts.where_sql
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(parts.params.iter()), |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    })
 }
 
 pub fn summaries(project: &Project, ids: &[String]) -> AppResult<Vec<AssetSummary>> {
@@ -664,6 +697,7 @@ pub struct PendingCaption {
     pub mode: String,
     pub tags: Vec<String>,
     pub text: String,
+    pub tag_order: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -686,12 +720,13 @@ pub struct PendingMembership {
 
 #[derive(Debug, Clone)]
 pub struct PendingBatch {
-    pub id: String,
     pub label: String,
     pub command_type: String,
     pub entries: Vec<PendingAssetChange>,
     pub memberships: Vec<PendingMembership>,
-    pub created_at: String,
+    pub project_root: std::path::PathBuf,
+    pub skipped_count: usize,
+    pub check_tag_state: bool,
 }
 
 fn is_member(conn: &rusqlite::Connection, collection_id: &str, asset_id: &str) -> AppResult<bool> {
@@ -773,20 +808,23 @@ pub fn batch_preview(
     request: &BatchRequest,
     batch_id: &str,
 ) -> AppResult<(BatchPreview, PendingBatch)> {
-    let conn = project.conn();
-    let cfg = caption_config(&conn)?;
+    let regex_tags = RegexTags::compile(&request.op)?;
+    let reader = project.read_conn()?;
+    let conn = &reader.unchecked_transaction()?;
+    let cfg = caption_config(conn)?;
+    let resolved;
     let ids = if !request.asset_ids.is_empty() {
-        let mut ids = request.asset_ids.clone();
-        ids.retain(|id| !request.exclude_ids.contains(id));
-        ids
+        &request.asset_ids
     } else if let Some(filter) = &request.filter {
-        let mut ids = resolve_ids(&conn, filter)?;
-        ids.retain(|id| !request.exclude_ids.contains(id));
-        ids
+        resolved = resolve_ids(conn, filter)?;
+        &resolved
     } else {
-        Vec::new()
+        &request.asset_ids
     };
-    if ids.is_empty() {
+    let excluded: std::collections::HashSet<_> = request.exclude_ids.iter().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = ids.iter().filter(|id| !excluded.contains(*id) && seen.insert(*id)).peekable();
+    if ids.peek().is_none() {
         return Err(AppError::new("EMPTY_SCOPE", "没有可应用操作的图片"));
     }
     let mut entries = Vec::new();
@@ -794,6 +832,13 @@ pub fn batch_preview(
     let mut skipped = Vec::new();
     let mut diffs = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut skipped_count = 0;
+    let mut skip = |item: BatchSkip| {
+        skipped_count += 1;
+        if skipped.len() < 8 {
+            skipped.push(item);
+        }
+    };
 
     // 复制标注需要源内容
     let copy_source = if let BatchOp::CopyCaption { source } = &request.op {
@@ -805,12 +850,13 @@ pub fn batch_preview(
 
     let mut operation_label = String::new();
     for id in ids {
-        let asset = match db::get_asset(&conn, &id) {
+        let asset = match db::get_asset(conn, id) {
             Ok(asset) => asset,
-            Err(_) => {
-                skipped.push(BatchSkip { asset_id: id, name: String::new(), reason: "图片已不存在".into() });
+            Err(error) if error.code == "NOT_FOUND" => {
+                skip(BatchSkip { asset_id: id.clone(), name: String::new(), reason: "图片已不存在".into() });
                 continue;
             }
+            Err(error) => return Err(error),
         };
         let raw = caption_raw(&conn, asset.caption_revision_id.as_deref(), &cfg.default_mode);
         let mut before_preview = caption::caption_preview(&raw.mode, &raw.tags, &raw.text, 80);
@@ -819,14 +865,50 @@ pub fn batch_preview(
         let mut reason_change = None;
         let mut split_change = None;
         let mut after_preview = before_preview.clone();
+        let mut tag_changes = None;
+        let mut regex_snapshot = None;
 
         match &request.op {
+            BatchOp::ExtractTags { .. } | BatchOp::RegexRemoveTags { .. } | BatchOp::RegexReplaceTags { .. } => {
+                let rule = regex_tags.as_ref().expect("compiled regex batch operation");
+                let snapshot = history::snapshot_row_with_tag_state(conn, &asset)?;
+                let result = if raw.mode == "nl" && !rule.applies_to_prose() {
+                    Err("只有自然语言标注".into())
+                } else {
+                    rule.apply(
+                        &asset.original_name, &raw.tags, snapshot.tag_order.as_deref(),
+                        snapshot.tag_disabled.as_deref().unwrap_or_default(), &cfg.trigger_word,
+                        raw.mode == "nl",
+                    )
+                };
+                let update = match result {
+                    Ok(update) => update,
+                    Err(reason) => {
+                        skip(BatchSkip { asset_id: id.clone(), name: asset.original_name, reason });
+                        continue;
+                    }
+                };
+                let mode = if raw.mode != "nl" { raw.mode.as_str() } else if raw.text.trim().is_empty() { "tags" } else { "mixed" };
+                if raw.mode == "nl" && mode == "mixed" && warnings.is_empty() {
+                    warnings.push("含自然语言正文的图片会切换为混合标注，保留原正文。".into());
+                }
+                after_preview = caption::caption_preview(mode, &update.tags, &raw.text, 80);
+                caption_change = Some(PendingCaption {
+                    mode: mode.into(),
+                    tags: update.tags,
+                    text: raw.text,
+                    tag_order: update.order,
+                });
+                tag_changes = Some(update.changes);
+                regex_snapshot = Some(snapshot);
+                operation_label = rule.label().into();
+            }
             BatchOp::SetStatus { status, reason } => {
                 let reason = reason.clone().unwrap_or_default();
                 if asset.review_status == *status
                     && (status != "excluded" || asset.excluded_reason.clone().unwrap_or_default() == reason)
                 {
-                    skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "状态未变化".into() });
+                    skip(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "状态未变化".into() });
                     continue;
                 }
                 status_change = Some(status.clone());
@@ -837,7 +919,7 @@ pub fn batch_preview(
             BatchOp::SetSplit { split } => {
                 let target = split.clone().filter(|s| !s.is_empty());
                 if asset.split_lock == target {
-                    skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "用途未变化".into() });
+                    skip(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "用途未变化".into() });
                     continue;
                 }
                 split_change = Some(target.clone());
@@ -858,7 +940,7 @@ pub fn batch_preview(
                 };
                 let member = is_member(&conn, collection, &id)?;
                 if add == member {
-                    skipped.push(BatchSkip {
+                    skip(BatchSkip {
                         asset_id: id.clone(),
                         name: asset.original_name.clone(),
                         reason: if add { "已在集合中".into() } else { "不在集合中".into() },
@@ -877,13 +959,14 @@ pub fn batch_preview(
             BatchOp::CopyCaption { .. } => {
                 if let Some(source) = &copy_source {
                     if source.mode == raw.mode && source.tags == raw.tags && source.text == raw.text {
-                        skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "标注已相同".into() });
+                        skip(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "标注已相同".into() });
                         continue;
                     }
                     caption_change = Some(PendingCaption {
                         mode: source.mode.clone(),
                         tags: source.tags.clone(),
                         text: source.text.clone(),
+                        tag_order: None,
                     });
                     after_preview = caption::caption_preview(&source.mode, &source.tags, &source.text, 80);
                     operation_label = "复制标注".into();
@@ -897,7 +980,7 @@ pub fn batch_preview(
                     }
                 }
                 if new_raw.mode == raw.mode && new_raw.tags == raw.tags && new_raw.text == raw.text {
-                    skipped.push(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "标注无变化".into() });
+                    skip(BatchSkip { asset_id: id.clone(), name: asset.original_name.clone(), reason: "标注无变化".into() });
                     continue;
                 }
                 after_preview = caption::caption_preview(&new_raw.mode, &new_raw.tags, &new_raw.text, 80);
@@ -905,6 +988,7 @@ pub fn batch_preview(
                     mode: new_raw.mode,
                     tags: new_raw.tags,
                     text: new_raw.text,
+                    tag_order: None,
                 });
                 operation_label = match op {
                     BatchOp::AddTags { .. } => "添加标签",
@@ -927,11 +1011,12 @@ pub fn batch_preview(
                 before: before_preview,
                 after: after_preview,
                 changed: true,
+                tag_changes,
             });
         }
-        let before = snapshot_asset(&conn, &id)?;
+        let before = regex_snapshot.unwrap_or_else(|| history::snapshot_from_row(&asset));
         entries.push(PendingAssetChange {
-            asset_id: id,
+            asset_id: id.clone(),
             expected_revision: asset.revision,
             before,
             caption: caption_change,
@@ -944,7 +1029,6 @@ pub fn batch_preview(
     let changed = entries.len();
     let memberships_only = changed > 0 && entries.iter().all(|e| e.caption.is_none() && e.status.is_none() && e.split.is_none());
     let count = if memberships_only { memberships.len() as i64 } else { changed as i64 };
-    let skipped_count = skipped.len();
     let summary = if count == 0 {
         "没有需要变更的图片".to_string()
     } else if memberships_only {
@@ -952,13 +1036,11 @@ pub fn batch_preview(
     } else {
         format!("将修改 {count} 张图片，跳过 {skipped_count} 张")
     };
-    if skipped.len() > 8 {
-        skipped.truncate(8);
-    }
     let preview = BatchPreview {
         preview_id: batch_id.to_string(),
         count,
         skipped,
+        skipped_count,
         diffs,
         summary,
         warnings,
@@ -972,12 +1054,13 @@ pub fn batch_preview(
         _ => "batch.caption",
     };
     let pending = PendingBatch {
-        id: batch_id.to_string(),
         label,
         command_type: command_type.into(),
         entries,
         memberships,
-        created_at: util::now_iso(),
+        project_root: project.root.clone(),
+        skipped_count,
+        check_tag_state: regex_tags.is_some(),
     };
     Ok((preview, pending))
 }
@@ -992,11 +1075,21 @@ fn status_label(status: &str) -> &'static str {
 }
 
 pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchResult> {
+    if project.root != pending.project_root {
+        return Err(AppError::new("PREVIEW_EXPIRED", "项目已切换，请重新预览"));
+    }
     let mut conn = project.conn();
+    let tx = conn.transaction()?;
     // 先校验全部修订号
     for entry in &pending.entries {
-        let current = db::get_asset(&conn, &entry.asset_id)?;
-        if current.revision != entry.expected_revision {
+        let current = db::get_asset(&tx, &entry.asset_id)?;
+        let tag_state_changed = if pending.check_tag_state {
+            let snapshot = history::snapshot_row_with_tag_state(&tx, &current)?;
+            snapshot.tag_order != entry.before.tag_order || snapshot.tag_disabled != entry.before.tag_disabled
+        } else {
+            false
+        };
+        if current.revision != entry.expected_revision || tag_state_changed {
             return Err(
                 AppError::new("REVISION_CONFLICT", "部分图片已被修改，批量操作未执行。请重新预览。")
                     .items(vec![entry.asset_id.clone()]),
@@ -1007,7 +1100,6 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
         return Err(AppError::new("EMPTY_SCOPE", "没有需要变更的图片"));
     }
     let now = util::now_iso();
-    let tx = conn.transaction()?;
     for entry in &pending.entries {
         let mut changed = false;
         if let Some(caption) = &entry.caption {
@@ -1039,6 +1131,12 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
                  WHERE id = ?3",
                 params![revision_id, now, entry.asset_id],
             )?;
+            if let Some(order) = &caption.tag_order {
+                tx.execute(
+                    "UPDATE caption_tag_state SET order_json = ?1, updated_at = ?2 WHERE asset_id = ?3",
+                    params![serde_json::to_string(order)?, now, entry.asset_id],
+                )?;
+            }
             changed = true;
         }
         if let Some(status) = &entry.status {
@@ -1073,8 +1171,6 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
             )?;
         }
     }
-    tx.commit()?;
-
     let asset_ids: Vec<String> = pending
         .entries
         .iter()
@@ -1086,9 +1182,13 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
     let after_assets = {
         let mut snapshots = Vec::new();
         for entry in &pending.entries {
-            if let Ok(snapshot) = snapshot_asset(&conn, &entry.asset_id) {
-                snapshots.push(snapshot);
-            }
+            let snapshot = if pending.check_tag_state {
+                let asset = db::get_asset(&tx, &entry.asset_id)?;
+                history::snapshot_row_with_tag_state(&tx, &asset)?
+            } else {
+                snapshot_asset(&tx, &entry.asset_id)?
+            };
+            snapshots.push(snapshot);
         }
         snapshots
     };
@@ -1115,7 +1215,7 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
         })
         .collect::<Vec<_>>();
     let seq = history::record(
-        &conn,
+        &tx,
         &pending.command_type,
         &pending.label,
         &asset_ids,
@@ -1123,7 +1223,8 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
         &HistoryState { assets: after_assets, memberships: membership_changes },
         None,
     )?;
-    db::mark_quality_stale(&conn)?;
+    db::mark_quality_stale(&tx)?;
+    tx.commit()?;
     let applied = if pending.memberships.is_empty() {
         pending.entries.len() as i64
     } else {
@@ -1131,7 +1232,7 @@ pub fn apply_batch(project: &Project, pending: PendingBatch) -> AppResult<BatchR
     };
     Ok(BatchResult {
         applied,
-        skipped: 0,
+        skipped: pending.skipped_count as i64,
         history_seq: seq,
         label: pending.label,
     })
@@ -1245,6 +1346,102 @@ mod query_tests {
         let mut seen = std::collections::HashSet::new();
         assert!(page.items.iter().all(|asset| seen.insert(asset.id.clone())));
 
+        drop(project);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn nested_filter_regex_and_pagination_use_the_same_scope() {
+        let (project, parent) = project_with_assets();
+        {
+            let conn = project.conn();
+            conn.execute("UPDATE assets SET favorite=1 WHERE id='asset-2'", []).unwrap();
+            conn.execute("UPDATE assets SET split_lock='train' WHERE id='asset-1'", []).unwrap();
+            conn.execute(
+                "UPDATE assets SET review_status='excluded', excluded_reason=?1 WHERE id='asset-3'",
+                params![crate::project::quality::RECYCLE_REASON],
+            ).unwrap();
+        }
+        let mut filter: AssetFilter = serde_json::from_value(serde_json::json!({
+            "regexSearch": {"pattern": "^[A-D]$", "target": "name"},
+            "expression": {"kind": "group", "mode": "all", "negated": false, "children": [
+                {"kind": "group", "mode": "any", "negated": false, "children": [
+                    {"kind": "rule", "field": "width", "operator": "gte", "value": "200", "negated": false},
+                    {"kind": "rule", "field": "favorite", "operator": "is", "value": "yes", "negated": false},
+                    {"kind": "rule", "field": "name", "operator": "regex", "value": "^D$", "negated": false}
+                ]},
+                {"kind": "group", "mode": "any", "negated": true, "children": [
+                    {"kind": "rule", "field": "split", "operator": "is", "value": "train", "negated": false},
+                    {"kind": "rule", "field": "tag", "operator": "is", "value": "blocked", "negated": false}
+                ]}
+            ]}
+        })).unwrap();
+        let sort = AssetSort::default();
+        let first = query(&project, &filter, &sort, 0, 1, None).unwrap();
+        let second = query(&project, &filter, &sort, 0, 1, first.next_cursor.as_deref()).unwrap();
+        assert_eq!(first.total, 2);
+        assert_eq!(first.items[0].id, "asset-0");
+        assert_eq!(second.items[0].id, "asset-2");
+        let conn = project.read_conn().unwrap();
+        assert_eq!(resolve_ids(&conn, &filter).unwrap(), ["asset-0", "asset-2"]);
+        let ids = ["asset-1".into(), "asset-2".into()];
+        assert_eq!(resolve_ids_within(&conn, &filter, Some(&ids)).unwrap(), ["asset-2"]);
+        filter.search_case_sensitive = true;
+        assert!(resolve_ids(&conn, &filter).unwrap().is_empty());
+        filter.regex_search = None;
+        filter.search_target = Some("path".into());
+        filter.query = "A.JPG".into();
+        assert!(resolve_ids(&conn, &filter).unwrap().is_empty());
+        filter.search_case_sensitive = false;
+        assert_eq!(resolve_ids(&conn, &filter).unwrap(), ["asset-0"]);
+        drop(conn);
+        drop(project);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn extract_filename_tags_previews_preserves_state_and_undoes() {
+        let (project, parent) = project_with_assets();
+        {
+            let conn = project.conn();
+            conn.execute("UPDATE assets SET original_name='[青山] 0042.PNG' WHERE id='asset-0'", []).unwrap();
+        }
+        let tag_state = |order: &[&str]| crate::project::captions::TagState {
+            order: order.iter().map(|tag| tag.to_string()).collect(),
+            disabled: vec!["artist: 青山".into()],
+        };
+        crate::project::captions::tag_state_set(&project, "asset-0", &tag_state(&["artist: 青山"])).unwrap();
+        let request = BatchRequest {
+            asset_ids: vec!["asset-0".into(), "asset-1".into(), "asset-0".into()],
+            filter: None,
+            exclude_ids: Vec::new(),
+            op: BatchOp::ExtractTags {
+                syntax: ExtractSyntax::Template,
+                pattern: "[{{artist: str}}] {{id: int}}.png".into(),
+                templates: vec!["artist: {{artist}}".into(), "id: {{id}}".into()],
+            },
+        };
+        let (preview, pending) = batch_preview(&project, &request, "preview").unwrap();
+        assert_eq!(preview.count, 1);
+        assert_eq!(preview.skipped_count, 1);
+        assert_eq!(preview.diffs[0].tag_changes.as_ref().unwrap().added, ["id: 0042"]);
+        let state = || crate::project::captions::tag_state_get(&project, "asset-0").unwrap();
+        assert_eq!(state().order, ["artist: 青山"]);
+        let result = apply_batch(&project, pending).unwrap();
+        assert_eq!(result.applied, 1);
+        assert_eq!(state().order, ["artist: 青山", "id: 0042"]);
+        assert_eq!(state().disabled, ["artist: 青山"]);
+        history::undo_last(&project, Some(result.history_seq)).unwrap();
+        assert_eq!(state().order, ["artist: 青山"]);
+        history::redo_last(&project).unwrap();
+        assert_eq!(state().order, ["artist: 青山", "id: 0042"]);
+
+        let mut replace = request;
+        replace.op = BatchOp::RegexReplaceTags { pattern: "^id: ([0-9]+)$".into(), replacement: "image {{1}}".into() };
+        let (preview, pending) = batch_preview(&project, &replace, "replace").unwrap();
+        assert_eq!(preview.diffs[0].tag_changes.as_ref().unwrap().added, ["image 0042"]);
+        crate::project::captions::tag_state_set(&project, "asset-0", &tag_state(&["id: 0042", "artist: 青山"])).unwrap();
+        assert_eq!(apply_batch(&project, pending).unwrap_err().code, "REVISION_CONFLICT");
         drop(project);
         let _ = std::fs::remove_dir_all(&parent);
     }

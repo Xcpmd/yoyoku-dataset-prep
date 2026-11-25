@@ -14,6 +14,7 @@ import {
   type PromptLibrary,
 } from "../../lib/promptDictionary";
 import { Icon } from "../../components/Icon";
+import { modelKindLabel } from "../../lib/modelDescriptions";
 import { Dropdown, MenuItem, MenuLabel, Notice, Segmented, Select, Spinner } from "../../components/ui";
 
 export type CaptionSaveState = "idle" | "saving" | "saved" | "error" | "dirty";
@@ -30,11 +31,11 @@ interface Props {
   triggerWord: string;
   triggerDisabled: boolean;
   aiModels: ModelInfo[];
-  aiModel: string;
+  aiModelIds: string[];
   aiModelsLoading: boolean;
   aiBusy: boolean;
   aiNote: string | null;
-  onAiModelChange: (value: string) => void;
+  onAiModelsChange: (value: string[]) => void;
   onAiTag: () => void;
   onChange: (patch: { mode?: CaptionMode; tags?: string[]; text?: string }) => void;
   onToggleTrigger: (disabled: boolean) => void;
@@ -55,11 +56,11 @@ export function CaptionPanel({
   triggerWord,
   triggerDisabled,
   aiModels,
-  aiModel,
+  aiModelIds,
   aiModelsLoading,
   aiBusy,
   aiNote,
-  onAiModelChange,
+  onAiModelsChange,
   onAiTag,
   onChange,
   onToggleTrigger,
@@ -742,6 +743,20 @@ export function CaptionPanel({
     );
   };
 
+  const selectedAiModels = aiModels.filter((item) => aiModelIds.includes(item.id));
+  const aiModelSummary = aiModelsLoading
+    ? "正在读取模型…"
+    : aiModels.length === 0
+      ? "未找到模型"
+      : selectedAiModels.length === 0
+        ? "选择模型"
+        : selectedAiModels.length === 1
+          ? selectedAiModels[0].name
+          : `${selectedAiModels.length} 个模型 · 并集`;
+  const aiModelTitle = selectedAiModels.length
+    ? selectedAiModels.map((item) => item.name).join(" + ")
+    : "选择 AI 打标模型（可多选，结果取并集）";
+
   return (
     <div className="caption-editor">
       <div className="form-block" style={{ borderBottom: "none", paddingBottom: 0 }}>
@@ -767,25 +782,81 @@ export function CaptionPanel({
             <Icon name="sparkles" className="sm" />
             AI 打标
           </span>
-          <Select
-            className="caption-ai-select"
-            value={aiModel}
-            onChange={onAiModelChange}
-            ariaLabel="AI 打标模型"
-            disabled={aiBusy || aiModelsLoading || aiModels.length === 0}
-            placeholder={aiModelsLoading ? "正在读取模型…" : "未找到模型"}
-            title={aiModels.find((item) => item.id === aiModel)?.name || "选择 AI 打标模型"}
-            options={aiModels.map((item) => ({
-              value: item.id,
-              label: `${item.name}${item.kind === "caption" ? "（自然语言）" : ""}`,
-            }))}
-          />
+          <div className="caption-ai-model-picker">
+            <Dropdown
+              width={320}
+              align="start"
+              renderTrigger={(toggle, open) => (
+                <button
+                  type="button"
+                  className="btn subtle sm caption-ai-model-trigger"
+                  onClick={toggle}
+                  disabled={aiBusy || aiModelsLoading || aiModels.length === 0}
+                  title={aiModelTitle}
+                  aria-label="AI 打标模型（可多选，结果取并集）"
+                  aria-haspopup="menu"
+                  aria-expanded={open}
+                >
+                  <span className="caption-ai-model-text">{aiModelSummary}</span>
+                  <Icon name="chevron-down" className="sm" />
+                </button>
+              )}
+            >
+            {(close) => (
+              <>
+                <MenuLabel>AI 打标模型（可多选，结果取并集）</MenuLabel>
+                <div className="caption-ai-model-options">
+                  {aiModels.map((item) => {
+                    const checked = aiModelIds.includes(item.id);
+                    return (
+                      <label
+                        key={item.id}
+                        className={classNames(
+                          "caption-ai-model-option",
+                          checked && "selected",
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            onAiModelsChange(
+                              checked
+                                ? aiModelIds.filter((id) => id !== item.id)
+                                : [...aiModelIds, item.id],
+                            )
+                          }
+                        />
+                        <span className="grow">
+                          <span className="caption-ai-model-option-name">{item.name}</span>
+                          <span className="caption-ai-model-option-meta">
+                            {modelKindLabel(item)} · {item.version}
+                          </span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <div className="caption-ai-model-foot">
+                  <span className="hint">已选 {selectedAiModels.length} 个</span>
+                  <button type="button" className="btn ghost sm" onClick={close}>
+                    完成
+                  </button>
+                </div>
+              </>
+            )}
+            </Dropdown>
+          </div>
           <button
             type="button"
             className="btn secondary sm"
             onClick={onAiTag}
-            disabled={aiBusy || !aiModel || aiModels.length === 0}
-            title="用所选模型为当前图片补充短语，重复项自动剔除"
+            disabled={aiBusy || aiModelsLoading || selectedAiModels.length === 0 || aiModels.length === 0}
+            title={
+              selectedAiModels.length > 1
+                ? `依次运行 ${selectedAiModels.length} 个模型并合并标签并集，重复项自动剔除`
+                : "用所选模型为当前图片补充短语，重复项自动剔除"
+            }
           >
             {aiBusy ? <Spinner /> : null}
             {aiBusy ? "打标中" : "补充短语"}

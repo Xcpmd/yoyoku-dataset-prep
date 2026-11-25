@@ -45,7 +45,7 @@ export interface ProjectContextValue {
 
   sequence: string[];
   sequenceLabel: string;
-  setSequence: (ids: string[], label?: string) => void;
+  refreshSequence: () => void;
 
   workbenchId: string | null;
   openWorkbench: (id: string, options?: OpenWorkbenchOptions) => void;

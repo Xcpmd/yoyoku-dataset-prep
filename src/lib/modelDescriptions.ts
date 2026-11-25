@@ -2,6 +2,7 @@ import type { ModelInfo } from "./types";
 
 /** 一行模型定位说明，用于批量打标模型列表与单图建议模型选择。 */
 export function modelDescription(item: ModelInfo): string {
+  if (item.kind === "vlm") return item.note;
   if (item.kind === "caption") {
     return "自然语言描述：生成完整句子，并按句号拆成多条短语";
   }
@@ -44,5 +45,6 @@ export function modelDescription(item: ModelInfo): string {
 }
 
 export function modelKindLabel(item: ModelInfo): string {
+  if (item.kind === "vlm") return "视觉语言模型";
   return item.kind === "caption" ? "自然语言描述" : "短语标签";
 }

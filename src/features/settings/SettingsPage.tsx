@@ -24,6 +24,8 @@ import {
   Spinner,
   Toggle,
 } from "../../components/ui";
+import { RegexGuide } from "./RegexGuide";
+import { VisionSettings } from "./VisionSettings";
 
 interface Thresholds {
   lowResolutionRatio: number;
@@ -126,7 +128,7 @@ export function SettingsPage({ active }: { active: boolean }) {
         api.models(),
         api.modelCatalog().catch(() => [] as ModelCatalogEntry[]),
       ]);
-      setModels(list);
+      setModels(list.filter((item) => item.kind !== "vlm"));
       setCatalog(entries);
       setDownloadId((current) => current || entries.find((entry) => !entry.installed)?.id || entries[0]?.id || "");
     } catch (error) {
@@ -534,6 +536,9 @@ export function SettingsPage({ active }: { active: boolean }) {
               </button>
             </div>
           </section>
+
+          <RegexGuide />
+          <VisionSettings active={active} />
 
           <section className="settings-card full">
             <h3><Icon name="shield" />{S.settings.thresholds}</h3>

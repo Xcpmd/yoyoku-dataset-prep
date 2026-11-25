@@ -1,27 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { listen } from "@tauri-apps/api/event";
 import { api, normalizeError } from "../../lib/api";
 import type { AssetFilter, AssetSort, AssetSummary, BatchOp, ReviewStatus } from "../../lib/types";
 import { useProject, type LibraryView } from "../../app/ProjectContext";
 import { S } from "../../lib/strings";
 import {
   classNames,
+  displayUrl,
   emptyFilter,
   filterActiveCount,
   formatBytes,
   formatNumber,
-  gridThumbUrl,
   lowThumbUrl,
+  processedDisplayUrl,
   statusLabel,
   statusTone,
 } from "../../lib/utils";
+import { warmImages } from "../../lib/imageCache";
 import { Icon } from "../../components/Icon";
 import {
   Badge,
   ConfirmDialog,
   Dropdown,
   EmptyState,
-  Field,
   IconButton,
   MenuItem,
   MenuLabel,
@@ -30,12 +32,12 @@ import {
   Segmented,
   Select,
   Spinner,
-  Toggle,
 } from "../../components/ui";
 import { ImportDialog } from "./ImportDialog";
 import { DedupeDialog } from "./DedupeDialog";
 import { Inspector } from "./Inspector";
 import { BatchDialog } from "./BatchDialog";
+import { DatasetFilterChips, DatasetFilterControls } from "./DatasetFilterBar";
 
 const PAGE_SIZE = 200;
 const GAP = 12;
@@ -74,8 +76,8 @@ function buildMasonryLayout(
   let maxHeight = 0;
   for (let index = 0; index < items.length; index += 1) {
     const asset = items[index];
-    const width = Math.max(1, asset.width);
-    const height = Math.max(1, asset.height);
+    const width = Math.max(1, asset.outWidth || asset.width);
+    const height = Math.max(1, asset.outHeight || asset.height);
     const cardHeight = Math.ceil((inner * height) / width) + GRID_CARD_EXTRA;
     heights[index] = cardHeight;
     maxHeight = Math.max(maxHeight, cardHeight);
@@ -148,7 +150,6 @@ export function LibraryPage({ active }: { active: boolean }) {
     collections,
     reloadCollections,
     importSignal,
-    searchSignal,
     setJobsOpen,
     reloadJobs,
     notify,
@@ -173,7 +174,6 @@ export function LibraryPage({ active }: { active: boolean }) {
   const dragAutoScrollRef = useRef<() => void>(() => {});
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
-  const [searchInput, setSearchInput] = useState(filter.query);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportWidth, setViewportWidth] = useState(900);
   const [viewportHeight, setViewportHeight] = useState(600);
@@ -196,21 +196,18 @@ export function LibraryPage({ active }: { active: boolean }) {
   const dedupeNoticeRef = useRef<string | null>(null);
   const dedupeSeq = useRef(0);
   const metricsRequested = useRef(false);
+  const lastSortField = useRef(sort.field);
   const [batchOpen, setBatchOpen] = useState(false);
   const [excludeTargets, setExcludeTargets] = useState<string[] | null>(null);
-  const [collectionPrompt, setCollectionPrompt] = useState<"new" | "smart" | null>(null);
+  const [collectionPrompt, setCollectionPrompt] = useState(false);
   const [deleteCollection, setDeleteCollection] = useState<{ id: string; name: string } | null>(null);
-  const [filterDraft, setFilterDraft] = useState<AssetFilter>(filter);
   const [dragOver, setDragOver] = useState(false);
   const [dragging, setDragging] = useState(false);
 
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
   const requestSeq = useRef(0);
-  const searchTimer = useRef<number | undefined>(undefined);
   const loadingMoreRef = useRef(false);
   const lastImportSignal = useRef(importSignal);
-  const lastSearchSignal = useRef(searchSignal);
   const widthRef = useRef(inspectorWidth);
   widthRef.current = inspectorWidth;
 
@@ -260,13 +257,20 @@ export function LibraryPage({ active }: { active: boolean }) {
   }, [notify]);
 
   useEffect(() => {
+    // 仅在用户本次主动切换到指标排序时补齐旧数据；恢复上次排序不重新拉起任务。
+    const changed = lastSortField.current !== sort.field;
+    lastSortField.current = sort.field;
+    if (!changed) return;
     if (["exposure", "colorfulness", "contrast", "saturation"].includes(sort.field)) {
       void ensureMetrics();
     }
   }, [sort.field, ensureMetrics]);
 
   const filterKey = useMemo(() => JSON.stringify({ filter, sort }), [filter, sort]);
+  const currentFilterKey = useRef(filterKey);
+  currentFilterKey.current = filterKey;
   const filterCount = filterActiveCount(filter);
+  const hasFilter = filterCount > 0 || !!filter.regexSearch;
 
   const loadFirst = useCallback(async () => {
     const seq = ++requestSeq.current;
@@ -300,7 +304,7 @@ export function LibraryPage({ active }: { active: boolean }) {
       const page = await api.queryAssets(filter, sort, 0, limit);
       if (seq !== requestSeq.current) return;
       setItems((current) => {
-        if (page.nextOffset === null) return page.items;
+        if (hasFilter || page.nextOffset === null) return page.items;
         if (current.length <= page.items.length) return page.items;
         // 新记录插入后旧尾部可能已前移，按 ID 去重，避免滚动时出现重复卡片。
         const seen = new Set(page.items.map((item) => item.id));
@@ -312,7 +316,7 @@ export function LibraryPage({ active }: { active: boolean }) {
     } catch {
       // 保留现有内容
     }
-  }, [filter, sort, items.length, loadFirst]);
+  }, [filter, sort, items.length, loadFirst, hasFilter]);
 
   // 页面隐藏时停止查询；返回时按筛选是否变化选择首屏或可见窗口刷新。
   const lastFilterKey = useRef(filterKey);
@@ -334,6 +338,46 @@ export function LibraryPage({ active }: { active: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshToken]);
 
+  // 裁剪保存后立即替换对应卡片的裁后缩略图，不必等整库刷新。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{
+      assetId: string;
+      thumbVersion: string;
+      revision: number;
+      outWidth: number;
+      outHeight: number;
+      reviewReset: boolean;
+    }>("asset:transform-saved", (event) => {
+      const payload = event.payload;
+      setItems((current) =>
+        current.map((item) =>
+          item.id === payload.assetId
+            ? {
+                ...item,
+                thumbVersion: payload.thumbVersion,
+                revision: payload.revision,
+                outWidth: payload.outWidth,
+                outHeight: payload.outHeight,
+                hasDraft: false,
+                status: payload.reviewReset ? ("pending" as ReviewStatus) : item.status,
+              }
+            : item,
+        ),
+      );
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   // 导入批次提交后的增量刷新：空图库立即取首屏，其余合并 250 ms 内的多次提交。
   const lastLibrarySignal = useRef(librarySignal);
   const libraryRefreshTimer = useRef<number | undefined>(undefined);
@@ -354,10 +398,6 @@ export function LibraryPage({ active }: { active: boolean }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [librarySignal, active]);
-
-  useEffect(() => {
-    setSearchInput(filter.query);
-  }, [filter.query]);
 
   // Resize observer for grid metrics
   useEffect(() => {
@@ -438,23 +478,21 @@ export function LibraryPage({ active }: { active: boolean }) {
     setVisibleIds(null);
     let cancelled = false;
     api
-      .assetIds(filter)
+      .assetIds(filter, selection)
       .then((ids) => {
         if (!cancelled) setVisibleIds(new Set(ids));
       })
-      .catch(() => {
-        if (!cancelled) setVisibleIds(new Set(items.map((item) => item.id)));
-      });
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selection.length, filterKey, refreshToken, active]);
+  }, [selection, filter, refreshToken, librarySignal, active]);
 
   const hiddenSelected = useMemo(() => {
     if (!visibleIds) return 0;
     return selection.filter((id) => !visibleIds.has(id)).length;
   }, [selection, visibleIds]);
+  const allResultsSelected = total > 0 && visibleIds?.size === total;
 
   // Open inspector on selection at wide screens
   useEffect(() => {
@@ -496,16 +534,6 @@ export function LibraryPage({ active }: { active: boolean }) {
     setImportOpen(true);
   }, [importSignal, active]);
 
-  useEffect(() => {
-    if (searchSignal === lastSearchSignal.current) return;
-    lastSearchSignal.current = searchSignal;
-    if (!active) return;
-    window.setTimeout(() => {
-      searchRef.current?.focus();
-      searchRef.current?.select();
-    }, 40);
-  }, [searchSignal, active]);
-
   // Tauri native drag and drop
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -541,31 +569,7 @@ export function LibraryPage({ active }: { active: boolean }) {
     };
   }, [active]);
 
-  const changeSearch = (value: string) => {
-    setSearchInput(value);
-    if (searchTimer.current) window.clearTimeout(searchTimer.current);
-    searchTimer.current = window.setTimeout(() => {
-      setFilter((current) => ({ ...current, query: value }));
-    }, 120);
-  };
-
-  const clearSearch = () => {
-    setSearchInput("");
-    if (searchTimer.current) window.clearTimeout(searchTimer.current);
-    setFilter((current) => ({ ...current, query: "" }));
-  };
-
-  const openAsset = async (id: string) => {
-    try {
-      const ids = await api.assetIds(filter);
-      openWorkbench(id, {
-        sequence: ids,
-        label: S.workbench.sequenceLibrary,
-      });
-    } catch {
-      openWorkbench(id);
-    }
-  };
+  const openAsset = (id: string) => openWorkbench(id);
 
   const handleCardClick = (asset: AssetSummary, event: React.MouseEvent) => {
     dragSelectRef.current = null;
@@ -602,13 +606,13 @@ export function LibraryPage({ active }: { active: boolean }) {
   };
 
   const toggleSelectAll = async () => {
-    if (total > 0 && selection.length >= total) {
-      clearSelection();
+    if (allResultsSelected && visibleIds) {
+      setSelection(selection.filter((id) => !visibleIds.has(id)));
       return;
     }
     try {
       const ids = await api.assetIds(filter);
-      setSelection(ids);
+      if (currentFilterKey.current === filterKey) setSelection(ids);
     } catch (error) {
       notify({ tone: "danger", title: S.errors.generic, message: normalizeError(error).message });
     }
@@ -952,28 +956,21 @@ export function LibraryPage({ active }: { active: boolean }) {
   };
 
   const createCollection = async (name: string) => {
-    const mode = collectionPrompt;
-    setCollectionPrompt(null);
+    setCollectionPrompt(false);
     if (!name.trim()) return;
     try {
-      if (mode === "smart") {
-        await api.createCollection({ name: name.trim(), kind: "query", query: filter, sort });
-        await reloadCollections();
-        notify({ tone: "success", message: `已保存智能集合「${name.trim()}」` });
+      const collection = await api.createCollection({ name: name.trim(), kind: "manual" });
+      await reloadCollections();
+      if (selection.length > 0) {
+        const preview = await api.batchPreview({
+          assetIds: selection,
+          op: { kind: "addToCollection", collection: collection.id },
+        });
+        if (preview.count > 0) await api.batchApply(preview.previewId);
+        bumpRefresh();
+        notify({ tone: "success", message: `已创建集合「${collection.name}」并加入 ${selection.length} 张图片` });
       } else {
-        const collection = await api.createCollection({ name: name.trim(), kind: "manual" });
-        await reloadCollections();
-        if (selection.length > 0) {
-          const preview = await api.batchPreview({
-            assetIds: selection,
-            op: { kind: "addToCollection", collection: collection.id },
-          });
-          if (preview.count > 0) await api.batchApply(preview.previewId);
-          bumpRefresh();
-          notify({ tone: "success", message: `已创建集合「${collection.name}」并加入 ${selection.length} 张图片` });
-        } else {
-          notify({ tone: "success", message: `已创建集合「${collection.name}」` });
-        }
+        notify({ tone: "success", message: `已创建集合「${collection.name}」` });
       }
     } catch (error) {
       notify({ tone: "danger", title: S.errors.generic, message: normalizeError(error).message });
@@ -990,20 +987,6 @@ export function LibraryPage({ active }: { active: boolean }) {
     } catch (error) {
       notify({ tone: "danger", message: normalizeError(error).message });
     }
-  };
-
-  const applyFilterDraft = (close: () => void) => {
-    setFilter({ ...filterDraft, query: filter.query });
-    close();
-  };
-
-  const resetFilterDraft = () => {
-    setFilterDraft({ ...emptyFilter(), query: filter.query });
-  };
-
-  const nowOpenFilter = (toggle: () => void) => {
-    setFilterDraft(filter);
-    toggle();
   };
 
   const assetNames = useMemo(() => {
@@ -1026,70 +1009,6 @@ export function LibraryPage({ active }: { active: boolean }) {
   const startRow = Math.max(0, Math.floor(scrollTop / rowHeight) - 2);
   const endRow = Math.min(rows, Math.ceil((scrollTop + viewportHeight) / rowHeight) + 2);
 
-  const activeFilterChips = useMemo(() => {
-    const chips: { key: string; label: string; remove: () => void }[] = [];
-    filter.statuses.forEach((status) =>
-      chips.push({
-        key: `status-${status}`,
-        label: statusLabel(status),
-        remove: () => setFilter({ ...filter, statuses: filter.statuses.filter((value) => value !== status) }),
-      }),
-    );
-    filter.issueLevels.forEach((level) =>
-      chips.push({
-        key: `level-${level}`,
-        label: level === "blocking" ? S.library.filterBlocking : level === "ignored" ? S.library.filterIgnored : S.library.filterSuggestion,
-        remove: () => setFilter({ ...filter, issueLevels: filter.issueLevels.filter((value) => value !== level) }),
-      }),
-    );
-    filter.orientations.forEach((orientation) =>
-      chips.push({
-        key: `orientation-${orientation}`,
-        label:
-          orientation === "landscape"
-            ? S.library.orientationLandscape
-            : orientation === "portrait"
-              ? S.library.orientationPortrait
-              : S.library.orientationSquare,
-        remove: () => setFilter({ ...filter, orientations: filter.orientations.filter((value) => value !== orientation) }),
-      }),
-    );
-    filter.collectionIds.forEach((id) => {
-      const collection = collections.find((item) => item.id === id);
-      chips.push({
-        key: `collection-${id}`,
-        label: collection?.name || "集合",
-        remove: () => setFilter({ ...filter, collectionIds: filter.collectionIds.filter((value) => value !== id) }),
-      });
-    });
-    if (filter.split) {
-      chips.push({
-        key: "split",
-        label: filter.split === "train" ? "训练" : filter.split === "val" ? "验证" : "未分配",
-        remove: () => setFilter({ ...filter, split: null }),
-      });
-    }
-    if (filter.duplicateOnly) {
-      chips.push({ key: "duplicate", label: S.library.filterDuplicate, remove: () => setFilter({ ...filter, duplicateOnly: false }) });
-    }
-    if (filter.favoriteOnly) {
-      chips.push({ key: "favorite", label: S.library.filterFavorites, remove: () => setFilter({ ...filter, favoriteOnly: false }) });
-    }
-    if (filter.hasDraft) {
-      chips.push({ key: "draft", label: S.library.filterDraft, remove: () => setFilter({ ...filter, hasDraft: false }) });
-    }
-    if (filter.recycledOnly) {
-      chips.push({ key: "recycled", label: "回收区", remove: () => setFilter({ ...filter, recycledOnly: false }) });
-    }
-    if (filter.minShortEdge) {
-      chips.push({ key: "minEdge", label: `短边 ≥ ${filter.minShortEdge}`, remove: () => setFilter({ ...filter, minShortEdge: null }) });
-    }
-    if (filter.maxShortEdge) {
-      chips.push({ key: "maxEdge", label: `短边 ≤ ${filter.maxShortEdge}`, remove: () => setFilter({ ...filter, maxShortEdge: null }) });
-    }
-    return chips;
-  }, [filter, collections, setFilter]);
-
   const beginInspectorResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     const startX = event.clientX;
@@ -1108,7 +1027,6 @@ export function LibraryPage({ active }: { active: boolean }) {
   };
 
   const showEmpty = !loading && total === 0;
-  const hasFilter = filterCount > 0;
 
   return (
     <div className="page" style={{ overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -1117,7 +1035,7 @@ export function LibraryPage({ active }: { active: boolean }) {
           <div>
             <h1 className="page-title">{S.library.title}</h1>
             <div className="head-count">
-              {filterCount > 0 || filter.query.trim() ? (
+              {hasFilter ? (
                 <>
                   <span>找到</span>
                   <strong>{formatNumber(total)}</strong>
@@ -1156,228 +1074,7 @@ export function LibraryPage({ active }: { active: boolean }) {
         </div>
 
         <div className="library-toolbar">
-          <div className="search-box">
-            <Icon name="search" className="sm" />
-            <input
-              ref={searchRef}
-              id="library-search"
-              className="input"
-              placeholder={S.library.searchPlaceholder}
-              value={searchInput}
-              onChange={(event) => changeSearch(event.target.value)}
-              aria-label={S.library.searchPlaceholder}
-            />
-            {searchInput ? (
-              <button type="button" className="search-clear" aria-label={S.common.clear} onClick={clearSearch}>
-                <Icon name="x" className="sm" />
-              </button>
-            ) : (
-              <span className="search-hint">
-                <span className="kbd">Ctrl F</span>
-              </span>
-            )}
-          </div>
-
-          <Dropdown
-            width={520}
-            renderTrigger={(toggle, open) => (
-              <button
-                type="button"
-                className={classNames("btn", filterCount > 0 ? "secondary" : "subtle")}
-                onClick={() => nowOpenFilter(toggle)}
-                aria-expanded={open}
-              >
-                <Icon name="filter" />
-                {S.library.filter}
-                {filterCount > 0 ? <span className="count info">{filterCount}</span> : null}
-              </button>
-            )}
-          >
-            {(close) => (
-              <div className="stack" style={{ gap: 14, padding: 10 }}>
-                <div className="filter-grid">
-                  <div className="filter-section">
-                    <div className="filter-title">{S.library.filterStatus}</div>
-                    <div className="row-wrap">
-                      {(["pending", "approved", "review", "excluded"] as ReviewStatus[]).map((status) => (
-                        <button
-                          key={status}
-                          type="button"
-                          className={classNames("chip", filterDraft.statuses.includes(status) && "active")}
-                          onClick={() =>
-                            setFilterDraft({
-                              ...filterDraft,
-                              statuses: filterDraft.statuses.includes(status)
-                                ? filterDraft.statuses.filter((value) => value !== status)
-                                : [...filterDraft.statuses, status],
-                            })
-                          }
-                        >
-                          {statusLabel(status)}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="filter-title" style={{ marginTop: 8 }}>{S.library.filterIssue}</div>
-                    <div className="row-wrap">
-                      {(["blocking", "suggestion", "ignored"] as const).map((level) => (
-                        <button
-                          key={level}
-                          type="button"
-                          className={classNames("chip", filterDraft.issueLevels.includes(level) && "active")}
-                          onClick={() =>
-                            setFilterDraft({
-                              ...filterDraft,
-                              issueLevels: filterDraft.issueLevels.includes(level)
-                                ? filterDraft.issueLevels.filter((value) => value !== level)
-                                : [...filterDraft.issueLevels, level],
-                            })
-                          }
-                        >
-                          {level === "blocking" ? S.library.filterBlocking : level === "suggestion" ? S.library.filterSuggestion : S.library.filterIgnored}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="filter-section">
-                    <div className="filter-title">{S.library.filterOrientation}</div>
-                    <div className="row-wrap">
-                      {(["landscape", "portrait", "square"] as const).map((orientation) => (
-                        <button
-                          key={orientation}
-                          type="button"
-                          className={classNames("chip", filterDraft.orientations.includes(orientation) && "active")}
-                          onClick={() =>
-                            setFilterDraft({
-                              ...filterDraft,
-                              orientations: filterDraft.orientations.includes(orientation)
-                                ? filterDraft.orientations.filter((value) => value !== orientation)
-                                : [...filterDraft.orientations, orientation],
-                            })
-                          }
-                        >
-                          {orientation === "landscape" ? S.library.orientationLandscape : orientation === "portrait" ? S.library.orientationPortrait : S.library.orientationSquare}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="filter-title" style={{ marginTop: 8 }}>{S.library.filterSize}</div>
-                    <div className="row" style={{ gap: 6 }}>
-                      <input
-                        className="input number"
-                        type="number"
-                        min={1}
-                        placeholder={S.library.minEdge}
-                        value={filterDraft.minShortEdge ?? ""}
-                        onChange={(event) =>
-                          setFilterDraft({
-                            ...filterDraft,
-                            minShortEdge: event.target.value ? Number(event.target.value) : null,
-                          })
-                        }
-                        style={{ minHeight: 38 }}
-                      />
-                      <span className="faint">—</span>
-                      <input
-                        className="input number"
-                        type="number"
-                        min={1}
-                        placeholder={S.library.maxEdge}
-                        value={filterDraft.maxShortEdge ?? ""}
-                        onChange={(event) =>
-                          setFilterDraft({
-                            ...filterDraft,
-                            maxShortEdge: event.target.value ? Number(event.target.value) : null,
-                          })
-                        }
-                        style={{ minHeight: 38 }}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="filter-section">
-                    <div className="filter-title">{S.library.filterCollection}</div>
-                    <Select
-                      value={filterDraft.collectionIds[0] || ""}
-                      onChange={(value) =>
-                        setFilterDraft({ ...filterDraft, collectionIds: value ? [value] : [] })
-                      }
-                      ariaLabel={S.library.filterCollection}
-                      options={[
-                        { value: "", label: S.library.filterAny },
-                        ...collections.map((collection) => ({
-                          value: collection.id,
-                          label: collection.name,
-                          hint: collection.count,
-                        })),
-                      ]}
-                    />
-                    <div className="filter-title" style={{ marginTop: 8 }}>{S.library.filterSplit}</div>
-                    <Select
-                      value={filterDraft.split || ""}
-                      onChange={(value) =>
-                        setFilterDraft({
-                          ...filterDraft,
-                          split: (value || null) as AssetFilter["split"],
-                        })
-                      }
-                      ariaLabel={S.library.filterSplit}
-                      options={[
-                        { value: "", label: S.library.filterAny },
-                        { value: "train", label: S.library.splitTrain },
-                        { value: "val", label: S.library.splitVal },
-                        { value: "unassigned", label: S.library.splitUnassigned },
-                      ]}
-                    />
-                  </div>
-
-                  <div className="filter-section">
-                    <Toggle
-                      checked={filterDraft.duplicateOnly}
-                      onChange={(value) => setFilterDraft({ ...filterDraft, duplicateOnly: value })}
-                      label={S.library.filterDuplicate}
-                    />
-                    <Toggle
-                      checked={filterDraft.favoriteOnly}
-                      onChange={(value) => setFilterDraft({ ...filterDraft, favoriteOnly: value })}
-                      label={S.library.filterFavorites}
-                    />
-                    <Toggle
-                      checked={filterDraft.hasDraft}
-                      onChange={(value) => setFilterDraft({ ...filterDraft, hasDraft: value })}
-                      label={S.library.filterDraft}
-                    />
-                    <Toggle
-                      checked={filterDraft.recycledOnly}
-                      onChange={(value) => setFilterDraft({ ...filterDraft, recycledOnly: value })}
-                      label="回收区"
-                    />
-                  </div>
-                </div>
-                <div className="row" style={{ justifyContent: "space-between", borderTop: "1px solid var(--line)", paddingTop: 12 }}>
-                  <button type="button" className="btn ghost sm" onClick={resetFilterDraft}>
-                    {S.library.resetFilters}
-                  </button>
-                  <div className="row" style={{ gap: 9 }}>
-                    <button
-                      type="button"
-                      className="btn subtle"
-                      onClick={() => {
-                        close();
-                        setFilterDraft(filter);
-                        setCollectionPrompt("smart");
-                      }}
-                    >
-                      {S.library.saveSmartCollection}
-                    </button>
-                    <button type="button" className="btn primary" onClick={() => applyFilterDraft(close)}>
-                      {S.library.applyFilters}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </Dropdown>
-
+          {active ? <DatasetFilterControls /> : null}
           <Dropdown
             width={260}
             renderTrigger={(toggle) => (
@@ -1395,7 +1092,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                   icon="image"
                   onClick={() => {
                     close();
-                    setFilter({ ...filter, collectionIds: [] });
+                    setFilter({ ...filter, collectionIds: [], recycledOnly: false });
                   }}
                   hint={filter.collectionIds.length === 0 ? "✓" : undefined}
                 >
@@ -1405,7 +1102,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                   icon="star"
                   onClick={() => {
                     close();
-                    setFilter({ ...filter, favoriteOnly: true, collectionIds: [], statuses: [], issueLevels: [], split: null });
+                    setFilter({ ...filter, recycledOnly: false, favoriteOnly: true, collectionIds: [], statuses: [], issueLevels: [], split: null });
                   }}
                 >
                   {S.library.smartFavorites}
@@ -1414,7 +1111,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                   icon="alert"
                   onClick={() => {
                     close();
-                    setFilter({ ...filter, favoriteOnly: false, collectionIds: [], statuses: ["review"], issueLevels: [], split: null });
+                    setFilter({ ...filter, recycledOnly: false, favoriteOnly: false, collectionIds: [], statuses: ["review"], issueLevels: [], split: null });
                   }}
                 >
                   {S.library.smartReview}
@@ -1423,7 +1120,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                   icon="clock"
                   onClick={() => {
                     close();
-                    setFilter({ ...filter, favoriteOnly: false, collectionIds: [] });
+                    setFilter({ ...filter, recycledOnly: false, favoriteOnly: false, collectionIds: [] });
                     setSort({ field: "date", direction: "desc" });
                   }}
                 >
@@ -1445,10 +1142,15 @@ export function LibraryPage({ active }: { active: boolean }) {
                   <MenuItem
                     key={collection.id}
                     icon="folder"
-                    hint={collection.count}
+                    hint={collection.kind === "query" ? "智能" : collection.count}
                     onClick={() => {
                       close();
-                      setFilter({ ...filter, collectionIds: [collection.id], favoriteOnly: false });
+                      if (collection.kind === "query" && collection.query) {
+                        setFilter({ ...emptyFilter(), ...collection.query });
+                        if (collection.sort) setSort(collection.sort);
+                        return;
+                      }
+                      setFilter({ ...filter, recycledOnly: false, collectionIds: [collection.id], favoriteOnly: false });
                     }}
                   >
                     {collection.name}
@@ -1459,7 +1161,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                   icon="plus"
                   onClick={() => {
                     close();
-                    setCollectionPrompt("new");
+                    setCollectionPrompt(true);
                   }}
                 >
                   新建集合…
@@ -1532,28 +1234,7 @@ export function LibraryPage({ active }: { active: boolean }) {
           />
         </div>
 
-        {activeFilterChips.length > 0 ? (
-          <div className="active-filters">
-            {activeFilterChips.map((chip) => (
-              <span className="chip active" key={chip.key}>
-                {chip.label}
-                <button type="button" className="x" aria-label={`移除 ${chip.label}`} onClick={chip.remove}>
-                  <Icon name="x" className="sm" />
-                </button>
-              </span>
-            ))}
-            <button
-              type="button"
-              className="btn ghost sm"
-              onClick={() => {
-                setFilter(emptyFilter());
-                setSearchInput("");
-              }}
-            >
-              {S.common.clearAll}
-            </button>
-          </div>
-        ) : null}
+        {active ? <DatasetFilterChips /> : null}
 
         <div className="library-body">
           <div className="asset-area">
@@ -1609,7 +1290,6 @@ export function LibraryPage({ active }: { active: boolean }) {
                         className="btn primary"
                         onClick={() => {
                           setFilter(emptyFilter());
-                          setSearchInput("");
                         }}
                       >
                         {S.common.clearAll}
@@ -1734,7 +1414,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                     title={S.library.selectAll}
                   >
                     <Icon name="check-circle" className="sm" />
-                    <span>{total > 0 && selection.length >= total ? "取消全选" : "全选"}</span>
+                    <span>{allResultsSelected ? "取消全选" : "全选"}</span>
                   </button>
                   <Dropdown
                     width={240}
@@ -1748,7 +1428,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                   >
                     {(close) => (
                       <>
-                        {collections.map((collection) => (
+                        {collections.filter((collection) => collection.kind !== "query").map((collection) => (
                           <MenuItem
                             key={collection.id}
                             icon="folder"
@@ -1762,7 +1442,7 @@ export function LibraryPage({ active }: { active: boolean }) {
                           </MenuItem>
                         ))}
                         <MenuSeparator />
-                        <MenuItem icon="plus" onClick={() => { close(); setCollectionPrompt("new"); }}>
+                        <MenuItem icon="plus" onClick={() => { close(); setCollectionPrompt(true); }}>
                           新建集合并加入
                         </MenuItem>
                       </>
@@ -1873,7 +1553,6 @@ export function LibraryPage({ active }: { active: boolean }) {
 
           {inspectorOpen ? (
             <>
-              <div className="inspector-backdrop" onClick={() => setInspectorOpen(false)} />
               <Inspector
                 open={inspectorOpen}
                 width={inspectorWidth}
@@ -1911,7 +1590,7 @@ export function LibraryPage({ active }: { active: boolean }) {
           setImportPaths([]);
         }}
       />
-      <BatchDialog open={batchOpen} onClose={() => setBatchOpen(false)} assetNames={assetNames} />
+      <BatchDialog open={batchOpen} onClose={() => setBatchOpen(false)} assetNames={assetNames} hiddenSelected={hiddenSelected} />
       <DedupeDialog
         open={dedupeOpen}
         onClose={() => setDedupeOpen(false)}
@@ -1934,18 +1613,14 @@ export function LibraryPage({ active }: { active: boolean }) {
       />
 
       <PromptDialog
-        open={collectionPrompt !== null}
-        title={collectionPrompt === "smart" ? S.library.saveSmartCollection : "新建集合"}
-        body={
-          collectionPrompt === "smart"
-            ? "将当前筛选与排序保存为动态集合，集合内容随素材变化自动计算。"
-            : "创建一个手动集合；若当前有选中图片，会一并加入。"
-        }
+        open={collectionPrompt}
+        title="新建集合"
+        body="创建手动集合，并加入当前选中的图片。"
         label={S.library.smartCollectionName}
         required
         confirmLabel={S.common.add}
         onSubmit={(value) => void createCollection(value)}
-        onClose={() => setCollectionPrompt(null)}
+        onClose={() => setCollectionPrompt(false)}
       />
 
       <ConfirmDialog
@@ -2007,15 +1682,19 @@ function AssetCard({
       }}
       tabIndex={focused ? 0 : -1}
       title={`${asset.name}\n${asset.width}×${asset.height}\n双击打开工作台`}
-      onPointerEnter={onDragEnter}
+      onPointerEnter={() => {
+        onDragEnter();
+        // 悬停时在空闲时段预热裁后图与原图大图：进入裁剪/打标后首屏直接命中缓存。
+        warmImages([processedDisplayUrl(asset), displayUrl(asset.id, asset.displayVersion)]);
+      }}
     >
       <div
         className="thumb-box checker"
-        style={{ aspectRatio: `${asset.width} / ${asset.height}` }}
+        style={{ aspectRatio: `${asset.outWidth || asset.width} / ${asset.outHeight || asset.height}` }}
       >
         {!failed ? (
           <img
-            src={gridThumbUrl(asset)}
+            src={lowThumbUrl(asset)}
             alt={asset.name}
             loading="lazy"
             draggable={false}

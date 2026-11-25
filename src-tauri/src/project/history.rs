@@ -230,7 +230,7 @@ fn load_entry(conn: &rusqlite::Connection, seq: i64) -> AppResult<(String, Strin
     Ok((label, command, before, after, targets))
 }
 
-pub fn undo_last(project: &Project) -> AppResult<Option<UndoOutcome>> {
+pub fn undo_last(project: &Project, expected_seq: Option<i64>) -> AppResult<Option<UndoOutcome>> {
     let mut conn = project.conn();
     let seq: Option<i64> = conn
         .query_row(
@@ -239,6 +239,9 @@ pub fn undo_last(project: &Project) -> AppResult<Option<UndoOutcome>> {
             |row| row.get(0),
         )
         .optional()?;
+    if expected_seq.is_some() && seq != expected_seq {
+        return Err(AppError::new("HISTORY_CHANGED", "操作历史已变化，请按历史顺序撤销"));
+    }
     let Some(seq) = seq else {
         return Ok(None);
     };

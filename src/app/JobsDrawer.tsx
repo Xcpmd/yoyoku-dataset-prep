@@ -11,6 +11,7 @@ function kindLabel(kind: string): string {
   if (kind === "import") return "导入";
   if (kind === "export") return "导出";
   if (kind === "metrics") return "指标";
+  if (kind === "crop") return "裁切";
   return kind;
 }
 
@@ -255,6 +256,22 @@ export function JobsDrawer() {
           <Icon name="tasks" />
           <h3>{S.jobs.title}</h3>
           <span className="count">{activeJobs.length}</span>
+          {finishedJobs.length > 0 ? (
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={busy !== null}
+              onClick={() =>
+                void runAction(async () => {
+                  const removed = await api.clearFinishedJobs();
+                  notify({ message: removed > 0 ? `已清理 ${removed} 条任务记录` : "没有可清理的记录" });
+                })
+              }
+            >
+              <Icon name="trash" className="sm" />
+              清理已完成
+            </button>
+          ) : null}
           <IconButton icon="x" label={S.jobs.closePanel} onClick={() => setJobsOpen(false)} />
         </div>
         <div className="jobs-body">

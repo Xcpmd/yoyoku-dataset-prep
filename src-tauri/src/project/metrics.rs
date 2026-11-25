@@ -2,6 +2,7 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::project::jobs::{self, JobContext, JobOutcome, JobRun};
 use crate::project::Project;
+use crate::util;
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -23,7 +24,8 @@ pub fn start_backfill(app: AppHandle, project: Arc<Project>) -> AppResult<Metric
         let conn = project.conn();
         let mut statement = conn.prepare(
             "SELECT id FROM assets
-             WHERE json_extract(analysis_json, '$.colorfulness') IS NULL
+             WHERE review_status <> 'excluded' AND COALESCE(missing, 0) = 0
+               AND json_extract(analysis_json, '$.colorfulness') IS NULL
              ORDER BY sort_index ASC",
         )?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -37,7 +39,7 @@ pub fn start_backfill(app: AppHandle, project: Arc<Project>) -> AppResult<Metric
         let conn = project.conn();
         let running: Option<String> = conn
             .query_row(
-                "SELECT id FROM jobs WHERE kind = ?1 AND status IN ('running','queued','paused') LIMIT 1",
+                "SELECT id FROM jobs WHERE kind = ?1 AND status IN ('running','queued') LIMIT 1",
                 params![JOB_KIND],
                 |row| row.get(0),
             )
@@ -45,6 +47,22 @@ pub fn start_backfill(app: AppHandle, project: Arc<Project>) -> AppResult<Metric
         if let Some(job_id) = running {
             return Ok(MetricsBackfillResult { job_id, total });
         }
+        // 指标任务不参与应用重启后的继续；把上次中断的 paused 记录收尾，
+        // 避免任务中心长期停留一个无法恢复的“分析图片指标”。
+        conn.execute(
+            "UPDATE jobs SET status = 'cancelled', phase = '已放弃',
+                error_json = ?1, updated_at = ?2
+             WHERE kind = ?3 AND status = 'paused'",
+            params![
+                serde_json::json!({
+                    "code": "CANCELLED",
+                    "message": "应用退出时中断的指标任务已放弃，将重新分析缺失指标。"
+                })
+                .to_string(),
+                util::now_iso(),
+                JOB_KIND
+            ],
+        )?;
     }
     let job_id = jobs::insert_job(
         &project,

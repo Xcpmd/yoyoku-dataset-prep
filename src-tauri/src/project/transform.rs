@@ -131,6 +131,13 @@ fn revision_plan(conn: &rusqlite::Connection, revision_id: Option<&str>) -> AppR
     }))
 }
 
+/// 读取当前已应用的裁剪配方；没有历史版本时返回默认配方。
+pub fn applied_plan(conn: &rusqlite::Connection, asset: &AssetRow) -> AppResult<TransformPlan> {
+    Ok(revision_plan(conn, asset.transform_revision_id.as_deref())?
+        .map(|(plan, _)| plan)
+        .unwrap_or_default())
+}
+
 pub fn transform_data(project: &Project, asset: &AssetRow) -> AppResult<TransformData> {
     let conn = project.conn();
     let current = revision_plan(&conn, asset.transform_revision_id.as_deref())?;
@@ -233,7 +240,8 @@ pub fn regenerate_thumb(
     let source = project.require_source(asset)?;
     let version = format!("{}-{}", &asset.content_hash[..10], revision_id);
     let path = project.thumb_path(&asset.id, &version);
-    worker.thumbnail(&source, Some(plan), &path, 640)?;
+    let low_path = project.thumb_path(&asset.id, &format!("low-{version}"));
+    worker.thumbnail_pair(&source, Some(plan), &path, 640, &low_path, 256)?;
     Ok(version)
 }
 

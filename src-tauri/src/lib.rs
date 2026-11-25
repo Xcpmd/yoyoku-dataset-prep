@@ -8,6 +8,7 @@ mod model;
 mod project;
 mod state;
 mod tagging;
+mod vlm;
 mod util;
 mod worker;
 
@@ -31,7 +32,10 @@ fn asset_response(path: Option<&Path>, mime: &str) -> Response<Vec<u8>> {
         Ok(bytes) => Response::builder()
             .status(200)
             .header("Content-Type", mime)
-            .header("Cache-Control", "no-cache")
+            // 文件名本身带内容版本（thumbVersion / displayVersion / sha / 预览哈希），
+            // 同一 URL 的内容不会变化，允许 WebView 长期复用，避免图库、裁剪、
+            // 打标之间切换时反复回源解码同一张图。
+            .header("Cache-Control", "public, max-age=31536000, immutable")
             .body(bytes)
             .unwrap_or_else(|_| forbid()),
         Err(_) => forbid(),
@@ -139,10 +143,16 @@ fn serve_asset(app: &tauri::AppHandle, request: &tauri::http::Request<Vec<u8>>) 
                         return;
                     };
                     let tmp = variant_temp_path(&path);
-                    match state
-                        .worker
-                        .thumbnail(&source, plan.as_ref(), &tmp, size)
-                    {
+                    let result = if version.starts_with("low-") {
+                        state
+                            .worker
+                            .thumbnail_background(&source, plan.as_ref(), &tmp, size)
+                    } else {
+                        state
+                            .worker
+                            .thumbnail(&source, plan.as_ref(), &tmp, size)
+                    };
+                    match result {
                         Ok(()) => {
                             let _ = std::fs::rename(&tmp, &path);
                         }
@@ -173,8 +183,37 @@ fn serve_asset(app: &tauri::AppHandle, request: &tauri::http::Request<Vec<u8>>) 
                     let Ok(source) = project.source_path(&asset) else {
                         return;
                     };
+                    // `proc-` 版本按已应用配方渲染，供图库/打标页显示裁后大图；
+                    // `src-` 版本保持原图语义供检查器使用。
+                    // `hd-` 前缀是放大查看时的 2560 px 版本，避免高倍缩放发虚。
+                    let high_res = version.starts_with("hd-");
+                    let processed =
+                        version.starts_with("proc-") || version.starts_with("hd-proc-");
+                    let plan = if processed {
+                        asset
+                            .transform_revision_id
+                            .as_deref()
+                            .and_then(|id| {
+                                let conn = project.conn();
+                                conn.query_row(
+                                    "SELECT plan_json FROM transform_revisions WHERE id = ?1",
+                                    rusqlite::params![id],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .ok()
+                            })
+                            .and_then(|json| {
+                                serde_json::from_str::<model::TransformPlan>(&json).ok()
+                            })
+                    } else {
+                        None
+                    };
                     let tmp = variant_temp_path(&path);
-                    match state.worker.display(&source, &tmp, 1600) {
+                    let max_side = if high_res { 2560 } else { 1600 };
+                    match state
+                        .worker
+                        .display_with_plan(&source, plan.as_ref(), &tmp, max_side)
+                    {
                         Ok(_) => {
                             let _ = std::fs::rename(&tmp, &path);
                         }
@@ -252,6 +291,7 @@ pub fn run() {
             commands::import_retry,
             commands::assets_query,
             commands::assets_ids,
+            commands::assets_filter_validate,
             commands::asset_get,
             commands::asset_update,
             commands::asset_display,
@@ -270,6 +310,7 @@ pub fn run() {
             commands::collection_ids,
             commands::transform_preview,
             commands::transform_save,
+            commands::crop_apply_batch,
             commands::transform_draft_save,
             commands::transform_draft_clear,
             commands::caption_save,
@@ -281,6 +322,8 @@ pub fn run() {
             commands::caption_tag_bulk,
             commands::caption_suggestions,
             commands::suggestion_generate,
+            commands::tagger_batch_begin,
+            commands::tagger_batch_end,
             commands::suggestion_apply,
             commands::quality_run,
             commands::quality_summary,
@@ -305,11 +348,19 @@ pub fn run() {
             commands::export_absolute_entry,
             commands::export_open_output,
             commands::jobs_list,
+            commands::jobs_clear_finished,
             commands::jobs_pause,
             commands::jobs_resume,
             commands::jobs_cancel,
             commands::jobs_retry_failed,
             commands::models_list,
+            commands::vlm_configuration,
+            commands::vlm_preferences_save,
+            commands::vlm_connection_save,
+            commands::vlm_connection_remove,
+            commands::vlm_models_discover,
+            commands::vlm_model_verify,
+            commands::vlm_prompt_test,
             commands::models_catalog,
             commands::model_download,
             commands::models_open_dir,

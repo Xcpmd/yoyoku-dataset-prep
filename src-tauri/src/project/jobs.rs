@@ -314,7 +314,12 @@ pub fn get_job(project: &Project, job_id: &str) -> AppResult<JobInfo> {
 pub fn list_jobs(project: &Project) -> AppResult<Vec<JobInfo>> {
     let ids: Vec<String> = {
         let conn = project.conn();
-        let mut statement = conn.prepare("SELECT id FROM jobs ORDER BY created_at DESC LIMIT 100")?;
+        // 指标回填是辅助任务，结束后不留在任务中心；进行中仍可查看进度。
+        let mut statement = conn.prepare(
+            "SELECT id FROM jobs
+             WHERE NOT (kind = 'metrics' AND status NOT IN ('running', 'queued', 'paused'))
+             ORDER BY created_at DESC LIMIT 100",
+        )?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.filter_map(|row| row.ok()).collect()
     };
@@ -337,8 +342,14 @@ pub fn mark_interrupted(project: &Project) -> AppResult<()> {
     });
     conn.execute(
         "UPDATE jobs SET status = 'paused', error_json = ?1, phase = '已中断', updated_at = ?2
-         WHERE status IN ('running', 'queued')",
+         WHERE status IN ('running', 'queued') AND kind <> 'metrics'",
         params![error.to_string(), util::now_iso()],
+    )?;
+    // 指标回填不支持重启续跑，直接收尾，避免长期占用任务中心。
+    conn.execute(
+        "UPDATE jobs SET status = 'cancelled', phase = '已放弃', updated_at = ?1
+         WHERE status IN ('running', 'queued') AND kind = 'metrics'",
+        params![util::now_iso()],
     )?;
     Ok(())
 }
@@ -352,4 +363,14 @@ pub fn completed_count(project: &Project) -> i64 {
             |row| row.get(0),
         )
         .unwrap_or(0)
+}
+
+/// 清除已结束的任务记录，保留运行中、排队和待恢复的任务。
+pub fn clear_finished(project: &Project) -> AppResult<i64> {
+    let conn = project.conn();
+    let removed = conn.execute(
+        "DELETE FROM jobs WHERE status NOT IN ('running','queued','paused')",
+        [],
+    )?;
+    Ok(removed as i64)
 }

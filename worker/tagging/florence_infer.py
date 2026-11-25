@@ -3,6 +3,8 @@
 
 Reads one JSON object from stdout, matching the WD14 adapter:
   {"text": "...", "device": "CPU", "elapsedMs": 123, "model": "...", "runtime": "transformers"}
+Using `--serve` keeps the model loaded and processes one JSON request per stdin
+line, so batch tagging only pays the model-load cost once.
 Run with a Python that has torch / transformers / einops. The embedded WD14
 runtime only contains onnxruntime and intentionally is not used here.
 """
@@ -15,6 +17,11 @@ import json
 import sys
 import time
 import types
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
 
 
 def install_timm_shim() -> None:
@@ -53,15 +60,7 @@ def install_timm_shim() -> None:
     sys.modules["timm.layers"] = layers
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image", required=True)
-    parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--task", default="<MORE_DETAILED_CAPTION>")
-    parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    args = parser.parse_args()
-
+def load_runtime(model_dir, device_arg):
     try:
         import torch
         from PIL import Image
@@ -69,8 +68,9 @@ def main() -> int:
         print(
             f"Florence-2 运行时缺少依赖：{error}。请在设置中指定安装 torch、transformers、einops 的 Python 3.10+。",
             file=sys.stderr,
+            flush=True,
         )
-        return 2
+        return None
 
     install_timm_shim()
     try:
@@ -79,70 +79,162 @@ def main() -> int:
         print(
             f"Florence-2 无法加载 transformers：{error}。需要 torch、transformers、einops 与 Pillow。",
             file=sys.stderr,
+            flush=True,
         )
-        return 2
+        return None
 
-    started = time.time()
-    use_cuda = args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
+    use_cuda = device_arg == "cuda" or (device_arg == "auto" and torch.cuda.is_available())
     device = "cuda" if use_cuda else "cpu"
     dtype = torch.float16 if use_cuda else torch.float32
-
     try:
         processor = AutoProcessor.from_pretrained(
-            args.model_dir, trust_remote_code=True, local_files_only=True
+            model_dir, trust_remote_code=True, local_files_only=True
         )
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_dir,
+            model_dir,
             trust_remote_code=True,
             local_files_only=True,
             torch_dtype=dtype,
         )
         model.to(device)
         model.eval()
+    except Exception as error:  # noqa: BLE001
+        print(f"Florence-2 模型加载失败：{error}", file=sys.stderr, flush=True)
+        return None
 
-        image = Image.open(args.image).convert("RGB")
-        inputs = processor(text=args.task, images=image, return_tensors="pt")
-        inputs = {
-            key: (
-                value.to(device=device, dtype=dtype)
-                if hasattr(value, "is_floating_point") and value.is_floating_point()
-                else value.to(device)
-            )
-            if hasattr(value, "to")
-            else value
-            for key, value in inputs.items()
-        }
-        with torch.inference_mode():
-            generated = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=max(32, min(args.max_new_tokens, 512)),
-                num_beams=2,
-                do_sample=False,
-            )
-        decoded = processor.batch_decode(generated, skip_special_tokens=False)[0]
-        parsed = processor.post_process_generation(
-            decoded, task=args.task, image_size=(image.width, image.height)
+    return {
+        "torch": torch,
+        "Image": Image,
+        "processor": processor,
+        "model": model,
+        "device": device,
+        "dtype": dtype,
+        "use_cuda": use_cuda,
+    }
+
+
+def infer(runtime, image_path, task, max_new_tokens):
+    torch = runtime["torch"]
+    Image = runtime["Image"]
+    processor = runtime["processor"]
+    model = runtime["model"]
+    device = runtime["device"]
+    dtype = runtime["dtype"]
+    started = time.time()
+
+    image = Image.open(image_path).convert("RGB")
+    inputs = processor(text=task, images=image, return_tensors="pt")
+    inputs = {
+        key: (
+            value.to(device=device, dtype=dtype)
+            if hasattr(value, "is_floating_point") and value.is_floating_point()
+            else value.to(device)
         )
-        value = parsed.get(args.task)
-        if isinstance(value, list):
-            value = value[0] if value else ""
-        text = str(value or decoded).strip()
-        if not text:
-            raise ValueError("Florence-2 没有返回描述")
-        print(
-            json.dumps(
-                {
-                    "text": text,
-                    "device": "GPU" if use_cuda else "CPU",
-                    "elapsedMs": int((time.time() - started) * 1000),
-                    "model": "Florence-2 base-ft",
-                    "runtime": "transformers",
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
+        if hasattr(value, "to")
+        else value
+        for key, value in inputs.items()
+    }
+    with torch.inference_mode():
+        generated = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=max(32, min(max_new_tokens, 512)),
+            num_beams=2,
+            do_sample=False,
         )
+    decoded = processor.batch_decode(generated, skip_special_tokens=False)[0]
+    parsed = processor.post_process_generation(
+        decoded, task=task, image_size=(image.width, image.height)
+    )
+    value = parsed.get(task)
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    text = str(value or decoded).strip()
+    if not text:
+        raise ValueError("Florence-2 没有返回描述")
+    return {
+        "text": text,
+        "device": "GPU" if runtime["use_cuda"] else "CPU",
+        "elapsedMs": int((time.time() - started) * 1000),
+        "model": "Florence-2 base-ft",
+        "runtime": "transformers",
+    }
+
+
+def serve(args):
+    runtime = load_runtime(args.model_dir, args.device)
+    if runtime is None:
+        return 2
+    print(
+        json.dumps(
+            {
+                "ready": True,
+                "model": "Florence-2 base-ft",
+                "device": "GPU" if runtime["use_cuda"] else "CPU",
+                "runtime": "transformers",
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        request_id = None
+        try:
+            request = json.loads(line)
+            request_id = request.get("id")
+            image = request.get("image")
+            if not image:
+                raise ValueError("缺少 image 参数")
+            result = infer(
+                runtime,
+                image,
+                request.get("task", args.task),
+                int(request.get("maxNewTokens", args.max_new_tokens)),
+            )
+            print(
+                json.dumps({"id": request_id, "ok": True, "result": result}, ensure_ascii=False),
+                flush=True,
+            )
+        except Exception as error:  # noqa: BLE001
+            print(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "ok": False,
+                        "error": {"code": "MODEL_ERROR", "message": str(error)},
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image")
+    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--task", default="<MORE_DETAILED_CAPTION>")
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--serve", action="store_true")
+    args = parser.parse_args()
+
+    if args.serve:
+        return serve(args)
+    if not args.image:
+        print("缺少 --image 参数", file=sys.stderr, flush=True)
+        return 2
+
+    runtime = load_runtime(args.model_dir, args.device)
+    if runtime is None:
+        return 2
+    try:
+        result = infer(runtime, args.image, args.task, args.max_new_tokens)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
         return 0
     except Exception as error:  # noqa: BLE001
         print(f"Florence-2 推理失败：{error}", file=sys.stderr, flush=True)

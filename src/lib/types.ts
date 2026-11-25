@@ -238,6 +238,10 @@ export interface AssetDetail {
 
 export interface AssetFilter {
   query: string;
+  searchTarget?: RegexSearchTarget | null;
+  searchCaseSensitive?: boolean;
+  regexSearch?: { pattern: string; target: RegexSearchTarget } | null;
+  expression?: FilterExpression | null;
   statuses: ReviewStatus[];
   orientations: string[];
   collectionIds: string[];
@@ -251,6 +255,12 @@ export interface AssetFilter {
   hasDraft: boolean;
   recycledOnly: boolean;
 }
+
+export type RegexSearchTarget = "all" | "name" | "path" | "tag" | "caption" | "note";
+
+export type FilterExpression =
+  | { kind: "group"; mode: "all" | "any"; negated: boolean; children: FilterExpression[] }
+  | { kind: "rule"; field: string; operator: string; value: string; negated: boolean };
 
 export interface AssetSort {
   field:
@@ -280,6 +290,9 @@ export interface AssetPatch {
 
 export type BatchOp =
   | { kind: "addTags"; tags: string[] }
+  | { kind: "extractTags"; pattern: string; syntax: "template" | "regex"; templates: string[] }
+  | { kind: "regexRemoveTags"; pattern: string }
+  | { kind: "regexReplaceTags"; pattern: string; replacement: string }
   | { kind: "removeTags"; tags: string[] }
   | { kind: "replaceTag"; from: string; to: string }
   | { kind: "moveToFront"; tag: string }
@@ -303,7 +316,15 @@ export interface BatchPreview {
   previewId: string;
   count: number;
   skipped: { assetId: string; name: string; reason: string }[];
-  diffs: { assetId: string; name: string; before: string; after: string; changed: boolean }[];
+  skippedCount: number;
+  diffs: {
+    assetId: string;
+    name: string;
+    before: string;
+    after: string;
+    changed: boolean;
+    tagChanges?: { added: string[]; removed: string[] };
+  }[];
   summary: string;
   warnings: string[];
   createdAt: string;
@@ -553,8 +574,13 @@ export interface KohyaConfig {
   subsets: KohyaSubset[];
 }
 
+export interface LoraScriptConfig {
+  repeats: Record<string, number>;
+  ungroupedRepeats: number;
+}
+
 export interface ExportConfig {
-  target: "kohya" | "imagefolder";
+  target: "kohya" | "imagefolder" | "lora_script";
   package: "folder" | "zip";
   destDir: string | null;
   name: string | null;
@@ -566,6 +592,7 @@ export interface ExportConfig {
   captionExtension: ".txt" | ".caption";
   size: SizePolicy;
   kohya: KohyaConfig;
+  loraScript: LoraScriptConfig;
 }
 
 export interface ExportCounts {
@@ -671,7 +698,7 @@ export interface JobInfo {
 export interface ModelInfo {
   id: string;
   name: string;
-  kind: "wd14-tagger" | "caption";
+  kind: "wd14-tagger" | "caption" | "vlm";
   version: string;
   sizeBytes: number;
   path: string;
@@ -679,6 +706,55 @@ export interface ModelInfo {
   status: "available" | "unavailable";
   license: string;
   note: string;
+}
+
+export type VisionProtocol = "ollama" | "openAi";
+export type VisionDepth = "simple" | "detailed" | "exhaustive";
+
+export interface VisionParameters {
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  presencePenalty?: number;
+  frequencyPenalty?: number;
+  maxTokens?: number;
+  tokenLimitField?: "max_tokens" | "max_completion_tokens";
+  contextSize?: number;
+  seed?: number;
+  think?: boolean;
+  reasoningEffort?: string;
+}
+
+export interface VisionConnection {
+  id: string;
+  name: string;
+  protocol: VisionProtocol;
+  baseUrl: string;
+  parameters: VisionParameters;
+  hasKey: boolean;
+  verifiedModels: { name: string; thinking: boolean }[];
+}
+
+export interface VisionPreferences {
+  output: "tags" | "caption" | "both";
+  depth: VisionDepth;
+  simple: string;
+  detailed: string;
+  exhaustive: string;
+  imageEdge: number;
+}
+
+export interface VisionConfiguration {
+  connections: VisionConnection[];
+  preferences: VisionPreferences;
+  defaults: VisionPreferences;
+}
+
+export interface VisionModel {
+  name: string;
+  vision: boolean | null;
+  thinking: boolean;
+  note?: string | null;
 }
 
 export interface ModelCatalogEntry {
@@ -819,11 +895,25 @@ export interface SuggestionResult {
   mode: CaptionMode;
   tags: string[];
   text: string;
+  visionLanguage: boolean;
   model: string;
   modelVersion: string;
   threshold: number;
   device: string;
   elapsedMs: number;
+}
+
+export interface TaggerModelSessionInfo {
+  modelId: string;
+  model: string;
+  device: string;
+  runtime: string;
+  loadMs: number;
+}
+
+export interface TaggerBatchInfo {
+  models: TaggerModelSessionInfo[];
+  loadMs: number;
 }
 
 export interface TransformPreview {
@@ -848,6 +938,11 @@ export interface TransformSaveResult {
   reviewReset: boolean;
   warning: string | null;
   historySeq: number;
+}
+
+export interface CropApplyStart {
+  jobId: string;
+  total: number;
 }
 
 export interface CaptionSaveResult {

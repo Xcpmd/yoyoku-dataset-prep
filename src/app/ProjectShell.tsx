@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useRoot } from "./AppProvider";
-import { ProjectProvider, type LibraryView } from "./ProjectContext";
+import { ProjectProvider, type LibraryView, type OpenWorkbenchOptions } from "./ProjectContext";
 import type { AssetFilter, AssetSort, CollectionInfo, JobInfo } from "../lib/types";
 import { api, normalizeError } from "../lib/api";
 import { classNames, emptyFilter } from "../lib/utils";
@@ -12,6 +12,7 @@ import { WindowControls } from "../components/WindowControls";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { JobsDrawer } from "./JobsDrawer";
 import { LibraryPage } from "../features/library/LibraryPage";
+import { DatasetFilterBar, DatasetFilterProvider } from "../features/library/DatasetFilterBar";
 import { WorkbenchPage } from "../features/editor/WorkbenchPage";
 import { CropBoardPage } from "../features/editor/CropBoardPage";
 import {
@@ -32,6 +33,7 @@ const NAV: { id: string; label: string; icon: IconName }[] = [
 ];
 
 const TERMINAL = new Set(["completed", "completed_with_errors", "failed", "cancelled"]);
+const DATASET_PAGES = new Set(["library", "crop", "tag"]);
 
 interface StoredSession {
   page?: string;
@@ -85,6 +87,9 @@ export function ProjectShell() {
   );
   const [sequenceLabel, setSequenceLabel] = useState<string>(S.workbench.sequenceLibrary);
   const [workbenchId, setWorkbenchId] = useState<string | null>(stored.workbenchId || null);
+  const workbenchIdRef = useRef(workbenchId);
+  const [sequenceScope, setSequenceScope] = useState<AssetFilter | null>(null);
+  const [sequenceRefresh, setSequenceRefresh] = useState(0);
   const [refreshToken, setRefreshToken] = useState(0);
   const [librarySignal, setLibrarySignal] = useState(0);
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
@@ -107,6 +112,7 @@ export function ProjectShell() {
   }, [sidebarCollapsed]);
 
   const navigate = useCallback((next: string) => {
+    if (next !== "crop") setSequenceScope(null);
     setPage(next);
     setVisited((current) => {
       if (current.has(next)) return current;
@@ -134,63 +140,56 @@ export function ProjectShell() {
 
   const clearSelection = useCallback(() => setSelectionState([]), []);
 
-  const setSequence = useCallback((ids: string[], label?: string) => {
-    setSequenceState(ids);
-    if (label) setSequenceLabel(label);
+  const refreshSequence = useCallback(() => {
+    setSequenceScope(null);
+    setSequenceRefresh((value) => value + 1);
   }, []);
 
   const openWorkbench = useCallback(
-    (id: string, options?: { sequence?: string[]; label?: string }) => {
+    (id: string, options?: OpenWorkbenchOptions) => {
       if (options?.sequence && options.sequence.length > 0) {
-        setSequenceState(options.sequence);
+        const ids = new Set(options.sequence);
+        setSequenceState(ids.has(id) ? [...ids] : [id, ...ids]);
         setSequenceLabel(options.label || S.workbench.sequenceLibrary);
-        if (!options.sequence.includes(id)) {
-          setSequenceState([id, ...options.sequence]);
-        }
-      } else {
-        setSequenceState((current) => (current.includes(id) ? current : [id, ...current]));
+        setSequenceScope(filter);
       }
+      workbenchIdRef.current = id;
       setWorkbenchId(id);
       setFocusedId(id);
       navigate(page === "tag" ? "tag" : "crop");
     },
-    [navigate, page],
+    [filter, navigate, page],
   );
 
-  // 单图裁剪模式首次进入时没有当前图片，自动打开筛选范围第一张，避免空白工作台。
+  const workbenchActive = page === "tag" || (page === "crop" && cropMode === "single");
+  const hasScopedSequence = page === "crop" && sequenceScope === filter;
   useEffect(() => {
-    if (page !== "crop" || cropMode !== "single" || workbenchId) return;
+    if (!workbenchActive || hasScopedSequence) return;
     let cancelled = false;
+    setSequenceScope(null);
     api
       .assetIds(filter)
       .then((ids) => {
-        if (!cancelled && ids[0]) openWorkbench(ids[0]);
+        if (cancelled) return;
+        const current = workbenchIdRef.current;
+        const next = current && ids.includes(current) ? current : ids[0] ?? null;
+        setSequenceState((previous) =>
+          previous.length === ids.length && previous.every((id, index) => id === ids[index]) ? previous : ids,
+        );
+        setSequenceLabel(S.workbench.sequenceLibrary);
+        if (next !== current) {
+          workbenchIdRef.current = next;
+          setWorkbenchId(next);
+          setFocusedId(next);
+        }
       })
-      .catch(() => undefined);
+      .catch((error) => {
+        if (!cancelled) notify({ tone: "danger", title: "无法更新图片序列", message: normalizeError(error).message });
+      });
     return () => {
       cancelled = true;
     };
-  }, [page, cropMode, workbenchId, filter, openWorkbench]);
-
-  const goToStep = useCallback(
-    async (target: string) => {
-      if (target === "tag" && !workbenchId) {
-        try {
-          const ids = await api.assetIds(filter);
-          if (ids.length > 0) {
-            setSequenceState(ids);
-            setSequenceLabel(S.workbench.sequenceLibrary);
-            setWorkbenchId(ids[0]);
-            setFocusedId(ids[0]);
-          }
-        } catch {
-          // ignore
-        }
-      }
-      navigate(target);
-    },
-    [workbenchId, filter, navigate],
-  );
+  }, [workbenchActive, hasScopedSequence, filter, refreshToken, librarySignal, sequenceRefresh, notify]);
 
   const bumpRefresh = useCallback(() => {
     setRefreshToken((value) => value + 1);
@@ -219,13 +218,17 @@ export function ProjectShell() {
   }, [navigate]);
 
   const requestSearch = useCallback(() => {
-    navigate("library");
-    window.setTimeout(() => setSearchSignal((value) => value + 1), 30);
-  }, [navigate]);
+    if (!DATASET_PAGES.has(page)) navigate("library");
+    setSearchSignal((value) => value + 1);
+  }, [navigate, page]);
 
   const navigateToLibrary = useCallback(
     (patch?: Partial<AssetFilter>) => {
-      if (patch) setFilter((current) => ({ ...current, ...patch }));
+      if (patch) setFilter((current) => ({
+        ...current,
+        ...(patch.query !== undefined ? { regexSearch: null, searchTarget: null, searchCaseSensitive: false } : {}),
+        ...patch,
+      }));
       navigate("library");
     },
     [navigate],
@@ -303,6 +306,30 @@ export function ProjectShell() {
             tone: "success",
             title: S.jobs.exportSuccess,
             message: path || S.jobs.exportSummary(total),
+          });
+        }
+      } else if (job.kind === "crop") {
+        const success = Number(job.result?.success || 0);
+        const failed = Number(job.result?.failed || 0);
+        if (job.status === "cancelled") {
+          notify({
+            tone: "warning",
+            title: "裁切已取消",
+            message: `已完成 ${success} 张${failed > 0 ? `，失败 ${failed} 张` : ""}`,
+          });
+        } else if (job.status === "failed") {
+          notify({
+            tone: "danger",
+            title: "裁切失败",
+            message: job.error?.message || "裁切任务失败",
+          });
+        } else {
+          notify({
+            tone: failed > 0 ? "warning" : "success",
+            title: "裁切完成",
+            message: failed > 0 ? `成功 ${success} 张，失败 ${failed} 张` : `已裁切 ${success} 张图片`,
+            actionLabel: failed > 0 ? "查看任务" : undefined,
+            onAction: failed > 0 ? () => setJobsOpen(true) : undefined,
           });
         }
       }
@@ -490,9 +517,9 @@ export function ProjectShell() {
 
   const commands = useMemo<PaletteCommand[]>(
     () => [
-      { id: "nav-library", label: S.palette.goLibrary, icon: "import", run: () => void goToStep("library") },
-      { id: "nav-crop", label: S.palette.goCrop, icon: "crop", run: () => void goToStep("crop") },
-      { id: "nav-tag", label: S.palette.goTag, icon: "tag", run: () => void goToStep("tag") },
+      { id: "nav-library", label: S.palette.goLibrary, icon: "import", run: () => navigate("library") },
+      { id: "nav-crop", label: S.palette.goCrop, icon: "crop", run: () => navigate("crop") },
+      { id: "nav-tag", label: S.palette.goTag, icon: "tag", run: () => navigate("tag") },
       { id: "nav-quality", label: S.palette.goQuality, icon: "quality", run: () => navigate("quality") },
       { id: "nav-prompts", label: S.nav.prompts, icon: "library", run: () => navigate("prompts") },
       { id: "nav-export", label: S.palette.goExport, icon: "export", run: () => navigate("export") },
@@ -539,7 +566,7 @@ export function ProjectShell() {
         run: () => requestClose(),
       },
     ],
-    [navigate, goToStep, requestImport, runQuality, undo, redo, updateSettings],
+    [navigate, requestImport, runQuality, undo, redo, updateSettings],
   );
 
   const flushAndClose = useCallback(() => {
@@ -595,7 +622,7 @@ export function ProjectShell() {
       setView,
       sequence,
       sequenceLabel,
-      setSequence,
+      refreshSequence,
       workbenchId,
       openWorkbench,
       refreshToken,
@@ -637,7 +664,7 @@ export function ProjectShell() {
       librarySignal,
       sequence,
       sequenceLabel,
-      setSequence,
+      refreshSequence,
       workbenchId,
       openWorkbench,
       refreshToken,
@@ -828,7 +855,7 @@ export function ProjectShell() {
                   key={item.id}
                   type="button"
                   className={`nav-item ${page === item.id ? "active" : ""}`}
-                  onClick={() => void goToStep(item.id)}
+                  onClick={() => navigate(item.id)}
                   aria-current={page === item.id ? "page" : undefined}
                   title={item.label}
                 >
@@ -876,49 +903,52 @@ export function ProjectShell() {
             </div>
           </aside>
 
-          <main className="main-area">
-            <div className="page-stack">
-              <div className="page-host" hidden={page !== "library"}>
-                <LibraryPage active={page === "library"} />
+          <DatasetFilterProvider active={DATASET_PAGES.has(page)}>
+            <main className="main-area">
+              {page === "tag" ? <DatasetFilterBar className="tag-dataset-filter-bar" /> : null}
+              <div className="page-stack">
+                <div className="page-host" hidden={page !== "library"}>
+                  <LibraryPage active={page === "library"} />
+                </div>
+                <div className="page-host" hidden={page !== "crop" || cropMode !== "masonry"}>
+                  {visited.has("crop") ? (
+                    <CropBoardPage
+                      active={page === "crop" && cropMode === "masonry"}
+                      mode={cropMode}
+                      onModeChange={setCropMode}
+                    />
+                  ) : null}
+                </div>
+                <div className="page-host" hidden={page !== "crop" || cropMode !== "single"}>
+                  {visited.has("crop") && cropWorkbenchReady ? (
+                    <WorkbenchPage
+                      active={page === "crop" && cropMode === "single"}
+                      workspace="crop"
+                      cropMode={cropMode}
+                      onCropModeChange={setCropMode}
+                    />
+                  ) : null}
+                </div>
+                <div className="page-host" hidden={page !== "tag"}>
+                  {visited.has("tag") ? <WorkbenchPage active={page === "tag"} workspace="tag" /> : null}
+                </div>
+                <div className="page-host" hidden={page !== "quality"}>
+                  {visited.has("quality") ? <QualityPage active={page === "quality"} /> : null}
+                </div>
+                <div className="page-host" hidden={page !== "prompts"}>
+                  {visited.has("prompts") ? (
+                    <PromptLibraryPage active={page === "prompts"} />
+                  ) : null}
+                </div>
+                <div className="page-host" hidden={page !== "export"}>
+                  {visited.has("export") ? <ExportPage active={page === "export"} /> : null}
+                </div>
+                <div className="page-host" hidden={page !== "settings"}>
+                  {visited.has("settings") ? <SettingsPage active={page === "settings"} /> : null}
+                </div>
               </div>
-              <div className="page-host" hidden={page !== "crop" || cropMode !== "masonry"}>
-                {visited.has("crop") ? (
-                  <CropBoardPage
-                    active={page === "crop" && cropMode === "masonry"}
-                    mode={cropMode}
-                    onModeChange={setCropMode}
-                  />
-                ) : null}
-              </div>
-              <div className="page-host" hidden={page !== "crop" || cropMode !== "single"}>
-                {visited.has("crop") && cropWorkbenchReady ? (
-                  <WorkbenchPage
-                    active={page === "crop" && cropMode === "single"}
-                    workspace="crop"
-                    cropMode={cropMode}
-                    onCropModeChange={setCropMode}
-                  />
-                ) : null}
-              </div>
-              <div className="page-host" hidden={page !== "tag"}>
-                {visited.has("tag") ? <WorkbenchPage active={page === "tag"} workspace="tag" /> : null}
-              </div>
-              <div className="page-host" hidden={page !== "quality"}>
-                {visited.has("quality") ? <QualityPage active={page === "quality"} /> : null}
-              </div>
-              <div className="page-host" hidden={page !== "prompts"}>
-                {visited.has("prompts") ? (
-                  <PromptLibraryPage active={page === "prompts"} />
-                ) : null}
-              </div>
-              <div className="page-host" hidden={page !== "export"}>
-                {visited.has("export") ? <ExportPage active={page === "export"} /> : null}
-              </div>
-              <div className="page-host" hidden={page !== "settings"}>
-                {visited.has("settings") ? <SettingsPage active={page === "settings"} /> : null}
-              </div>
-            </div>
-          </main>
+            </main>
+          </DatasetFilterProvider>
         </div>
 
         <nav className="bottom-nav" aria-label="底部导航">
@@ -927,7 +957,7 @@ export function ProjectShell() {
               key={item.id}
               type="button"
               className={`bottom-nav-item ${page === item.id ? "active" : ""}`}
-              onClick={() => void goToStep(item.id)}
+              onClick={() => navigate(item.id)}
               aria-current={page === item.id ? "page" : undefined}
             >
               <Icon name={item.icon} />

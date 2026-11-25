@@ -527,13 +527,43 @@ impl WorkerPool {
         out: &Path,
         size: u32,
     ) -> AppResult<()> {
+        self.thumbnail_with_priority(source, plan, out, size, Priority::Interactive)
+    }
+
+    /// 网格/素材栏的 256 px 缩略图使用后台优先级，避免一次滚动占满图像槽位，
+    /// 让当前大图和裁剪预览先完成。
+    pub fn thumbnail_background(
+        &self,
+        source: &Path,
+        plan: Option<&crate::model::TransformPlan>,
+        out: &Path,
+        size: u32,
+    ) -> AppResult<()> {
+        self.thumbnail_with_priority(source, plan, out, size, Priority::Background)
+    }
+
+    /// 一次解码同时生成正常缩略图与 256 px 网格缩略图，供裁剪保存后立即使用。
+    pub fn thumbnail_pair(
+        &self,
+        source: &Path,
+        plan: Option<&crate::model::TransformPlan>,
+        out: &Path,
+        size: u32,
+        low_out: &Path,
+        low_size: u32,
+    ) -> AppResult<()> {
         if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = low_out.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut params = json!({
             "path": source.to_string_lossy(),
             "out": out.to_string_lossy(),
             "size": size,
+            "lowOut": low_out.to_string_lossy(),
+            "lowSize": low_size,
         });
         if let Some(plan) = plan {
             params["plan"] = serde_json::to_value(plan)?;
@@ -547,17 +577,55 @@ impl WorkerPool {
         Ok(())
     }
 
-    pub fn display(&self, source: &Path, out: &Path, max_side: u32) -> AppResult<Value> {
+    fn thumbnail_with_priority(
+        &self,
+        source: &Path,
+        plan: Option<&crate::model::TransformPlan>,
+        out: &Path,
+        size: u32,
+        priority: Priority,
+    ) -> AppResult<()> {
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut params = json!({
+            "path": source.to_string_lossy(),
+            "out": out.to_string_lossy(),
+            "size": size,
+        });
+        if let Some(plan) = plan {
+            params["plan"] = serde_json::to_value(plan)?;
+        }
+        self.call_priority("thumbnail", params, Duration::from_secs(120), priority)?;
+        Ok(())
+    }
+
+    pub fn display(&self, source: &Path, out: &Path, max_side: u32) -> AppResult<Value> {
+        self.display_with_plan(source, None, out, max_side)
+    }
+
+    /// 裁后大图：按裁剪配方渲染后输出 WebP，供图库与打标页直接请求。
+    pub fn display_with_plan(
+        &self,
+        source: &Path,
+        plan: Option<&crate::model::TransformPlan>,
+        out: &Path,
+        max_side: u32,
+    ) -> AppResult<Value> {
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut params = json!({
+            "path": source.to_string_lossy(),
+            "out": out.to_string_lossy(),
+            "maxSide": max_side,
+        });
+        if let Some(plan) = plan {
+            params["plan"] = serde_json::to_value(plan)?;
+        }
         self.call_priority(
             "display",
-            json!({
-                "path": source.to_string_lossy(),
-                "out": out.to_string_lossy(),
-                "maxSide": max_side,
-            }),
+            params,
             Duration::from_secs(120),
             Priority::Interactive,
         )

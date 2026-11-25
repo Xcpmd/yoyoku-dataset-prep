@@ -6,7 +6,7 @@ use crate::worker::WorkerPool;
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 pub struct JobControl {
@@ -79,6 +79,11 @@ pub struct AppState {
     pub batch_previews: Mutex<HashMap<String, crate::project::assets::PendingBatch>>,
     pub export_previews: Mutex<HashMap<String, crate::exports::PendingExport>>,
     pub job_controls: Mutex<HashMap<String, Arc<JobControl>>>,
+    /// 批量打标期间常驻的模型进程；按模型 ID 复用，批次结束后统一释放。
+    pub tagger_sessions: Mutex<HashMap<String, crate::tagging::SharedTaggerSession>>,
+    /// 批次代际：新的 begin/end 会让仍在加载的旧批次失效，避免旧会话回填。
+    pub tagger_generation: AtomicU64,
+    pub vlm: crate::vlm::VlmState,
     pub dedupe_cache: Mutex<HashMap<String, DedupeCacheEntry>>,
     /// 图片协议中同一张图的并发请求合并；键为项目/资产/变体/版本。
     pub asset_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -119,6 +124,9 @@ impl AppState {
             batch_previews: Mutex::new(HashMap::new()),
             export_previews: Mutex::new(HashMap::new()),
             job_controls: Mutex::new(HashMap::new()),
+            tagger_sessions: Mutex::new(HashMap::new()),
+            tagger_generation: AtomicU64::new(0),
+            vlm: crate::vlm::VlmState::default(),
             dedupe_cache: Mutex::new(HashMap::new()),
             asset_locks: Mutex::new(HashMap::new()),
             protocol_gate: std::sync::Arc::new(ImageGate::new(image_slots * 2 + 2)),
@@ -136,6 +144,8 @@ impl AppState {
     }
 
     pub fn set_project(&self, project: Option<Arc<Project>>) {
+        // 切换项目时结束批量打标的常驻模型进程，避免旧项目的模型继续占用内存。
+        crate::tagging::end_batch(self);
         *self.project.write() = project;
     }
 

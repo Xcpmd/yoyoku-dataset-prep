@@ -3,7 +3,7 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::exports;
 use crate::model::*;
-use crate::project::{self, assets, captions, collections, history, import, jobs, prompt_library, quality, sample, transform, Project};
+use crate::project::{self, assets, captions, collections, crop, history, import, jobs, prompt_library, quality, sample, transform, Project};
 use crate::state::{self, AppState};
 use crate::tagging;
 use crate::util;
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
 // 应用与对话框
@@ -456,21 +456,31 @@ pub struct AssetsQueryRequest {
 #[tauri::command]
 pub async fn assets_query(state: State<'_, AppState>, req: AssetsQueryRequest) -> AppResult<AssetsPage> {
     let project = state.project()?;
-    assets::query(
-        &project,
-        &req.filter,
-        &req.sort,
-        req.offset,
-        req.limit,
-        req.cursor.as_deref(),
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        assets::query(&project, &req.filter, &req.sort, req.offset, req.limit, req.cursor.as_deref())
+    })
+    .await
+    .map_err(|error| AppError::msg(format!("图库查询中断：{error}")))?
 }
 
 #[tauri::command]
-pub async fn assets_ids(state: State<'_, AppState>, filter: AssetFilter) -> AppResult<Vec<String>> {
+pub async fn assets_ids(
+    state: State<'_, AppState>,
+    filter: AssetFilter,
+    within_ids: Option<Vec<String>>,
+) -> AppResult<Vec<String>> {
     let project = state.project()?;
-    let conn = project.conn();
-    assets::resolve_ids(&conn, &filter)
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = project.read_conn()?;
+        assets::resolve_ids_within(&conn, &filter, within_ids.as_deref())
+    })
+    .await
+    .map_err(|error| AppError::msg(format!("图库查询中断：{error}")))?
+}
+
+#[tauri::command]
+pub fn assets_filter_validate(filter: AssetFilter) -> AppResult<()> {
+    crate::project::asset_filter::validate(&filter)
 }
 
 #[tauri::command]
@@ -526,12 +536,18 @@ pub async fn batch_preview(
 ) -> AppResult<BatchPreview> {
     let project = state.project()?;
     let batch_id = util::new_id();
-    let (preview, pending) = assets::batch_preview(&project, &req, &batch_id)?;
+    let (preview, pending) = tauri::async_runtime::spawn_blocking(move || {
+        assets::batch_preview(&project, &req, &batch_id)
+    })
+    .await
+    .map_err(|error| AppError::msg(format!("批量预览中断：{error}")))??;
     let mut previews = state.batch_previews.lock();
     if previews.len() > 12 {
         previews.clear();
     }
-    previews.insert(batch_id, pending);
+    if preview.count > 0 {
+        previews.insert(preview.preview_id.clone(), pending);
+    }
     Ok(preview)
 }
 
@@ -546,13 +562,15 @@ pub async fn batch_apply(
         .lock()
         .remove(&preview_id)
         .ok_or_else(|| AppError::new("PREVIEW_EXPIRED", "批量预览已过期，请重新预览"))?;
-    assets::apply_batch(&project, pending)
+    tauri::async_runtime::spawn_blocking(move || assets::apply_batch(&project, pending))
+        .await
+        .map_err(|error| AppError::msg(format!("批量编辑中断：{error}")))?
 }
 
 #[tauri::command]
-pub async fn undo(state: State<'_, AppState>) -> AppResult<Option<history::UndoOutcome>> {
+pub async fn undo(state: State<'_, AppState>, expected_seq: Option<i64>) -> AppResult<Option<history::UndoOutcome>> {
     let project = state.project()?;
-    history::undo_last(&project)
+    history::undo_last(&project, expected_seq)
 }
 
 #[tauri::command]
@@ -653,11 +671,35 @@ pub struct TransformSaveRequest {
 
 #[tauri::command]
 pub async fn transform_save(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: TransformSaveRequest,
 ) -> AppResult<transform::TransformSaveResult> {
     let project = state.project()?;
-    transform::save(&project, &state.worker, &req.asset_id, &req.plan, req.expected_revision)
+    let result = transform::save(&project, &state.worker, &req.asset_id, &req.plan, req.expected_revision)?;
+    // 通知已打开页面立即切换到新的裁后缩略图，避免等待整库刷新。
+    let _ = app.emit(
+        "asset:transform-saved",
+        serde_json::json!({
+            "assetId": req.asset_id,
+            "thumbVersion": result.thumb_version,
+            "revision": result.asset_revision,
+            "outWidth": result.geometry.out_width,
+            "outHeight": result.geometry.out_height,
+            "reviewReset": result.review_reset,
+        }),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn crop_apply_batch(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: crop::CropApplyRequest,
+) -> AppResult<crop::CropApplyStart> {
+    let project = state.project()?;
+    crop::start(app, project, req)
 }
 
 #[tauri::command]
@@ -757,6 +799,8 @@ pub struct SuggestionRequest {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
     pub threshold: Option<f64>,
     #[serde(default)]
     pub character_threshold: Option<f64>,
@@ -764,18 +808,54 @@ pub struct SuggestionRequest {
 
 #[tauri::command]
 pub async fn suggestion_generate(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: SuggestionRequest,
 ) -> AppResult<SuggestionResult> {
     let project = state.project()?;
-    tagging::generate(
-        &state,
-        &project,
-        &req.asset_id,
-        &req.model,
-        req.threshold.unwrap_or(0.35),
-        req.character_threshold.unwrap_or(0.85),
-    )
+    let models = if req.models.is_empty() {
+        vec![req.model]
+    } else {
+        req.models
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        tagging::generate(
+            &app.state::<AppState>(), &project, &req.asset_id, &models,
+            req.threshold.unwrap_or(0.35), req.character_threshold.unwrap_or(0.85),
+        )
+    }).await.map_err(|_| AppError::new("MODEL_ERROR", "打标线程异常退出"))?
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaggerBatchBeginRequest {
+    pub models: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn tagger_batch_begin(
+    app: tauri::AppHandle,
+    req: TaggerBatchBeginRequest,
+) -> AppResult<tagging::TaggerBatchInfo> {
+    // 模型加载可能阻塞数十秒，放到阻塞线程池，避免占住 async 运行时后
+    // 其他命令（包括批次结束/状态查询）排队无法执行。
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        tagging::begin_batch(&state, &req.models)
+    })
+    .await
+    .map_err(|error| AppError::new("MODEL_UNAVAILABLE", format!("模型加载线程异常：{error}")))?
+}
+
+#[tauri::command]
+pub async fn tagger_batch_end(app: tauri::AppHandle) -> AppResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        tagging::end_batch(&state);
+    })
+    .await
+    .map_err(|error| AppError::new("MODEL_ERROR", format!("模型释放线程异常：{error}")))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -981,7 +1061,7 @@ pub async fn export_preview(
 }
 
 fn validate_export_config(config: &ExportConfig) -> AppResult<()> {
-    if !matches!(config.target.as_str(), "kohya" | "imagefolder") {
+    if !matches!(config.target.as_str(), "kohya" | "imagefolder" | "lora_script") {
         return Err(AppError::new("INVALID_CONFIG", "未知的导出目标"));
     }
     if !matches!(config.package.as_str(), "folder" | "zip") {
@@ -1103,6 +1183,12 @@ pub async fn jobs_list(state: State<'_, AppState>) -> AppResult<Vec<JobInfo>> {
 }
 
 #[tauri::command]
+pub async fn jobs_clear_finished(state: State<'_, AppState>) -> AppResult<i64> {
+    let project = state.project()?;
+    jobs::clear_finished(&project)
+}
+
+#[tauri::command]
 pub async fn jobs_pause(state: State<'_, AppState>, job_id: String) -> AppResult<()> {
     let controls = state.job_controls.lock();
     if let Some(control) = controls.get(&job_id) {
@@ -1203,6 +1289,46 @@ pub async fn jobs_retry_failed(
 #[tauri::command]
 pub async fn models_list(state: State<'_, AppState>) -> AppResult<Vec<ModelInfo>> {
     Ok(tagging::list_models(&state))
+}
+
+#[tauri::command]
+pub fn vlm_configuration(state: State<'_, AppState>) -> AppResult<crate::vlm::Configuration> {
+    crate::vlm::configuration(&state)
+}
+
+#[tauri::command]
+pub fn vlm_preferences_save(state: State<'_, AppState>, preferences: crate::vlm::Preferences) -> AppResult<()> {
+    crate::vlm::save_preferences(&state, preferences)
+}
+
+#[tauri::command]
+pub fn vlm_connection_save(
+    state: State<'_, AppState>, connection: crate::vlm::Connection, key: Option<String>,
+) -> AppResult<crate::vlm::ConnectionView> {
+    crate::vlm::save_connection(&state, connection, key)
+}
+
+#[tauri::command]
+pub fn vlm_connection_remove(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    crate::vlm::remove_connection(&state, &id)
+}
+
+#[tauri::command]
+pub async fn vlm_models_discover(app: tauri::AppHandle, id: String) -> AppResult<Vec<crate::vlm::DiscoveredModel>> {
+    tauri::async_runtime::spawn_blocking(move || crate::vlm::discover(&app.state::<AppState>(), &id))
+        .await.map_err(|_| AppError::new("VLM_CONNECTION", "模型列表读取中断"))?
+}
+
+#[tauri::command]
+pub async fn vlm_model_verify(app: tauri::AppHandle, id: String, model: String) -> AppResult<crate::vlm::DiscoveredModel> {
+    tauri::async_runtime::spawn_blocking(move || crate::vlm::verify(&app.state::<AppState>(), &id, &model))
+        .await.map_err(|_| AppError::new("VLM_CONNECTION", "图像检测中断"))?
+}
+
+#[tauri::command]
+pub async fn vlm_prompt_test(app: tauri::AppHandle, id: String, model: String) -> AppResult<crate::vlm::Generated> {
+    tauri::async_runtime::spawn_blocking(move || crate::vlm::test_prompt(&app.state::<AppState>(), &id, &model))
+        .await.map_err(|_| AppError::new("VLM_CONNECTION", "提示词试跑中断"))?
 }
 
 #[tauri::command]

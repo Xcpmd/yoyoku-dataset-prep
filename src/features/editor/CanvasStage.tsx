@@ -1,7 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AssetDetail, TransformPlan, CropRect } from "../../lib/types";
 import { S } from "../../lib/strings";
-import { classNames, clamp, displayUrl, lowThumbUrl, previewUrl as previewSrc } from "../../lib/utils";
+import {
+  classNames,
+  clamp,
+  displayUrl,
+  hdProcessedDisplayUrl,
+  hdSourceDisplayUrl,
+  lowSourceThumbRaw,
+  lowThumbUrl,
+  processedDisplayUrl,
+  previewUrl as previewSrc,
+} from "../../lib/utils";
+import { warmImage } from "../../lib/imageCache";
 import { Icon } from "../../components/Icon";
 import { Dropdown, IconButton, MenuItem, MenuLabel, Segmented, Spinner } from "../../components/ui";
 
@@ -35,6 +46,13 @@ type Gesture =
     }
   | { kind: "new"; startX: number; startY: number; currentX: number; currentY: number };
 
+/** Ctrl 将缩放步长收细到 1/5，Shift 收细到 1/10。 */
+function zoomPrecision(event: { ctrlKey: boolean; shiftKey: boolean }): number {
+  if (event.shiftKey) return 0.1;
+  if (event.ctrlKey) return 0.2;
+  return 1;
+}
+
 export function CanvasStage({
   asset,
   plan,
@@ -59,13 +77,35 @@ export function CanvasStage({
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [panning, setPanning] = useState(false);
   const [pinching, setPinching] = useState(false);
-  // 记录“哪张素材已载入/失败”而不是单纯布尔值：切换页面时缓存图片可能在
-  // effect 重置前就触发 onLoad，布尔值被重置后会一直停在载入态。
-  const [imageState, setImageState] = useState<{ id: string; status: "loaded" | "failed" } | null>(null);
-  const imageReady = imageState?.id === asset.summary.id && imageState.status === "loaded";
-  const imageFailed = imageState?.id === asset.summary.id && imageState.status === "failed";
+  // 记录“哪张素材、哪个 URL 已载入/失败”：打标页会从缩略图切换到裁后预览。
+  const [imageState, setImageState] = useState<{ key: string; status: "loaded" | "failed" } | null>(null);
+  const processedView = !croppable;
+  const [previewBroken, setPreviewBroken] = useState(false);
+  const [retryToken, setRetryToken] = useState(0);
+  const imageElRef = useRef<HTMLImageElement>(null);
+  /** 高倍缩放时才请求 2560 px 大图，并保留 1600 px 图作为过渡。 */
+  const [hdRequested, setHdRequested] = useState(false);
+  const [hdState, setHdState] = useState<{ key: string; status: "loaded" | "failed" } | null>(null);
+  /** 滚轮/捏合期间关闭尺寸过渡，避免画面追着动画走、越缩放越糊。 */
+  const [zooming, setZooming] = useState(false);
+  const zoomTimerRef = useRef<number | undefined>(undefined);
   const [compareStyle, setCompareStyle] = useState<"side" | "split">("side");
   const [split, setSplit] = useState(50);
+
+  useEffect(() => {
+    // 新的裁后大图可用时重新尝试；重试次数同时重置。
+    setPreviewBroken(false);
+    setRetryToken(0);
+    setHdRequested(false);
+    setHdState(null);
+  }, [asset.summary.id, asset.summary.thumbVersion, asset.summary.displayVersion]);
+
+  useEffect(
+    () => () => {
+      if (zoomTimerRef.current) window.clearTimeout(zoomTimerRef.current);
+    },
+    [],
+  );
 
   const gestureRef = useRef<Gesture | null>(null);
   const panRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
@@ -74,12 +114,74 @@ export function CanvasStage({
   planRef.current = plan;
 
   const rotated = plan.rotation === 90 || plan.rotation === 270;
-  const baseWidth = rotated ? asset.normHeight : asset.normWidth;
-  const baseHeight = rotated ? asset.normWidth : asset.normHeight;
-  const display = useMemo(
-    () => displayUrl(asset.summary.id, `src-${asset.sha256.slice(0, 10)}`),
-    [asset.summary.id, asset.sha256],
+  const baseWidth = processedView
+    ? Math.max(1, asset.summary.outWidth || asset.normWidth)
+    : rotated
+      ? asset.normHeight
+      : asset.normWidth;
+  const baseHeight = processedView
+    ? Math.max(1, asset.summary.outHeight || asset.normHeight)
+    : rotated
+      ? asset.normWidth
+      : asset.normHeight;
+  const baseDisplay = useMemo(
+    () =>
+      processedView
+        ? previewBroken
+          ? lowThumbUrl(asset.summary)
+          : processedDisplayUrl(asset.summary)
+        : previewBroken
+          ? lowSourceThumbRaw(asset.summary.id, asset.summary.displayVersion)
+          : displayUrl(asset.summary.id, `src-${asset.sha256.slice(0, 10)}`),
+    [processedView, previewBroken, asset.summary, asset.sha256],
   );
+  const hdBase = processedView
+    ? hdProcessedDisplayUrl(asset.summary)
+    : hdSourceDisplayUrl({ id: asset.summary.id, sha256: asset.sha256 });
+  const display = retryToken
+    ? `${baseDisplay}${baseDisplay.includes("?") ? "&" : "?"}retry=${retryToken}`
+    : baseDisplay;
+  const imageReady = imageState?.key === display && imageState.status === "loaded";
+  const imageFailed = imageState?.key === display && imageState.status === "failed";
+  const hdReady = hdState?.key === hdBase && hdState.status === "loaded";
+  const hdFailed = hdState?.key === hdBase && hdState.status === "failed";
+  const showHd = hdRequested && !hdFailed && !imageFailed;
+
+  // 兜底检查：缓存图片可能在 onLoad 绑定前就已 complete，轮询元素状态避免一直停在载入中。
+  useEffect(() => {
+    const check = () => {
+      const image = imageElRef.current;
+      if (!image) return true;
+      if (!image.complete) return false;
+      setImageState((current) =>
+        current?.key === display
+          ? current
+          : { key: display, status: image.naturalWidth > 0 ? "loaded" : "failed" },
+      );
+      return true;
+    };
+    if (check()) return;
+    const timer = window.setInterval(() => {
+      if (check()) window.clearInterval(timer);
+    }, 400);
+    return () => window.clearInterval(timer);
+  }, [display]);
+
+  const lowThumb = lowThumbUrl(asset.summary);
+
+  // 提前把显示图放进跨页面缓存：从图库/裁剪切回打标时可直接复用已解码位图。
+  useEffect(() => {
+    void warmImage(display);
+  }, [display]);
+
+  // 仍在清晰范围内时只预热 1600 px 图；真正放大后再请求 2560 px，避免无谓的渲染。
+  useEffect(() => {
+    if (!Number.isFinite(zoom)) return;
+    const cssWidth = baseWidth * zoom;
+    if (cssWidth > 1500) setHdRequested(true);
+    // 2560 px 图只预热字节，不长期持有解码位图，避免大图缓存占用过高。
+    if (cssWidth > 1350) void warmImage(hdBase, false);
+  }, [zoom, baseWidth, hdBase]);
 
   const fitScale = useMemo(() => {
     const availableW = Math.max(80, stageSize.width - 48);
@@ -116,9 +218,16 @@ export function CanvasStage({
   }, [autoFit, fitScale, asset.summary.id]);
 
   const zoomAt = useCallback(
-    (nextZoom: number, clientX?: number, clientY?: number) => {
+    (nextZoom: number, clientX?: number, clientY?: number, immediate = false) => {
       const next = clamp(nextZoom, 0.015, 4);
       setAutoFit(false);
+      // 连续滚轮/捏合时关闭 width/height 过渡：过渡会让图片始终落后于指针，
+      // 且在动画过程中被反复重采样，看起来发糊。
+      if (immediate) {
+        setZooming(true);
+        if (zoomTimerRef.current) window.clearTimeout(zoomTimerRef.current);
+        zoomTimerRef.current = window.setTimeout(() => setZooming(false), 180);
+      }
       const stage = stageRef.current;
       if (stage && clientX !== undefined && clientY !== undefined) {
         const rect = stage.getBoundingClientRect();
@@ -147,8 +256,8 @@ export function CanvasStage({
     const onWheel = (event: WheelEvent) => {
       if (mode === "compare") return;
       event.preventDefault();
-      const factor = Math.exp(-event.deltaY * 0.0018);
-      zoomAt(zoom * factor, event.clientX, event.clientY);
+      const factor = Math.exp(-event.deltaY * 0.0018 * zoomPrecision(event));
+      zoomAt(zoom * factor, event.clientX, event.clientY, true);
     };
     stage.addEventListener("wheel", onWheel, { passive: false });
     return () => stage.removeEventListener("wheel", onWheel);
@@ -210,7 +319,7 @@ export function CanvasStage({
       if (event.touches.length === 2 && pinchRef.current) {
         event.preventDefault();
         const next = (pinchRef.current.zoom * distance(event.touches)) / Math.max(10, pinchRef.current.distance);
-        zoomAt(next, pinchRef.current.midX, pinchRef.current.midY);
+        zoomAt(next, pinchRef.current.midX, pinchRef.current.midY, true);
       }
     };
     const onEnd = () => {
@@ -318,24 +427,33 @@ export function CanvasStage({
 
   const crop = plan.crop;
   const colorFilter =
-    mode === "edit"
+    !processedView && mode === "edit"
       ? `brightness(${plan.color.brightness}) contrast(${plan.color.contrast}) saturate(${plan.color.saturation})`
       : undefined;
 
-  const imageTransform =
-    mode === "original"
+  const imageTransform = processedView
+    ? "translate(-50%, -50%)"
+    : mode === "original"
       ? "translate(-50%, -50%)"
       : `translate(-50%, -50%) scaleX(${plan.flipH ? -1 : 1}) scaleY(${plan.flipV ? -1 : 1}) rotate(${plan.rotation}deg)`;
 
-  const originalRotation = mode === "original" ? 0 : plan.rotation;
+  const originalRotation = processedView || mode === "original" ? 0 : plan.rotation;
   const originalRotated = originalRotation === 90 || originalRotation === 270;
-  const worldWidth = (originalRotated ? asset.normHeight : asset.normWidth) * zoom;
-  const worldHeight = (originalRotated ? asset.normWidth : asset.normHeight) * zoom;
-  const imageWidth = asset.normWidth * zoom;
-  const imageHeight = asset.normHeight * zoom;
+  const worldWidth = processedView
+    ? baseWidth * zoom
+    : (originalRotated ? asset.normHeight : asset.normWidth) * zoom;
+  const worldHeight = processedView
+    ? baseHeight * zoom
+    : (originalRotated ? asset.normWidth : asset.normHeight) * zoom;
+  const imageWidth = processedView ? baseWidth * zoom : asset.normWidth * zoom;
+  const imageHeight = processedView ? baseHeight * zoom : asset.normHeight * zoom;
 
-  const cropPixelWidth = Math.round(crop.w * (rotated ? asset.normHeight : asset.normWidth));
-  const cropPixelHeight = Math.round(crop.h * (rotated ? asset.normWidth : asset.normHeight));
+  const cropPixelWidth = processedView
+    ? Math.max(1, asset.summary.outWidth || baseWidth)
+    : Math.round(crop.w * (rotated ? asset.normHeight : asset.normWidth));
+  const cropPixelHeight = processedView
+    ? Math.max(1, asset.summary.outHeight || baseHeight)
+    : Math.round(crop.h * (rotated ? asset.normWidth : asset.normHeight));
 
   const compareOriginal = (
     <div className="compare-pane" style={{ background: "var(--canvas)" }}>
@@ -358,23 +476,22 @@ export function CanvasStage({
   return (
     <div className="wb-canvas-wrap">
       <div className="canvas-toolbar">
-        <Segmented
-          compact
-          value={mode}
-          onChange={(value) => setMode(value as CanvasMode)}
-          options={
-            croppable
-              ? [
-                  { value: "edit", label: "编辑", icon: "crop" },
-                  { value: "original", label: "原图", icon: "image" },
-                  { value: "compare", label: "对比", icon: "split" },
-                ]
-              : [
-                  { value: "edit", label: "查看", icon: "image" },
-                  { value: "compare", label: "对比", icon: "split" },
-                ]
-          }
-        />
+        {croppable ? (
+          <Segmented
+            compact
+            value={mode}
+            onChange={(value) => setMode(value as CanvasMode)}
+            options={[
+              { value: "edit", label: "编辑", icon: "crop" },
+              { value: "original", label: "原图", icon: "image" },
+              { value: "compare", label: "对比", icon: "split" },
+            ]}
+          />
+        ) : (
+          <span className="hint" style={{ paddingLeft: 6 }}>
+            裁切后视图
+          </span>
+        )}
         {mode === "compare" ? (
           <Segmented
             compact
@@ -425,9 +542,17 @@ export function CanvasStage({
         </Dropdown>
         {mode !== "compare" ? (
           <>
-            <IconButton icon="zoom-out" label="缩小" onClick={() => zoomAt(zoom / 1.25)} />
+            <IconButton
+              icon="zoom-out"
+              label="缩小"
+              onClick={(event) => zoomAt(zoom / (1 + 0.25 * zoomPrecision(event)))}
+            />
             <span className="zoom-readout">{Math.round(zoom * 100)}%</span>
-            <IconButton icon="zoom-in" label="放大" onClick={() => zoomAt(zoom * 1.25)} />
+            <IconButton
+              icon="zoom-in"
+              label="放大"
+              onClick={(event) => zoomAt(zoom * (1 + 0.25 * zoomPrecision(event)))}
+            />
             <IconButton icon="maximize" label={S.workbench.fit} onClick={fit} />
             <button type="button" className="btn ghost sm" onClick={() => zoomAt(1)}>
               100%
@@ -537,7 +662,7 @@ export function CanvasStage({
               className={classNames(
                 "canvas-world",
                 background === "checker" && "checker",
-                smoothZoom && !pinching && "smooth-zoom",
+                smoothZoom && !pinching && !zooming && "smooth-zoom",
               )}
               ref={worldRef}
               style={{
@@ -555,24 +680,24 @@ export function CanvasStage({
                 boxShadow: "0 12px 42px rgba(0,0,0,.22)",
               }}
             >
-              {!imageReady && !imageFailed ? (
-                <img
-                  className="canvas-image canvas-image-low"
-                  src={lowThumbUrl(asset.summary)}
-                  alt=""
-                  draggable={false}
-                  style={{
-                    width: imageWidth,
-                    height: imageHeight,
-                    transform: imageTransform,
-                    filter: colorFilter,
-                    opacity: 0.65,
-                    pointerEvents: "none",
-                  }}
-                />
-              ) : null}
+              <img
+                className="canvas-image canvas-image-low"
+                src={lowThumb}
+                alt=""
+                draggable={false}
+                style={{
+                  width: imageWidth,
+                  height: imageHeight,
+                  transform: imageTransform,
+                  filter: colorFilter,
+                  opacity: imageReady ? 0 : 0.72,
+                  pointerEvents: "none",
+                }}
+              />
               {!imageFailed ? (
                 <img
+                  key={display}
+                  ref={imageElRef}
                   className="canvas-image"
                   src={display}
                   alt={asset.summary.name}
@@ -584,19 +709,51 @@ export function CanvasStage({
                     filter: colorFilter,
                     opacity: imageReady ? 1 : 0,
                   }}
-                  onLoad={() => setImageState({ id: asset.summary.id, status: "loaded" })}
-                  onError={() => setImageState({ id: asset.summary.id, status: "failed" })}
+                  onLoad={() => setImageState({ key: display, status: "loaded" })}
+                  onError={() => {
+                    // 裁后大图生成失败时退回裁后缩略图，而不是整页停在载入态。
+                    if (!previewBroken) {
+                      setPreviewBroken(true);
+                      return;
+                    }
+                    setImageState({ key: display, status: "failed" });
+                  }}
                 />
               ) : null}
-              {!imageReady && !imageFailed ? (
-                <div className="image-loading">
-                  <Spinner /> 载入图片…
-                </div>
+              {showHd && imageReady ? (
+                <img
+                  key={hdBase}
+                  className="canvas-image canvas-image-hd"
+                  src={hdBase}
+                  alt=""
+                  draggable={false}
+                  style={{
+                    width: imageWidth,
+                    height: imageHeight,
+                    transform: imageTransform,
+                    filter: colorFilter,
+                    opacity: hdReady ? 1 : 0,
+                  }}
+                  onLoad={() => setHdState({ key: hdBase, status: "loaded" })}
+                  onError={() => setHdState({ key: hdBase, status: "failed" })}
+                />
               ) : null}
               {imageFailed ? (
                 <div className="image-loading" style={{ color: "var(--danger)", padding: 20, textAlign: "center" }}>
                   <Icon name="alert" />
                   无法读取显示图。源文件可能已失联。
+                  <button
+                    type="button"
+                    className="btn subtle sm"
+                    style={{ marginTop: 8 }}
+                    onClick={() => {
+                      setImageState(null);
+                      setPreviewBroken(false);
+                      setRetryToken((value) => value + 1);
+                    }}
+                  >
+                    重试
+                  </button>
                 </div>
               ) : null}
               {croppable && imageReady && mode === "edit" ? (
@@ -631,6 +788,11 @@ export function CanvasStage({
             </div>
           </div>
         )}
+        {mode !== "compare" && !imageReady && !imageFailed ? (
+          <div className="image-loading-pill">
+            <Spinner /> 载入高清…
+          </div>
+        ) : null}
         {mode !== "compare" ? (
           <div className="canvas-hint">
             <Icon name="mouse" className="sm" />

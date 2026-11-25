@@ -15,6 +15,7 @@ pub mod runner;
 pub const ADAPTER_VERSION: &str = "yoyoku-adapters/1.0";
 pub const KOHYA_COMPAT: &str = "sd-scripts (DreamBooth 同名标注结构)";
 pub const DIFFUSERS_COMPAT: &str = "diffusers text_to_image LoRA 示例脚本";
+pub const LORA_SCRIPT_COMPAT: &str = "lora_script (单图训练次数_分组 目录结构)";
 
 #[derive(Debug, Clone)]
 pub struct ExportItem {
@@ -241,6 +242,74 @@ fn sanitize_subset_dir(name: &str, index: usize) -> String {
 struct SubsetPlan {
     assignments: HashMap<String, (String, String, u32, u32)>, // collectionId -> (dir,label,repeats,keep)
     overlaps: Vec<String>,
+}
+
+/// LoRA Script 的分组结构：分组目录为 `{单图训练次数}_{组名}`。
+struct LoraSubsetPlan {
+    order: Vec<String>,
+    assignments: HashMap<String, (String, String, u32)>,
+    ungrouped: (String, String, u32),
+    members: HashMap<String, Vec<String>>,
+}
+
+fn unique_dir(base: String, used: &mut HashSet<String>) -> String {
+    let mut candidate = base.clone();
+    let mut counter = 2;
+    while !used.insert(candidate.to_lowercase()) {
+        candidate = format!("{base}-{counter}");
+        counter += 1;
+    }
+    candidate
+}
+
+fn build_lora_subset_plan(
+    conn: &rusqlite::Connection,
+    config: &ExportConfig,
+) -> AppResult<LoraSubsetPlan> {
+    let mut untiled = conn.prepare(
+        "SELECT id, name FROM collections WHERE kind <> 'query' ORDER BY lower(name), id",
+    )?;
+    let groups: Vec<(String, String)> = untiled
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .filter_map(|row| row.ok())
+        .collect();
+    let mut plan = LoraSubsetPlan {
+        order: Vec::new(),
+        assignments: HashMap::new(),
+        ungrouped: (String::new(), "未分组".into(), 1),
+        members: HashMap::new(),
+    };
+    let mut used: HashSet<String> = HashSet::new();
+    for (index, (collection_id, name)) in groups.iter().enumerate() {
+        let repeats = config
+            .lora_script
+            .repeats
+            .get(collection_id)
+            .copied()
+            .unwrap_or(1)
+            .clamp(1, 1000);
+        let label = if name.trim().is_empty() {
+            format!("分组{}", index + 1)
+        } else {
+            name.trim().to_string()
+        };
+        let safe = util::sanitize_stem(&label);
+        let dir = unique_dir(format!("{repeats}_{safe}"), &mut used);
+        plan.order.push(collection_id.clone());
+        plan.assignments
+            .insert(collection_id.clone(), (dir, label, repeats));
+        let mut statement =
+            conn.prepare("SELECT asset_id FROM collection_assets WHERE collection_id = ?1")?;
+        let rows = statement.query_map(params![collection_id], |row| row.get::<_, String>(0))?;
+        plan.members.insert(
+            collection_id.clone(),
+            rows.filter_map(|row| row.ok()).collect(),
+        );
+    }
+    let ungrouped_repeats = config.lora_script.ungrouped_repeats.clamp(1, 1000);
+    let ungrouped_dir = unique_dir(format!("{ungrouped_repeats}_未分组"), &mut used);
+    plan.ungrouped = (ungrouped_dir, "未分组".into(), ungrouped_repeats);
+    Ok(plan)
 }
 
 fn build_subset_plan(
@@ -524,13 +593,20 @@ fn assign_names(items: &mut [ExportItem], config: &ExportConfig) -> HashSet<Stri
                 break;
             }
         }
-        if config.target == "kohya" {
+        if config.target == "kohya" || config.target == "lora_script" {
             let caption_name = Path::new(&item.image_path)
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             let caption_dir = item.image_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-            let caption_ext = if config.caption_extension == ".caption" { ".caption" } else { ".txt" };
+            // lora_script 固定使用同名 .txt 标注。
+            let caption_ext = if config.target == "lora_script" {
+                ".txt"
+            } else if config.caption_extension == ".caption" {
+                ".caption"
+            } else {
+                ".txt"
+            };
             item.caption_path = if caption_dir.is_empty() {
                 format!("{caption_name}{caption_ext}")
             } else {
@@ -636,10 +712,23 @@ pub fn preview(project: &Project, config: &ExportConfig) -> AppResult<PendingExp
     }
 
     let (subset_plan, subset_members) = build_subset_plan(&conn, config)?;
-    let (split_assign, split_summary) = assign_splits(&conn, &eligible_assets.iter().map(|a| (*a).clone()).collect::<Vec<_>>(), config)?;
+    let lora_plan = if config.target == "lora_script" {
+        Some(build_lora_subset_plan(&conn, config)?)
+    } else {
+        None
+    };
+    // LoRA Script 结构只有分组训练目录，不生成验证集分割。
+    let mut split_config = config.clone();
+    if config.target == "lora_script" {
+        split_config.validation.enabled = false;
+    }
+    let (split_assign, split_summary) = assign_splits(&conn, &eligible_assets.iter().map(|a| (*a).clone()).collect::<Vec<_>>(), &split_config)?;
 
     let mut issues: Vec<ExportIssue> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    if config.target == "lora_script" && config.validation.enabled {
+        warnings.push("LoRA Script 结构不使用验证集，已全部按训练分组导出。".into());
+    }
     let mut items: Vec<ExportItem> = Vec::new();
     let mut missing_ids: Vec<String> = Vec::new();
     let mut empty_caption_ids: Vec<String> = Vec::new();
@@ -742,11 +831,45 @@ pub fn preview(project: &Project, config: &ExportConfig) -> AppResult<PendingExp
             } else {
                 (String::new(), "默认子集".into(), 1, config.kohya.keep_tokens)
             }
+        } else if let Some(plan) = &lora_plan {
+            // 按分组名称顺序选择第一个归属，避免同一图片写入多个子目录。
+            let matches: Vec<&String> = plan
+                .order
+                .iter()
+                .filter(|collection_id| {
+                    plan.members
+                        .get(*collection_id)
+                        .map(|ids| ids.iter().any(|id| id == &asset.id))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if matches.len() > 1 {
+                overlaps.push(format!(
+                    "{} 同时属于 {} 个分组，已使用「{}」",
+                    asset.original_name,
+                    matches.len(),
+                    plan.assignments
+                        .get(matches[0])
+                        .map(|(_, label, _)| label.clone())
+                        .unwrap_or_default()
+                ));
+            }
+            let (dir, label, repeats) = if let Some(collection_id) = matches.first() {
+                plan.assignments
+                    .get(*collection_id)
+                    .cloned()
+                    .unwrap_or_else(|| plan.ungrouped.clone())
+            } else {
+                plan.ungrouped.clone()
+            };
+            (dir, label, repeats, 0)
         } else {
             (String::new(), "默认子集".into(), 1, 0)
         };
 
-        let dir = if split == "val" {
+        let dir = if config.target == "lora_script" {
+            subset.clone()
+        } else if split == "val" {
             "validation".to_string()
         } else if config.target == "kohya" && !subset.is_empty() {
             format!("train/{subset}")
@@ -849,13 +972,21 @@ pub fn preview(project: &Project, config: &ExportConfig) -> AppResult<PendingExp
         });
     }
     if !overlaps.is_empty() {
-        issues.push(ExportIssue {
-            level: "blocking".into(),
-            code: "SUBSET_OVERLAP".into(),
-            message: format!("{} 张图片同时属于多个训练子集，请先调整集合归属。", overlaps.len()),
-            asset_ids: Vec::new(),
-            action: "collection".into(),
-        });
+        if config.target == "lora_script" {
+            warnings.push(format!(
+                "{} 张图片同时属于多个分组，已按分组名称顺序选择第一个：{}",
+                overlaps.len(),
+                overlaps.iter().take(3).cloned().collect::<Vec<_>>().join("；")
+            ));
+        } else {
+            issues.push(ExportIssue {
+                level: "blocking".into(),
+                code: "SUBSET_OVERLAP".into(),
+                message: format!("{} 张图片同时属于多个训练子集，请先调整集合归属。", overlaps.len()),
+                asset_ids: Vec::new(),
+                action: "collection".into(),
+            });
+        }
     }
     if !split_summary.conflicts.is_empty() {
         issues.push(ExportIssue {
@@ -866,7 +997,7 @@ pub fn preview(project: &Project, config: &ExportConfig) -> AppResult<PendingExp
             action: "split".into(),
         });
     }
-    if config.validation.enabled {
+    if split_summary.enabled {
         if train == 0 {
             issues.push(ExportIssue {
                 level: "blocking".into(),
@@ -913,12 +1044,29 @@ pub fn preview(project: &Project, config: &ExportConfig) -> AppResult<PendingExp
             action: "path".into(),
         });
     }
-    let output_path = unique_path(&parent, &default_output_name(config));
-    let adapter_version = if config.target == "kohya" {
-        KOHYA_COMPAT.to_string()
+    let output_path = if config.target == "lora_script"
+        && config.name.as_deref().map(|name| name.trim().is_empty()).unwrap_or(true)
+    {
+        // LoRA Script 的根目录就是 LoRA 名称；未填写时使用项目名。
+        let project_name: String = conn
+            .query_row("SELECT name FROM project LIMIT 1", [], |row| row.get(0))
+            .unwrap_or_else(|_| "lora".into());
+        let base = util::sanitize_stem(&project_name);
+        let name = if config.package == "zip" {
+            format!("{base}.zip")
+        } else {
+            base
+        };
+        unique_path(&parent, &name)
     } else {
-        DIFFUSERS_COMPAT.to_string()
+        unique_path(&parent, &default_output_name(config))
     };
+    let adapter_version = match config.target.as_str() {
+        "kohya" => KOHYA_COMPAT,
+        "imagefolder" => DIFFUSERS_COMPAT,
+        _ => LORA_SCRIPT_COMPAT,
+    }
+    .to_string();
     let mut preview = ExportPreview {
         id: util::new_id(),
         fingerprint: String::new(),
@@ -1161,4 +1309,52 @@ pub fn write_absolute_entry(project: &Project, record_id: &str) -> AppResult<(St
         absolute_path.to_string_lossy()
     );
     Ok((absolute_path.to_string_lossy().to_string(), command))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lora_config() -> ExportConfig {
+        let mut config = ExportConfig::default();
+        config.target = "lora_script".into();
+        config.lora_script.ungrouped_repeats = 3;
+        config
+    }
+
+    #[test]
+    fn lora_subset_plan_uses_repeats_and_ignores_query_collections() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL);
+             CREATE TABLE collection_assets (collection_id TEXT NOT NULL, asset_id TEXT NOT NULL);
+             INSERT INTO collections VALUES ('c1', '人物', 'manual');
+             INSERT INTO collections VALUES ('c2', '人物', 'manual');
+             INSERT INTO collections VALUES ('c3', '人物', 'manual');
+             INSERT INTO collections VALUES ('q1', '查询', 'query');
+             INSERT INTO collection_assets VALUES ('c1', 'a1');
+             INSERT INTO collection_assets VALUES ('c2', 'a2');
+             INSERT INTO collection_assets VALUES ('c3', 'a3');",
+        )
+        .unwrap();
+        let mut config = lora_config();
+        config.lora_script.repeats.insert("c1".into(), 2);
+        config.lora_script.repeats.insert("c2".into(), 5);
+        config.lora_script.repeats.insert("c3".into(), 2);
+
+        let plan = build_lora_subset_plan(&conn, &config).unwrap();
+
+        assert_eq!(
+            plan.order,
+            vec!["c1".to_string(), "c2".to_string(), "c3".to_string()]
+        );
+        assert_eq!(plan.assignments.get("c1").unwrap().0, "2_人物");
+        assert_eq!(plan.assignments.get("c2").unwrap().0, "5_人物");
+        // 同名且同次数时通过序号目录区分，避免写入同一个文件夹。
+        assert_eq!(plan.assignments.get("c3").unwrap().0, "2_人物-2");
+        assert_eq!(plan.assignments.get("c1").unwrap().2, 2);
+        assert_eq!(plan.assignments.get("c2").unwrap().2, 5);
+        assert!(plan.assignments.get("q1").is_none());
+        assert_eq!(plan.ungrouped, ("3_未分组".into(), "未分组".into(), 3));
+    }
 }

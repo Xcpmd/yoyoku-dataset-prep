@@ -1,6 +1,6 @@
 import { useEffect, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api, normalizeError } from "../../lib/api";
-import type { AssetDetail, AssetSummary, BatchOp, ReviewStatus } from "../../lib/types";
+import type { AssetDetail, AssetSummary, BatchOp, ReviewStatus, TransformPlan } from "../../lib/types";
 import { useProject } from "../../app/ProjectContext";
 import { S } from "../../lib/strings";
 import {
@@ -29,8 +29,45 @@ import {
   Spinner,
 } from "../../components/ui";
 
-interface Props {
-  open: boolean;
+/** 把裁剪配方中的裁剪框反算回原图坐标，用于在检查器里标出被裁区域。 */
+function cropRegionFor(
+  plan: TransformPlan,
+): { left: number; top: number; width: number; height: number } | null {
+  const crop = plan.crop;
+  if (!crop) return null;
+  if (crop.x <= 0.001 && crop.y <= 0.001 && crop.w >= 0.999 && crop.h >= 0.999) return null;
+  const rotation = ((Math.round(plan.rotation) % 360) + 360) % 360;
+  const points: [number, number][] = [
+    [crop.x, crop.y],
+    [crop.x + crop.w, crop.y],
+    [crop.x, crop.y + crop.h],
+    [crop.x + crop.w, crop.y + crop.h],
+  ];
+  const mapped = points.map(([x, y]) => {
+    // 先逆翻转，再逆旋转（与工作进程 rotate_flip 的顺序相反）。
+    const tx = plan.flipH ? 1 - x : x;
+    const ty = plan.flipV ? 1 - y : y;
+    if (rotation === 90) return [ty, 1 - tx] as const;
+    if (rotation === 180) return [1 - tx, 1 - ty] as const;
+    if (rotation === 270) return [1 - ty, tx] as const;
+    return [tx, ty] as const;
+  });
+  const xs = mapped.map(([x]) => x);
+  const ys = mapped.map(([, y]) => y);
+  const left = Math.max(0, Math.min(...xs));
+  const right = Math.min(1, Math.max(...xs));
+  const top = Math.max(0, Math.min(...ys));
+  const bottom = Math.min(1, Math.max(...ys));
+  if (right - left <= 0 || bottom - top <= 0) return null;
+  return {
+    left: left * 100,
+    top: top * 100,
+    width: (right - left) * 100,
+    height: (bottom - top) * 100,
+  };
+}
+
+interface Props {  open: boolean;
   width: number;
   assetIds: string[];
   focusedId: string | null;
@@ -165,6 +202,7 @@ export function Inspector({
     return accumulator;
   }, {});
   const hasExcluded = selectedSummaries.some((item) => item.status === "excluded");
+  const cropRegion = detail && !multi ? cropRegionFor(detail.transform.plan) : null;
 
   return (
     <aside
@@ -329,6 +367,23 @@ export function Inspector({
                 onLoad={() => setFullReady(true)}
                 onDoubleClick={() => onOpenWorkbench(detail.summary.id)}
               />
+              {cropRegion ? (
+                <>
+                  <div
+                    className="inspector-crop-region"
+                    style={{
+                      left: `${cropRegion.left}%`,
+                      top: `${cropRegion.top}%`,
+                      width: `${cropRegion.width}%`,
+                      height: `${cropRegion.height}%`,
+                    }}
+                    aria-hidden="true"
+                  >
+                    <span className="inspector-crop-label">裁剪区域</span>
+                  </div>
+                  <div className="inspector-crop-hint">原图预览 · 框内为导出与打标使用的区域</div>
+                </>
+              ) : null}
             </div>
             <div>
               <div className="inspector-title">{detail.summary.name}</div>

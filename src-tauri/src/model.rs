@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // 应用与项目
@@ -239,6 +240,13 @@ pub struct Geometry {
 #[serde(rename_all = "camelCase", default)]
 pub struct AssetFilter {
     pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_target: Option<String>,
+    pub search_case_sensitive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex_search: Option<RegexSearch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<FilterExpression>,
     pub statuses: Vec<String>,
     pub orientations: Vec<String>,
     pub collection_ids: Vec<String>,
@@ -252,6 +260,27 @@ pub struct AssetFilter {
     pub has_draft: bool,
     /// 只看去重回收区；默认视图会隐藏回收区图片。
     pub recycled_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegexSearch {
+    pub pattern: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FilterExpression {
+    Group { mode: FilterMode, negated: bool, children: Vec<FilterExpression> },
+    Rule { field: String, operator: String, value: String, negated: bool },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FilterMode {
+    All,
+    Any,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +431,9 @@ pub struct AssetPatch {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum BatchOp {
     AddTags { tags: Vec<String> },
+    ExtractTags { pattern: String, syntax: ExtractSyntax, templates: Vec<String> },
+    RegexRemoveTags { pattern: String },
+    RegexReplaceTags { pattern: String, replacement: String },
     RemoveTags { tags: Vec<String> },
     ReplaceTag { from: String, to: String },
     MoveToFront { tag: String },
@@ -413,6 +445,13 @@ pub enum BatchOp {
     SetSplit { split: Option<String> },
     AddToCollection { collection: String },
     RemoveFromCollection { collection: String },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExtractSyntax {
+    Template,
+    Regex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +480,15 @@ pub struct BatchDiff {
     pub before: String,
     pub after: String,
     pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag_changes: Option<BatchTagChanges>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTagChanges {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -449,6 +497,7 @@ pub struct BatchPreview {
     pub preview_id: String,
     pub count: i64,
     pub skipped: Vec<BatchSkip>,
+    pub skipped_count: usize,
     pub diffs: Vec<BatchDiff>,
     pub summary: String,
     pub warnings: Vec<String>,
@@ -801,6 +850,24 @@ impl Default for KohyaConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct LoraScriptConfig {
+    /// 分组（集合）ID -> 单图训练次数。
+    pub repeats: HashMap<String, u32>,
+    /// 不属于任何分组的图片使用的单图训练次数。
+    pub ungrouped_repeats: u32,
+}
+
+impl Default for LoraScriptConfig {
+    fn default() -> Self {
+        Self {
+            repeats: HashMap::new(),
+            ungrouped_repeats: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ExportConfig {
     pub target: String,
     pub package: String,
@@ -814,6 +881,7 @@ pub struct ExportConfig {
     pub caption_extension: String,
     pub size: SizePolicy,
     pub kohya: KohyaConfig,
+    pub lora_script: LoraScriptConfig,
 }
 
 impl Default for ExportConfig {
@@ -831,6 +899,7 @@ impl Default for ExportConfig {
             caption_extension: ".txt".into(),
             size: SizePolicy::default(),
             kohya: KohyaConfig::default(),
+            lora_script: LoraScriptConfig::default(),
         }
     }
 }
@@ -1058,6 +1127,7 @@ pub struct SuggestionResult {
     pub mode: String,
     pub tags: Vec<String>,
     pub text: String,
+    pub vision_language: bool,
     pub model: String,
     pub model_version: String,
     pub threshold: f64,

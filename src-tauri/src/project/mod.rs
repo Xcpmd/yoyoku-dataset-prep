@@ -7,15 +7,18 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod asset_filter;
 pub mod assets;
 pub mod captions;
 pub mod collections;
+pub mod crop;
 pub mod history;
 pub mod import;
 pub mod jobs;
 pub mod metrics;
 pub mod prompt_library;
 pub mod quality;
+mod regex_tags;
 pub mod sample;
 pub mod transform;
 
@@ -70,6 +73,15 @@ impl Drop for Project {
 impl Project {
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn read_conn(&self) -> AppResult<Connection> {
+        let conn = Connection::open_with_flags(
+            self.root.join("database.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(conn)
     }
 
     pub fn originals_dir(&self) -> PathBuf {

@@ -138,6 +138,11 @@ fn kohya_caption(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Kohya 与 LoRA Script 都使用同名 .txt/.caption 标注文件。
+fn writes_caption_files(config: &ExportConfig) -> bool {
+    matches!(config.target.as_str(), "kohya" | "lora_script")
+}
+
 fn imagefolder_line(item: &ExportItem) -> serde_json::Value {
     let dir = adapters::split_dir(&item.split);
     let file_name = item
@@ -266,7 +271,7 @@ pub fn run_export(mut ctx: JobContext, pending: PendingExport) -> AppResult<JobO
         let path = temp_root.join("dataset.toml");
         util::write_atomic(&path, toml.as_bytes())?;
         config_files.push(("dataset.toml".into(), util::sha256_text(&toml)));
-    } else {
+    } else if config.target == "imagefolder" {
         for split in ["train", "val"] {
             let content = adapters::jsonl_content(&pending.items, split);
             if content.is_empty() {
@@ -277,7 +282,7 @@ pub fn run_export(mut ctx: JobContext, pending: PendingExport) -> AppResult<JobO
             config_files.push((rel, util::sha256_text(&content)));
         }
     }
-    let readme = adapters::readme_content(&config, &pending.preview.split, &output_name, &model);
+    let readme = adapters::readme_content(&config, &pending.items, &pending.preview.split, &output_name, &model);
     util::write_atomic(&temp_root.join("README.md"), readme.as_bytes())?;
     config_files.push(("README.md".into(), util::sha256_text(&readme)));
 
@@ -432,7 +437,7 @@ fn render_one(
             .map_err(|e| AppError::io("计算导出图片哈希失败", e))?
             .0;
         let caption_sha;
-        if config.target == "kohya" {
+        if writes_caption_files(config) {
             let caption = kohya_caption(&item.caption);
             let caption_path = temp_root.join(&item.caption_path);
             util::write_atomic(&caption_path, caption.as_bytes())?;
@@ -458,7 +463,7 @@ fn render_one(
         .map_err(|e| AppError::io("计算导出图片哈希失败", e))?
         .0;
     let caption_sha;
-    if config.target == "kohya" {
+    if writes_caption_files(config) {
         let caption = kohya_caption(&item.caption);
         let caption_path = temp_root.join(&item.caption_path);
         util::write_atomic(&caption_path, caption.as_bytes())?;
@@ -533,7 +538,7 @@ fn validate_export(
     );
 
     // 标注配对
-    if config.target == "kohya" {
+    if writes_caption_files(config) {
         let mut missing_captions = 0;
         let mut empty_captions = 0;
         for item in items {
@@ -669,7 +674,7 @@ fn validate_export(
             }
             Err(error) => hash_problems.push(format!("{image_path} 读取失败：{error}")),
         }
-        if config.target == "kohya" {
+        if writes_caption_files(config) {
             let caption_path = entry.get("caption_path").and_then(|v| v.as_str()).unwrap_or("");
             let expected = entry.get("caption_sha256").and_then(|v| v.as_str()).unwrap_or("");
             if let Ok(bytes) = std::fs::read(root.join(caption_path)) {

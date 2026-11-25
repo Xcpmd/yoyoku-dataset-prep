@@ -1,13 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, normalizeError } from "../../lib/api";
 import type { BatchOp, BatchPreview, ReviewStatus } from "../../lib/types";
 import { useProject } from "../../app/ProjectContext";
 import { S } from "../../lib/strings";
 import { Icon } from "../../components/Icon";
-import { Badge, Field, Modal, Notice, Spinner } from "../../components/ui";
+import { Field, Modal, Notice, Select, Spinner } from "../../components/ui";
 
 type OpKind =
   | "addTags"
+  | "extractTags"
+  | "regexRemoveTags"
+  | "regexReplaceTags"
   | "removeTags"
   | "replaceTag"
   | "moveToFront"
@@ -22,6 +25,9 @@ type OpKind =
 
 const OP_LABELS: { value: OpKind; label: string }[] = [
   { value: "addTags", label: "添加标签" },
+  { value: "extractTags", label: "从文件名添加标签" },
+  { value: "regexReplaceTags", label: "正则替换标签" },
+  { value: "regexRemoveTags", label: "正则删除标签" },
   { value: "removeTags", label: "删除标签" },
   { value: "replaceTag", label: "精确替换标签" },
   { value: "moveToFront", label: "移动到首位" },
@@ -46,14 +52,21 @@ export function BatchDialog({
   open,
   onClose,
   assetNames,
+  hiddenSelected,
 }: {
   open: boolean;
   onClose: () => void;
   assetNames: Record<string, string>;
+  hiddenSelected: number;
 }) {
   const { selection, focusedId, collections, notify, bumpRefresh, reloadCollections } = useProject();
   const [kind, setKind] = useState<OpKind>("addTags");
   const [tagsText, setTagsText] = useState("");
+  const [extractSyntax, setExtractSyntax] = useState<"template" | "regex">("template");
+  const [filenamePattern, setFilenamePattern] = useState("");
+  const [tagTemplates, setTagTemplates] = useState("");
+  const [tagPattern, setTagPattern] = useState("");
+  const [replacement, setReplacement] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [tag, setTag] = useState("");
@@ -66,25 +79,53 @@ export function BatchDialog({
   const [preview, setPreview] = useState<BatchPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const previewRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) {
       setPreview(null);
       setError(null);
       setSource(focusedId || selection[0] || "");
-      if (!collection && collections.length > 0) setCollection(collections[0].id);
+      const manual = collections.filter((item) => item.kind !== "query");
+      if (!manual.some((item) => item.id === collection)) setCollection(manual[0]?.id ?? "");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const change = (setter: (value: any) => void) => (value: any) => {
+  useEffect(() => {
+    if (open && preview && window.matchMedia("(max-width: 639.98px)").matches) {
+      const panel = previewRef.current;
+      const body = panel?.closest<HTMLElement>(".modal-body");
+      if (panel && body) {
+        body.scrollTop += panel.getBoundingClientRect().top - body.getBoundingClientRect().top;
+      }
+    }
+  }, [open, preview]);
+
+  const change = <T,>(setter: (value: T) => void) => (value: T) => {
     setter(value);
     setPreview(null);
+    setError(null);
   };
 
   const buildOp = (): BatchOp | null => {
     setError(null);
     switch (kind) {
+      case "extractTags": {
+        const templates = tagTemplates.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        if (!filenamePattern.trim() || templates.length === 0) {
+          setError("请填写文件名匹配规则和标签模板");
+          return null;
+        }
+        return { kind, syntax: extractSyntax, pattern: filenamePattern, templates };
+      }
+      case "regexRemoveTags":
+      case "regexReplaceTags":
+        if (!tagPattern) {
+          setError("请输入要匹配的标签正则");
+          return null;
+        }
+        return kind === "regexReplaceTags" ? { kind, pattern: tagPattern, replacement } : { kind, pattern: tagPattern };
       case "addTags": {
         const tags = splitTags(tagsText);
         if (tags.length === 0) {
@@ -143,11 +184,13 @@ export function BatchDialog({
   const previewChanges = async () => {
     const op = buildOp();
     if (!op) return;
+    setPreview(null);
     setBusy(true);
     try {
       const result = await api.batchPreview({ assetIds: selection, op });
       setPreview(result);
     } catch (error) {
+      setPreview(null);
       setError(normalizeError(error).message);
     } finally {
       setBusy(false);
@@ -169,7 +212,7 @@ export function BatchDialog({
         actionLabel: S.common.undo,
         onAction: async () => {
           try {
-            const undone = await api.undo();
+            const undone = await api.undo(result.historySeq);
             bumpRefresh();
             notify({ message: undone ? `已撤销：${undone.label}` : "没有可撤销的操作" });
           } catch (error) {
@@ -178,6 +221,7 @@ export function BatchDialog({
         },
       });
     } catch (error) {
+      setPreview(null);
       setError(normalizeError(error).message);
     } finally {
       setBusy(false);
@@ -186,11 +230,11 @@ export function BatchDialog({
 
   const sourceOptions = useMemo(
     () =>
-      selection.map((id) => ({
+      open && kind === "copyCaption" ? selection.map((id) => ({
         id,
         name: assetNames[id] || id.slice(0, 8),
-      })),
-    [selection, assetNames],
+      })) : [],
+    [open, kind, selection, assetNames],
   );
 
   return (
@@ -198,12 +242,12 @@ export function BatchDialog({
       open={open}
       onClose={() => !busy && onClose()}
       title={S.library.batchEdit}
-      subtitle={`作用范围：已选 ${selection.length} 张图片`}
+      subtitle={`已选 ${selection.length} 张图片${hiddenSelected ? `，含 ${hiddenSelected} 张被筛选隐藏` : ""}`}
       width="wide"
       closeOnBackdrop={!busy}
       footer={
         <>
-          <div className="left hint">预览会重新校验图片修订号；应用后可撤销。</div>
+          <div className="left hint">应用后可撤销</div>
           <button type="button" className="btn ghost" onClick={onClose} disabled={busy}>
             {S.common.cancel}
           </button>
@@ -224,16 +268,48 @@ export function BatchDialog({
       }
     >
       <div className="batch-grid">
-        <div className="stack" style={{ gap: 14 }}>
+        <fieldset className="stack batch-fields" disabled={busy}>
           <Field label="操作">
-            <select className="select" value={kind} onChange={(event) => change(setKind)(event.target.value as OpKind)}>
-              {OP_LABELS.map((item) => (
-                <option key={item.value} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
+            <Select ariaLabel="批量操作" options={OP_LABELS} value={kind}
+              onChange={(value) => change(setKind)(value as OpKind)} />
           </Field>
+
+          {kind === "extractTags" ? (
+            <>
+              <div className="row-wrap batch-pattern-controls">
+                <Select ariaLabel="文件名匹配方式" value={extractSyntax}
+                  options={[{ value: "template", label: "文件名模板" }, { value: "regex", label: "原生正则" }]}
+                  onChange={(value) => change(setExtractSyntax)(value === "regex" ? "regex" : "template")} />
+                <button type="button" className="btn ghost sm" onClick={() => {
+                  change(setFilenamePattern)(extractSyntax === "template"
+                    ? "[{{artist: str}}] {{id: int}}.png"
+                    : String.raw`^\[(?P<artist>[^\]]+)\] (?P<id>[0-9]+)\.png$`);
+                  change(setTagTemplates)("artist: {{artist}}\nid: {{id}}");
+                }}>
+                  填入示例
+                </button>
+              </div>
+              <Field label="匹配文件名" hint={extractSyntax === "template" ? "匹配完整文件名，含扩展名。str 匹配文字，int 匹配数字并保留前导零。" : "用 (?P<名称>…) 命名捕获组，或用普通括号按顺序捕获。"}>
+                <input className="input batch-pattern" aria-label="文件名匹配规则" spellCheck={false} value={filenamePattern} onChange={(event) => change(setFilenamePattern)(event.target.value)} placeholder={extractSyntax === "template" ? "[{{artist: str}}] {{id: int}}.png" : "^(.+)\\.png$"} />
+              </Field>
+              <Field label="标签模板" hint="每行一个标签。用 {{artist}} 或 {{1}} 引用提取结果。">
+                <textarea className="textarea batch-pattern" rows={3} aria-label="标签模板" spellCheck={false} value={tagTemplates} onChange={(event) => change(setTagTemplates)(event.target.value)} placeholder="artist: {{artist}}" />
+              </Field>
+            </>
+          ) : null}
+
+          {kind === "regexRemoveTags" || kind === "regexReplaceTags" ? (
+            <>
+              <Field label="标签正则" hint={kind === "regexRemoveTags" ? "移除匹配的整个标签。用 (?i) 忽略大小写。" : "逐个标签替换匹配片段。用 (?i) 忽略大小写。"}>
+                <input className="input batch-pattern" aria-label="标签正则" spellCheck={false} value={tagPattern} onChange={(event) => change(setTagPattern)(event.target.value)} placeholder="^artist: (.+)$" />
+              </Field>
+              {kind === "regexReplaceTags" ? (
+                <Field label="替换为" hint="用 {{1}} 或 {{名称}} 引用捕获组。留空会移除匹配片段。">
+                  <input className="input batch-pattern" aria-label="替换为" spellCheck={false} value={replacement} onChange={(event) => change(setReplacement)(event.target.value)} placeholder="by {{1}}" />
+                </Field>
+              ) : null}
+            </>
+          ) : null}
 
           {kind === "addTags" || kind === "removeTags" ? (
             <Field label="标签" hint="用逗号或换行分隔多个标签。">
@@ -337,8 +413,8 @@ export function BatchDialog({
                 value={collection}
                 onChange={(event) => change(setCollection)(event.target.value)}
               >
-                {collections.length === 0 ? <option value="">暂无集合</option> : null}
-                {collections.map((item) => (
+                {!collections.some((item) => item.kind !== "query") ? <option value="">暂无集合</option> : null}
+                {collections.filter((item) => item.kind !== "query").map((item) => (
                   <option key={item.id} value={item.id}>
                     {item.name}（{item.count}）
                   </option>
@@ -347,10 +423,10 @@ export function BatchDialog({
             </Field>
           ) : null}
 
-          {error ? <Notice tone="danger">{error}</Notice> : null}
-        </div>
+          {error ? <Notice tone="danger"><span className="gallery-pattern-error">{error}</span></Notice> : null}
+        </fieldset>
 
-        <div className="stack" style={{ gap: 10, minWidth: 0 }}>
+        <div ref={previewRef} className="stack" style={{ gap: 10, minWidth: 0 }} aria-live="polite">
           <div className="group-title">变更预览</div>
           {preview ? (
             <>
@@ -370,19 +446,28 @@ export function BatchDialog({
                     <div className="tiny" style={{ fontWeight: 600 }}>
                       {diff.name}
                     </div>
-                    <div className="tiny faint" style={{ textDecoration: "line-through", marginTop: 2, overflowWrap: "anywhere" }}>
-                      {diff.before || "（空）"}
-                    </div>
-                    <div className="tiny" style={{ marginTop: 2, overflowWrap: "anywhere" }}>
-                      {diff.after || "（空）"}
-                    </div>
+                    {diff.tagChanges ? (
+                      <ul className="batch-tag-diff">
+                        {diff.tagChanges.removed.map((tag) => <li key={`removed-${tag}`}><del>− {tag}</del></li>)}
+                        {diff.tagChanges.added.map((tag) => <li key={`added-${tag}`}>+ {tag}</li>)}
+                      </ul>
+                    ) : (
+                      <>
+                        <div className="tiny faint" style={{ textDecoration: "line-through", marginTop: 2, overflowWrap: "anywhere" }}>
+                          {diff.before || "（空）"}
+                        </div>
+                        <div className="tiny" style={{ marginTop: 2, overflowWrap: "anywhere" }}>
+                          {diff.after || "（空）"}
+                        </div>
+                      </>
+                    )}
                   </div>
                 ))}
               </div>
               {preview.skipped.length > 0 ? (
                 <details>
                   <summary className="tiny faint" style={{ cursor: "pointer" }}>
-                    跳过 {preview.skipped.length} 张
+                    跳过 {preview.skippedCount} 张{preview.skippedCount > preview.skipped.length ? `（显示前 ${preview.skipped.length} 张）` : ""}
                   </summary>
                   <div className="stack" style={{ gap: 2, marginTop: 4 }}>
                     {preview.skipped.map((item) => (
@@ -396,13 +481,9 @@ export function BatchDialog({
             </>
           ) : (
             <div className="well" style={{ color: "var(--faint)", fontSize: 12.5, padding: 18 }}>
-              选择操作并点击「预览变更」，这里会显示变更数量、代表差异与跳过原因。
+              点击「预览变更」查看改动
             </div>
           )}
-          <div className="row-wrap">
-            <Badge tone="info">已选 {selection.length}</Badge>
-            {focusedId ? <Badge>焦点：{assetNames[focusedId] || focusedId.slice(0, 8)}</Badge> : null}
-          </div>
         </div>
       </div>
     </Modal>

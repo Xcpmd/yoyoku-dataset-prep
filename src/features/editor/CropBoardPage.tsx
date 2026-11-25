@@ -5,6 +5,7 @@ import { useProject } from "../../app/ProjectContext";
 import { classNames, formatNumber, projectBaseResolution, snapSize64 } from "../../lib/utils";
 import { Icon } from "../../components/Icon";
 import { Badge, Notice, Spinner } from "../../components/ui";
+import { DatasetFilterBar } from "../library/DatasetFilterBar";
 import { InlineCropCard } from "./InlineCropCard";
 import { CropModeSwitch, type CropMode } from "./CropModeSwitch";
 
@@ -36,6 +37,9 @@ export function CropBoardPage({
     notify,
     bumpRefresh,
     refreshToken,
+    jobs,
+    reloadJobs,
+    setJobsOpen,
   } = useProject();
   const [assets, setAssets] = useState<AssetSummary[]>([]);
   const [plans, setPlans] = useState<PlanMap>({});
@@ -50,13 +54,31 @@ export function CropBoardPage({
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const lastWorkbenchRef = useRef<string | null>(null);
   const loadSeq = useRef(0);
+  /** 记录已加载的筛选与刷新代际，页面来回切换时不重复清空并重载瀑布流。 */
+  const loadedKeyRef = useRef<string | null>(null);
+  const loadedTokenRef = useRef(-1);
+  /** 每张图片串行保存，连续拖动只保留最后一个待保存方案，避免旧响应覆盖新裁剪。 */
+  const commitQueues = useRef(new Map<string, { running: boolean; latest: TransformPlan | null }>());
+  /** 保存用版本号，独立于 plans 状态，避免中间保存结果触发卡片视图回跳。 */
+  const revisionsRef = useRef<Record<string, number>>({});
 
   const base = snapSize64(projectBaseResolution(project), 1024);
   const groups = useMemo(() => collections.filter((collection) => collection.kind !== "query"), [collections]);
+  const cropJobActive = jobs.some(
+    (job) => job.kind === "crop" && ["running", "queued", "paused"].includes(job.status),
+  );
+  const pendingSaves = savingIds.size > 0;
+  const applyBusy = applyingGroup !== null || cropJobActive || pendingSaves;
 
   const updateSummary = useCallback((id: string, updates: Partial<AssetSummary>) => {
     setAssets((current) => current.map((asset) => (asset.id === id ? { ...asset, ...updates } : asset)));
   }, []);
+
+  useEffect(() => {
+    const next = { ...revisionsRef.current };
+    for (const [id, info] of Object.entries(plans)) next[id] = info.revision;
+    revisionsRef.current = next;
+  }, [plans]);
 
   const loadAssets = useCallback(async () => {
     const seq = ++loadSeq.current;
@@ -65,6 +87,8 @@ export function CropBoardPage({
     try {
       const ids = Array.from(new Set(await api.assetIds(filter)));
       if (seq !== loadSeq.current) return;
+      const matching = new Set(ids);
+      setSelection((current) => current.filter((id) => matching.has(id)));
       setAssets([]);
       setPlans({});
       // 分批载入并立即呈现，首批 200 张不再等待整库摘要与配方。
@@ -92,7 +116,20 @@ export function CropBoardPage({
 
   useEffect(() => {
     if (!active) return;
+    const key = JSON.stringify(filter);
+    // 没有新的保存/裁切/筛选变化时，保留现有卡片与图片 DOM，避免来回切页重新加载。
+    if (!error && loadedKeyRef.current === key && loadedTokenRef.current === refreshToken) {
+      return;
+    }
+    if (loadedKeyRef.current !== key) {
+      setAssets([]);
+      setPlans({});
+      setSelection([]);
+    }
+    loadedKeyRef.current = key;
+    loadedTokenRef.current = refreshToken;
     void loadAssets();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadAssets, refreshToken, active]);
 
   useEffect(() => {
@@ -187,10 +224,10 @@ export function CropBoardPage({
   };
 
   useEffect(() => {
-    if (!active || !workbenchId || lastWorkbenchRef.current === workbenchId) return;
+    if (!active || !workbenchId || lastWorkbenchRef.current === workbenchId || !assets.some((asset) => asset.id === workbenchId)) return;
     lastWorkbenchRef.current = workbenchId;
     setSelection((current) => (current.includes(workbenchId) ? current : [...current, workbenchId]));
-  }, [active, workbenchId]);
+  }, [active, workbenchId, assets]);
 
   // 从工作台进入的图片若位于折叠组，自动展开该组，保证当前卡片可见。
   useEffect(() => {
@@ -211,16 +248,14 @@ export function CropBoardPage({
     }
   };
 
-  const applyTargetToGroup = async (section: { key: string; assets: AssetSummary[] }) => {
-    if (applyingGroup) return;
+  const applyTargetToGroup = async (section: { key: string; name: string; assets: AssetSummary[] }) => {
+    if (applyingGroup || cropJobActive) return;
     if (section.key === UNGROUPED && groups.some((group) => !Array.isArray(members[group.id]))) {
       notify({ message: "正在载入分组信息，请稍后再应用" });
       return;
     }
     const target = targetFor(section.key);
     setApplyingGroup(section.key);
-    let applied = 0;
-    const failures: string[] = [];
     try {
       if (section.key !== UNGROUPED) {
         await api.updateCollection({ id: section.key, targetWidth: target.width, targetHeight: target.height });
@@ -232,53 +267,34 @@ export function CropBoardPage({
         section.key === UNGROUPED
           ? Array.from(new Set(await api.assetIds(filter))).filter((id) => !groupedIds.has(id))
           : await api.collectionIds(section.key);
-      if (targetIds.length === 0) return;
-      const knownAssets = new Map(assets.map((asset) => [asset.id, asset] as const));
-      const knownPlans = new Map(Object.entries(plans));
-      const missing = targetIds.filter((id) => !knownAssets.has(id) || !knownPlans.has(id));
-      for (let index = 0; index < missing.length; index += LOAD_CHUNK) {
-        const chunk = missing.slice(index, index + LOAD_CHUNK);
-        const [summaries, chunkPlans] = await Promise.all([
-          api.assetSummaries(chunk),
-          api.assetTransformPlans(chunk),
-        ]);
-        for (const summary of summaries) knownAssets.set(summary.id, summary);
-        for (const info of chunkPlans) {
-          knownPlans.set(info.assetId, { plan: info.plan, revision: info.revision });
-        }
+      if (targetIds.length === 0) {
+        notify({ message: "该分组没有可裁切的图片" });
+        return;
       }
-      for (const id of targetIds) {
-        const asset = knownAssets.get(id);
-        if (!asset) {
-          failures.push(`${id}：缺少素材信息`);
-          continue;
-        }
-        const info = knownPlans.get(id);
-        try {
-          const plan: TransformPlan = {
-            ...(info?.plan || ({} as TransformPlan)),
-            scaleMode: "fitCrop",
-            width: target.width,
-            height: target.height,
-            allowUpscale: true,
-          };
-          const result = await api.transformSave(id, plan, info?.revision ?? asset.revision);
-          setPlans((current) => ({ ...current, [id]: { plan, revision: result.assetRevision } }));
-          updateSummary(id, {
-            revision: result.assetRevision,
-            thumbVersion: result.thumbVersion,
-            outWidth: result.geometry.outWidth,
-            outHeight: result.geometry.outHeight,
-          });
-          applied += 1;
-        } catch (applyError) {
-          failures.push(`${asset.name}：${normalizeError(applyError).message}`);
-        }
-      }
-      bumpRefresh();
+      const started = await api.cropApplyBatch({
+        assetIds: targetIds,
+        width: target.width,
+        height: target.height,
+        collectionId: section.key === UNGROUPED ? null : section.key,
+        title: `裁切 ${section.name} · ${target.width}×${target.height}`,
+      });
+      await reloadJobs();
       notify({
-        tone: failures.length > 0 ? "warning" : "success",
-        message: `已统一 ${applied} 张为 ${target.width}×${target.height}${failures.length ? `，${failures.length} 张失败` : ""}`,
+        tone: "success",
+        message: `已开始裁切 ${started.total} 张，进度见任务列表`,
+        actionLabel: "查看任务",
+        onAction: () => setJobsOpen(true),
+      });
+    } catch (applyError) {
+      const normalized = normalizeError(applyError);
+      if (normalized.code === "NO_CHANGED_IMAGES") {
+        notify({ message: normalized.message });
+        return;
+      }
+      notify({
+        tone: "danger",
+        title: "批量裁切失败",
+        message: normalized.message,
       });
     } finally {
       setApplyingGroup(null);
@@ -296,12 +312,22 @@ export function CropBoardPage({
     let applied = 0;
     const failures: string[] = [];
     for (const targetId of targetIds) {
-      const targetInfo = plans[targetId];
-      if (!targetInfo) continue;
       const targetName = assets.find((asset) => asset.id === targetId)?.name || targetId;
+      let targetInfo: PlanMap[string] | undefined = plans[targetId];
+      if (!targetInfo) {
+        try {
+          targetInfo = (await planInfoFor(targetId)) ?? undefined;
+        } catch {
+          targetInfo = undefined;
+        }
+      }
+      if (!targetInfo) {
+        failures.push(`${targetName}：无法读取裁剪配方`);
+        continue;
+      }
       setSavingIds((current) => new Set(current).add(targetId));
       try {
-        const linkedResult = await api.transformSave(targetId, plan, targetInfo.revision);
+        const linkedResult = await savePlan(targetId, plan, targetInfo.revision);
         setPlans((current) => ({ ...current, [targetId]: { plan, revision: linkedResult.assetRevision } }));
         updateSummary(targetId, {
           revision: linkedResult.assetRevision,
@@ -330,29 +356,132 @@ export function CropBoardPage({
     return applied;
   };
 
-  const commitCard = async (asset: AssetSummary, plan: TransformPlan) => {
-    const info = plans[asset.id];
-    if (!info) return;
-    setSavingIds((current) => new Set(current).add(asset.id));
+  /** 从后端读取单张图片的当前配方。 */
+  const fetchPlanInfo = async (id: string) => {
+    const infos = await api.assetTransformPlans([id]);
+    const info = infos[0];
+    if (!info) return null;
+    setPlans((current) => ({ ...current, [id]: { plan: info.plan, revision: info.revision } }));
+    updateSummary(id, { revision: info.revision });
+    return { plan: info.plan, revision: info.revision };
+  };
+
+  /** 读取单张图片的当前配方；渐进加载尚未覆盖时按需补取。 */
+  const planInfoFor = async (id: string) => {
+    const existing = plans[id];
+    if (existing) return existing;
+    return fetchPlanInfo(id);
+  };
+
+  /** 版本冲突时刷新配方版本并重试一次，避免其他页面刚改过导致应用失败。 */
+  const savePlan = async (id: string, plan: TransformPlan, revision: number) => {
     try {
-      const result = await api.transformSave(asset.id, plan, info.revision);
-      setPlans((current) => ({ ...current, [asset.id]: { plan, revision: result.assetRevision } }));
-      updateSummary(asset.id, {
-        revision: result.assetRevision,
-        thumbVersion: result.thumbVersion,
-        outWidth: result.geometry.outWidth,
-        outHeight: result.geometry.outHeight,
-      });
-      await applyLinkedPlan(asset.id, plan);
+      return await api.transformSave(id, plan, revision);
+    } catch (error) {
+      if (normalizeError(error).code === "REVISION_CONFLICT") {
+        const fresh = await fetchPlanInfo(id);
+        if (fresh) return await api.transformSave(id, plan, fresh.revision);
+      }
+      throw error;
+    }
+  };
+
+  /** 读取保存所需版本号；不经过 plans 状态，避免刷新版本时把卡片视图拉回旧方案。 */
+  const readPlanRevision = async (id: string): Promise<number | null> => {
+    if (revisionsRef.current[id] !== undefined) return revisionsRef.current[id];
+    const existing = plans[id];
+    if (existing) {
+      revisionsRef.current[id] = existing.revision;
+      return existing.revision;
+    }
+    try {
+      const infos = await api.assetTransformPlans([id]);
+      const info = infos[0];
+      if (!info) return null;
+      revisionsRef.current[id] = info.revision;
+      setPlans((current) => ({ ...current, [id]: { plan: info.plan, revision: info.revision } }));
+      updateSummary(id, { revision: info.revision });
+      return info.revision;
+    } catch {
+      return null;
+    }
+  };
+
+  const saveWithRevision = async (id: string, plan: TransformPlan, revision: number) => {
+    try {
+      return await api.transformSave(id, plan, revision);
     } catch (saveError) {
-      notify({ tone: "danger", title: "裁剪保存失败", message: normalizeError(saveError).message });
-    } finally {
+      if (normalizeError(saveError).code === "REVISION_CONFLICT") {
+        const infos = await api.assetTransformPlans([id]);
+        const info = infos[0];
+        if (info) return await api.transformSave(id, plan, info.revision);
+      }
+      throw saveError;
+    }
+  };
+
+  const runCommitQueue = (asset: AssetSummary) => {
+    const queue = commitQueues.current.get(asset.id);
+    if (!queue || queue.running) return;
+    queue.running = true;
+    setSavingIds((current) => new Set(current).add(asset.id));
+    void (async () => {
+      while (queue.latest) {
+        const nextPlan = queue.latest;
+        queue.latest = null;
+        try {
+          const revision = await readPlanRevision(asset.id);
+          if (revision === null) {
+            notify({
+              tone: "danger",
+              title: "裁剪保存失败",
+              message: "无法读取该图片的裁剪配方，请刷新页面后重试。",
+            });
+            continue;
+          }
+          const result = await saveWithRevision(asset.id, nextPlan, revision);
+          revisionsRef.current[asset.id] = result.assetRevision;
+          // 仍有更新的方案在排队时不发布中间结果，卡片保持用户刚拖到的画面。
+          if (!queue.latest) {
+            setPlans((current) => ({
+              ...current,
+              [asset.id]: { plan: nextPlan, revision: result.assetRevision },
+            }));
+            updateSummary(asset.id, {
+              revision: result.assetRevision,
+              thumbVersion: result.thumbVersion,
+              outWidth: result.geometry.outWidth,
+              outHeight: result.geometry.outHeight,
+            });
+            await applyLinkedPlan(asset.id, nextPlan);
+          }
+        } catch (saveError) {
+          notify({
+            tone: "danger",
+            title: "裁剪保存失败",
+            message: normalizeError(saveError).message,
+          });
+        }
+      }
+      queue.running = false;
       setSavingIds((current) => {
         const next = new Set(current);
         next.delete(asset.id);
         return next;
       });
+      // 收尾与入队之间可能存在竞态，再检查一次。
+      if (queue.latest) runCommitQueue(asset);
+    })();
+  };
+
+  const commitCard = (asset: AssetSummary, plan: TransformPlan) => {
+    let queue = commitQueues.current.get(asset.id);
+    if (!queue) {
+      queue = { running: false, latest: null };
+      commitQueues.current.set(asset.id, queue);
     }
+    queue.latest = plan;
+    runCommitQueue(asset);
   };
 
   const maxGroupSelection = useMemo(() => {
@@ -373,7 +502,7 @@ export function CropBoardPage({
 
   const changeMode = (next: CropMode) => {
     if (next === "single") {
-      const first = selection[0] || workbenchId || assets[0]?.id;
+      const first = selection[0] || (assets.some((asset) => asset.id === workbenchId) ? workbenchId : assets[0]?.id);
       if (first) openWorkbench(first);
     }
     onModeChange(next);
@@ -396,7 +525,7 @@ export function CropBoardPage({
             className="btn primary crop-board-next"
             disabled={assets.length === 0}
             onClick={() => {
-              const first = selection[0] || assets[0]?.id;
+              const first = selection[0] || (assets.some((asset) => asset.id === workbenchId) ? workbenchId : assets[0]?.id);
               if (first) openWorkbench(first);
               navigate("tag");
             }}
@@ -406,6 +535,8 @@ export function CropBoardPage({
           </button>
         </div>
       </div>
+
+      {active ? <DatasetFilterBar className="crop-board-filter" /> : null}
 
       <div className="crop-board-toolbar">
         <span className={classNames("badge", selection.length > 0 ? "info" : "neutral")}>
@@ -523,7 +654,14 @@ export function CropBoardPage({
                       <button
                         type="button"
                         className="btn secondary sm"
-                        disabled={applyingGroup === section.key}
+                        disabled={applyBusy}
+                        title={
+                          applyingGroup !== null || cropJobActive
+                            ? "裁切任务进行中，请在任务列表查看进度"
+                            : pendingSaves
+                              ? "图片正在保存，请等待出现“已保存”后再应用"
+                              : "按目标尺寸裁切该分组，进度显示在任务列表"
+                        }
                         onClick={() => void applyTargetToGroup(section)}
                       >
                         {applyingGroup === section.key ? <Spinner /> : null}

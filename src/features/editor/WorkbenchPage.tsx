@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, normalizeError } from "../../lib/api";
 import type {
   AssetDetail,
@@ -25,7 +25,9 @@ import {
   normalizeKey,
   lowThumbRaw,
   normalizeTagList,
+  processedDisplayUrl,
 } from "../../lib/utils";
+import { useWarmImages } from "../../lib/imageCache";
 import { Icon } from "../../components/Icon";
 import {
   Badge,
@@ -42,9 +44,31 @@ import { CaptionPanel, type CaptionSaveState } from "./CaptionPanel";
 import { TagAssist } from "./TagAssist";
 import { InfoPanel } from "./InfoPanel";
 import { CropModeSwitch, type CropMode } from "./CropModeSwitch";
+import { DatasetFilterBar } from "../library/DatasetFilterBar";
 
 type Tab = "crop" | "caption" | "info";
 type MobileSection = "image" | "crop" | "caption" | "info";
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/** 给可能卡住的模型加载/释放加硬上限，保证批量打标入口不会永久锁死。 */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 export function WorkbenchPage({
   active,
@@ -62,9 +86,8 @@ export function WorkbenchPage({
     workbenchId,
     sequence,
     sequenceLabel,
-    setSequence,
+    refreshSequence,
     openWorkbench,
-    filter,
     notify,
     bumpRefresh,
     refreshToken,
@@ -98,15 +121,19 @@ export function WorkbenchPage({
   const [tagBatchOpen, setTagBatchOpen] = useState(false);
   const [tagModels, setTagModels] = useState<ModelInfo[]>([]);
   const [tagModelsLoading, setTagModelsLoading] = useState(false);
-  const [tagModel, setTagModel] = useState("");
+  const [tagModelIds, setTagModelIds] = useState<string[]>([]);
   const [tagBatchRunning, setTagBatchRunning] = useState(false);
   const [aiTagging, setAiTagging] = useState(false);
   const [tagBatchProgress, setTagBatchProgress] = useState<{ done: number; total: number } | null>(null);
+  const [tagBatchPhase, setTagBatchPhase] = useState<string | null>(null);
   const [aiTagActiveId, setAiTagActiveId] = useState<string | null>(null);
   const [aiTagDoneIds, setAiTagDoneIds] = useState<string[]>([]);
   const [aiTagProgress, setAiTagProgress] = useState<{ done: number; total: number } | null>(null);
   const [aiTagNote, setAiTagNote] = useState<string | null>(null);
   const aiHighlightTimer = useRef<number | undefined>(undefined);
+  /** 防止双击或状态尚未刷新时并发启动两个批量会话。 */
+  const tagBatchLock = useRef(false);
+  const aiTagLock = useRef(false);
 
   const [captionMode, setCaptionMode] = useState<CaptionMode>("tags");
   const [tags, setTags] = useState<string[]>([]);
@@ -139,7 +166,9 @@ export function WorkbenchPage({
           : "审核"
     : "审核";
   const [filmSummaries, setFilmSummaries] = useState<Record<string, AssetSummary>>({});
-  const [filmWindow, setFilmWindow] = useState({ start: 0, end: 0 });
+  /** 后台分批拉取摘要的游标，避免大图库一次性阻塞 IPC。 */
+  const filmRequestedRef = useRef(new Set<string>());
+  const filmInFlightRef = useRef(new Set<string>());
 
   const hydratedRef = useRef(false);
   const skipFlushRef = useRef(false);
@@ -164,6 +193,7 @@ export function WorkbenchPage({
 
   const triggerWord = project.triggerWord;
   const currentId = detail?.summary.id || workbenchId;
+  const sequenceSet = useMemo(() => new Set(sequence), [sequence]);
   const currentIndex = currentId ? sequence.indexOf(currentId) : -1;
   const geometry = useMemo(
     () => (plan && detail ? computeGeometry(plan, detail.normWidth, detail.normHeight) : null),
@@ -171,11 +201,14 @@ export function WorkbenchPage({
   );
   const linkedTargets = useMemo(() => {
     const ids = currentId ? [currentId, ...cropSelection] : cropSelection;
-    return Array.from(new Set(ids)).filter(Boolean);
-  }, [currentId, cropSelection]);
-  const railSelection = workspace === "crop" ? cropSelection : tagSelection;
+    return Array.from(new Set(ids)).filter((id) => id === currentId || sequenceSet.has(id));
+  }, [currentId, cropSelection, sequenceSet]);
+  const railSelection = useMemo(
+    () => (workspace === "crop" ? cropSelection : tagSelection).filter((id) => sequenceSet.has(id)),
+    [workspace, cropSelection, tagSelection, sequenceSet],
+  );
   const railAllSelected =
-    sequence.length > 0 && sequence.every((id) => railSelection.includes(id));
+    sequence.length > 0 && sequence.length === railSelection.length;
   const selectRailAll = () => {
     const next = [...sequence];
     if (workspace === "crop") setCropSelection(next);
@@ -273,22 +306,21 @@ export function WorkbenchPage({
 
   // Load asset, flushing previous edits first
   useEffect(() => {
-    if (!workbenchId) {
-      setDetail(null);
-      setPlan(null);
-      setAppliedPlan(null);
-      setLoading(false);
-      hydratedRef.current = false;
-      return;
-    }
     let cancelled = false;
     const run = async () => {
-      if (hydratedRef.current && !skipFlushRef.current) {
+      if (hydratedRef.current && (!skipFlushRef.current || assetIdRef.current !== workbenchId)) {
         await flushRef.current();
       }
-      skipFlushRef.current = false;
       if (cancelled) return;
+      skipFlushRef.current = false;
       hydratedRef.current = false;
+      if (!workbenchId) {
+        setDetail(null);
+        setPlan(null);
+        setAppliedPlan(null);
+        setLoading(false);
+        return;
+      }
       setLoading(true);
       setLoadError(null);
       try {
@@ -511,9 +543,14 @@ export function WorkbenchPage({
   }, [plan, planDirty, detail?.summary.id]);
 
   useEffect(() => {
-    if (!active || !workbenchId || workspace !== "crop") return;
+    if (!active || !workbenchId || workspace !== "crop" || !sequenceSet.has(workbenchId)) return;
     setCropSelection((current) => (current.includes(workbenchId) ? current : [...current, workbenchId]));
-  }, [active, workbenchId, workspace]);
+  }, [active, workbenchId, workspace, sequenceSet]);
+
+  useEffect(() => {
+    setCropSelection((current) => current.every((id) => sequenceSet.has(id)) ? current : current.filter((id) => sequenceSet.has(id)));
+    setTagSelection((current) => current.every((id) => sequenceSet.has(id)) ? current : current.filter((id) => sequenceSet.has(id)));
+  }, [sequenceSet]);
 
   useEffect(() => {
     setActiveTab(workspace === "tag" ? "caption" : "crop");
@@ -523,12 +560,17 @@ export function WorkbenchPage({
 
   const wasActiveRef = useRef(active);
   useEffect(() => {
-    if (active && !wasActiveRef.current && workspace === "crop") {
-      setActiveTab("crop");
-      setSideOpen(true);
-      setMobileSection("image");
-      // 瀑布流可能刚改过同一张图片，重新载入当前版本，避免用旧 revision 保存。
-      reloadDetail(true);
+    if (active && !wasActiveRef.current) {
+      if (workspace === "crop") {
+        setActiveTab("crop");
+        setSideOpen(true);
+        setMobileSection("image");
+        // 瀑布流可能刚改过同一张图片，重新载入当前版本，避免用旧 revision 保存。
+        reloadDetail(true);
+      } else if (workspace === "tag") {
+        // 裁剪页可能刚更新了同一张图的裁后版本；返回打标时重新取详情。
+        reloadDetail();
+      }
     }
     wasActiveRef.current = active;
   }, [active, workspace, reloadDetail]);
@@ -571,6 +613,8 @@ export function WorkbenchPage({
 
   // Transform preview
   useEffect(() => {
+    // 打标页直接请求裁后大图，不再生成裁剪预览。
+    if (workspace === "tag") return;
     if (!detail || !plan || !hydratedRef.current) return;
     let cancelled = false;
     setPreviewLoading(true);
@@ -594,61 +638,131 @@ export function WorkbenchPage({
   }, [plan, detail?.summary.id]);
 
   // 应用重启后恢复完整浏览序列
-  useEffect(() => {
-    if (!active || !workbenchId || sequence.length > 1) return;
-    let cancelled = false;
-    api
-      .assetIds(filter)
-      .then((ids) => {
-        if (cancelled) return;
-        if (ids.length > 1 && ids.includes(workbenchId)) {
-          setSequence(ids, S.workbench.sequenceLibrary);
-        }
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, workbenchId]);
+  // 素材摘要按批后台载入：先保证当前图附近可见，再补齐整个序列。
+  // 不再把超过 400 张的序列截断成 240 张窗口，滚动时所有图片都能出现。
+  const mergeFilmSummaries = useCallback((list: AssetSummary[]) => {
+    if (list.length === 0) return;
+    // 大序列的摘要分批到达时降低更新优先级，不打断滚动与拖动。
+    startTransition(() => {
+      setFilmSummaries((current) => {
+        const next = { ...current };
+        for (const summary of list) next[summary.id] = summary;
+        return next;
+      });
+    });
+  }, []);
 
-  // Filmstrip summaries window
+  const filmGenerationRef = useRef(0);
+  const fetchFilmSummaries = useCallback(
+    async (ids: string[], generation = filmGenerationRef.current) => {
+      const pending: string[] = [];
+      for (const id of ids) {
+        if (filmRequestedRef.current.has(id) || filmInFlightRef.current.has(id)) continue;
+        filmInFlightRef.current.add(id);
+        pending.push(id);
+      }
+      if (pending.length === 0) return;
+      try {
+        const list = await api.assetSummaries(pending);
+        for (const id of pending) {
+          filmInFlightRef.current.delete(id);
+          filmRequestedRef.current.add(id);
+        }
+        if (generation !== filmGenerationRef.current) return;
+        mergeFilmSummaries(list);
+      } catch {
+        for (const id of pending) filmInFlightRef.current.delete(id);
+      }
+    },
+    [mergeFilmSummaries],
+  );
+
   useEffect(() => {
-    if (sequence.length === 0) {
-      setFilmSummaries({});
-      setFilmWindow({ start: 0, end: 0 });
-      return;
-    }
-    const index = currentId ? sequence.indexOf(currentId) : 0;
-    const start = sequence.length > 400 ? Math.max(0, index - 120) : 0;
-    const end = sequence.length > 400 ? Math.min(sequence.length, start + 240) : sequence.length;
-    setFilmWindow({ start, end });
-    const ids = sequence.slice(start, end);
-    if (currentId && !ids.includes(currentId)) ids.push(currentId);
-    // 页面隐藏时停止拉取素材摘要，返回本页时再按当前窗口刷新。
-    if (!active) return;
+    filmGenerationRef.current += 1;
+    filmRequestedRef.current.clear();
+    filmInFlightRef.current.clear();
+    setFilmSummaries({});
+  }, [sequence]);
+
+  useEffect(() => {
+    if (!active || sequence.length === 0) return;
     let cancelled = false;
-    api
-      .assetSummaries(ids)
-      .then((list) => {
+    const index = currentId ? sequence.indexOf(currentId) : 0;
+    // 先取当前图前后各 60 张，保证首屏列表完整；其余再按顺序补齐。
+    const aroundStart = Math.max(0, index - 60);
+    const aroundEnd = Math.min(sequence.length, index + 60);
+    const ordered = [
+      ...sequence.slice(aroundStart, aroundEnd),
+      ...sequence.slice(0, aroundStart),
+      ...sequence.slice(aroundEnd),
+    ];
+    const run = async () => {
+      for (let start = 0; start < ordered.length; start += 150) {
         if (cancelled) return;
-        const map: Record<string, AssetSummary> = {};
-        list.forEach((summary) => {
-          map[summary.id] = summary;
-        });
-        setFilmSummaries(map);
-      })
-      .catch(() => undefined);
+        await fetchFilmSummaries(ordered.slice(start, start + 150));
+        if (cancelled) return;
+        // 让出一帧，避免大序列连续 IPC 阻塞滚动和图片解码。
+        await new Promise((resolve) => window.setTimeout(resolve, 24));
+      }
+    };
+    void run();
     return () => {
       cancelled = true;
     };
+    // currentId 只参与首次排序，翻页时不重新从头拉取。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sequence, currentId, refreshToken, active]);
+  }, [sequence, active, fetchFilmSummaries]);
+
+  // 保存/裁切后的刷新只重取当前附近与选中项，避免整库重新拉摘要。
+  useEffect(() => {
+    if (!active || sequence.length === 0) return;
+    const index = currentId ? sequence.indexOf(currentId) : 0;
+    const around = sequence.slice(Math.max(0, index - 12), index + 13);
+    const ids = new Set([...around, ...tagSelection]);
+    for (const id of ids) filmRequestedRef.current.delete(id);
+    void fetchFilmSummaries(Array.from(ids));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshToken, active, fetchFilmSummaries]);
 
   useEffect(() => {
     const element = filmRef.current?.querySelector<HTMLElement>(`[data-film-id="${currentId}"]`);
     element?.scrollIntoView({ block: "nearest", inline: "center" });
-  }, [currentId, filmWindow.start, filmWindow.end]);
+  }, [currentId, sequence]);
+
+  // 滚动到尚未载入摘要的区域时，优先补齐当前可见的一小段。
+  const filmScrollTimer = useRef<number | undefined>(undefined);
+  const onFilmScroll = () => {
+    if (filmScrollTimer.current) return;
+    filmScrollTimer.current = window.setTimeout(() => {
+      filmScrollTimer.current = undefined;
+      const element = filmRef.current;
+      if (!element || sequence.length === 0) return;
+      const start = Math.max(0, Math.floor(element.scrollTop / 53) - 20);
+      const end = Math.min(sequence.length, start + 140);
+      void fetchFilmSummaries(sequence.slice(start, end));
+    }, 80);
+  };
+  useEffect(
+    () => () => {
+      if (filmScrollTimer.current) window.clearTimeout(filmScrollTimer.current);
+    },
+    [],
+  );
+
+  // 打标页的大图是裁后 1600 px 版本；提前预热当前与前后两张，翻页/切页时直接复用。
+  const warmUrls = useMemo(() => {
+    if (!active || workspace !== "tag" || !currentId) return [];
+    const index = sequence.indexOf(currentId);
+    const urls: string[] = [];
+    for (let offset = -2; offset <= 2; offset += 1) {
+      const id = sequence[index + offset];
+      if (!id) continue;
+      const summary = id === currentId ? detail?.summary : filmSummaries[id];
+      if (summary) urls.push(processedDisplayUrl(summary));
+    }
+    return urls;
+  }, [active, workspace, currentId, sequence, detail, filmSummaries]);
+  useWarmImages(warmUrls, workspace === "tag");
 
   // Keyboard navigation
   useEffect(() => {
@@ -771,6 +885,21 @@ export function WorkbenchPage({
           applied += 1;
         } catch (error) {
           const normalized = normalizeError(error);
+          if (normalized.code === "REVISION_CONFLICT") {
+            try {
+              const fresh = await api.getAsset(id);
+              await api.transformSave(id, plan, fresh.summary.revision);
+              applied += 1;
+              setBatchProgress((current) => ({ done: (current?.done || 0) + 1, total: targets.length }));
+              continue;
+            } catch (retryError) {
+              failures.push(
+                `${summaries.find((item) => item.id === id)?.name || id.slice(0, 8)}：${normalizeError(retryError).message}`,
+              );
+              setBatchProgress((current) => ({ done: (current?.done || 0) + 1, total: targets.length }));
+              continue;
+            }
+          }
           failures.push(`${summaries.find((item) => item.id === id)?.name || id.slice(0, 8)}：${normalized.message}`);
         }
         setBatchProgress((current) => ({ done: (current?.done || 0) + 1, total: targets.length }));
@@ -820,7 +949,19 @@ export function WorkbenchPage({
       const captionOk = await saveCaptionNow();
       if (!captionOk) return false;
       const id = detail.summary.id;
-      const result = await api.transformSave(id, plan, revisionRef.current);
+      let result: Awaited<ReturnType<typeof api.transformSave>>;
+      try {
+        result = await api.transformSave(id, plan, revisionRef.current);
+      } catch (error) {
+        // 其他页面刚改过同一张图时，刷新到最新版本再重试一次。
+        if (normalizeError(error).code === "REVISION_CONFLICT") {
+          const fresh = await api.getAsset(id);
+          revisionRef.current = fresh.summary.revision;
+          result = await api.transformSave(id, plan, revisionRef.current);
+        } else {
+          throw error;
+        }
+      }
       if (assetIdRef.current !== id) return false;
       revisionRef.current = result.assetRevision;
       setAppliedPlan(plan);
@@ -893,7 +1034,7 @@ export function WorkbenchPage({
       .filter(
         (item) =>
           item.status === "available" &&
-          (item.kind === "wd14-tagger" || item.kind === "caption"),
+          (item.kind === "wd14-tagger" || item.kind === "caption" || item.kind === "vlm"),
       )
       .sort((a, b) => {
         const rank = (kind: string) => (kind === "caption" ? 0 : 1);
@@ -901,11 +1042,11 @@ export function WorkbenchPage({
       });
     setTagModels(available);
     const preferred = available.find((item) => item.kind === "wd14-tagger") || available[0];
-    setTagModel((current) =>
-      current && available.some((item) => item.id === current)
-        ? current
-        : preferred?.id || "",
-    );
+    setTagModelIds((current) => {
+      const valid = current.filter((id) => available.some((item) => item.id === id));
+      if (valid.length > 0) return valid;
+      return preferred ? [preferred.id] : [];
+    });
     return available;
   }, []);
 
@@ -939,48 +1080,64 @@ export function WorkbenchPage({
 
   const splitSentencePhrases = (text: string) =>
     text
-      .replace(/([.!?。！？])\s*/g, "$1\n")
-      .split(/\n+/)
+      .trim()
+      .split(/(?<=[.!?。！？])(?=\s+|$)|\n+/)
       .map((sentence) => sentence.replace(/[.!?。！？]+$/g, "").trim())
       .filter(Boolean);
 
-  const augmentCaptionWithModel = async (assetId: string, modelId: string) => {
+  const captionSentences = (text: string) =>
+    text.trim().split(/(?<=[.!?。！？])(?=\s+|$)|\n+/).map((sentence) => sentence.trim()).filter(Boolean);
+
+  const augmentCaptionWithModels = async (assetId: string, modelIds: string[]) => {
     const detail = await api.getAsset(assetId);
     const suggestion = await api.generateSuggestion({
       assetId,
-      model: modelId,
+      models: modelIds,
       threshold: 0.35,
       characterThreshold: 0.85,
     });
     const incoming = [...suggestion.tags];
-    if (suggestion.text.trim()) incoming.push(...splitSentencePhrases(suggestion.text));
+    if (!suggestion.visionLanguage && suggestion.text.trim()) incoming.push(...splitSentencePhrases(suggestion.text));
 
     const existingText = detail.caption.text.trim();
-    const existingTextKey = phraseKey(existingText);
     const seen = new Set(detail.caption.tags.map(phraseKey));
+    const sentences = new Set(captionSentences(existingText).map(phraseKey));
     const addedPhrases: string[] = [];
     for (const raw of incoming) {
       const phrase = raw.trim();
       const key = phraseKey(phrase);
-      if (!key || seen.has(key) || (existingTextKey && existingTextKey.includes(key))) continue;
+      if (!key || seen.has(key) || sentences.has(key)) continue;
       seen.add(key);
       addedPhrases.push(phrase);
     }
-    if (addedPhrases.length === 0) {
-      return { added: 0, saved: 0 };
+    const addedSentences: string[] = [];
+    if (suggestion.visionLanguage) {
+      for (const sentence of captionSentences(suggestion.text)) {
+        const key = phraseKey(sentence);
+        if (!key || sentences.has(key)) continue;
+        sentences.add(key);
+        addedSentences.push(/[.!?]$/.test(sentence) ? sentence : sentence + ".");
+      }
     }
+    if (!addedPhrases.length && !addedSentences.length) {
+      return { added: 0, sentences: 0, historySeq: null };
+    }
+    const mergedText = [existingText, addedSentences.join(" ")].filter(Boolean).join("\n\n");
     const merged = normalizeTagList([...detail.caption.tags, ...addedPhrases]);
     const mode: CaptionMode =
-      merged.length > 0 && existingText ? "mixed" : merged.length > 0 ? "tags" : existingText ? "nl" : "tags";
-    await api.saveCaption({
+      merged.length > 0 && mergedText ? "mixed" : merged.length > 0 ? "tags" : "nl";
+    if (assetIdRef.current === assetId && captionRef.current.dirty) {
+      throw new Error("打标期间图片标注已编辑，请保存后重新打标。");
+    }
+    const saved = await api.saveCaption({
       assetId,
       mode,
       tags: merged,
-      text: existingText,
+      text: mergedText,
       expectedRevision: detail.summary.revision,
       source: "suggestion",
     });
-    return { added: addedPhrases.length, saved: 1 };
+    return { added: addedPhrases.length, sentences: addedSentences.length, historySeq: saved.historySeq };
   };
 
   const openTagBatch = async () => {
@@ -991,7 +1148,7 @@ export function WorkbenchPage({
     } catch (error) {
       notify({
         tone: "danger",
-        title: "读取本地模型失败",
+        title: "读取打标模型失败",
         message: normalizeError(error).message,
       });
     } finally {
@@ -1000,8 +1157,9 @@ export function WorkbenchPage({
   };
 
   const runAiTagCurrent = async () => {
-    if (!currentId || !tagModel || aiTagging || tagBatchRunning) return;
+    if (!currentId || tagModelIds.length === 0 || aiTagLock.current || tagBatchLock.current) return;
     const runId = currentId;
+    aiTagLock.current = true;
     if (aiHighlightTimer.current) window.clearTimeout(aiHighlightTimer.current);
     setAiTagging(true);
     setAiTagNote(null);
@@ -1009,16 +1167,17 @@ export function WorkbenchPage({
     setAiTagActiveId(currentId);
     setAiTagProgress({ done: 0, total: 1 });
     try {
-      const result = await augmentCaptionWithModel(runId, tagModel);
-      if (result.saved > 0) {
+      if (!(await saveCaptionNow()) || assetIdRef.current !== runId) return;
+      const result = await augmentCaptionWithModels(runId, tagModelIds);
+      if (result.historySeq !== null) {
         bumpRefresh();
-        reloadDetail(true);
+        if (assetIdRef.current === runId && !captionRef.current.dirty) reloadDetail(true);
       }
       if (assetIdRef.current === runId) {
         setAiTagNote(
-          result.added > 0
-            ? `已新增 ${result.added} 条短语`
-            : "没有新增短语（重复项已剔除）",
+          result.historySeq !== null
+            ? `已新增 ${[result.added ? `${result.added} 条短语` : "", result.sentences ? `${result.sentences} 句描述` : ""].filter(Boolean).join("、")}`
+            : "没有新增标注",
         );
       }
       setAiTagDoneIds([runId]);
@@ -1026,6 +1185,7 @@ export function WorkbenchPage({
     } catch (error) {
       notify({ tone: "danger", title: "AI 打标失败", message: normalizeError(error).message });
     } finally {
+      aiTagLock.current = false;
       setAiTagging(false);
       setAiTagActiveId(null);
       aiHighlightTimer.current = window.setTimeout(() => {
@@ -1036,59 +1196,80 @@ export function WorkbenchPage({
   };
 
   const runTagBatch = async () => {
-    const targets = Array.from(new Set(tagSelection.filter(Boolean)));
-    if (!tagModel || targets.length === 0) return;
-    const captionOk = await saveCaptionNow();
-    if (!captionOk) return;
+    const targets = railSelection;
+    if (!tagModelIds.length || targets.length === 0 || tagBatchLock.current || aiTagLock.current) return;
+    tagBatchLock.current = true;
+    if (!(await saveCaptionNow())) {
+      tagBatchLock.current = false;
+      return;
+    }
+    const localModelIds = tagModelIds.filter((id) => !id.startsWith("vlm:"));
     if (aiHighlightTimer.current) window.clearTimeout(aiHighlightTimer.current);
     setTagBatchOpen(false);
     setTagBatchRunning(true);
     setTagBatchProgress({ done: 0, total: targets.length });
     setAiTagDoneIds([]);
     setAiTagProgress({ done: 0, total: targets.length });
-    let saved = 0;
-    const failures: string[] = [];
+    const historySeqs: number[] = [];
+    let failed = 0;
+    let firstFailure = "";
     try {
-      const summaries = await api.assetSummaries(targets);
-      const byId = new Map(summaries.map((item) => [item.id, item]));
-      for (const [index, id] of targets.entries()) {
-        const summary = byId.get(id);
-        if (!summary) {
-          failures.push(`${id.slice(0, 8)}：图片已不存在`);
-          setTagBatchProgress({ done: index + 1, total: targets.length });
-          setAiTagProgress({ done: index + 1, total: targets.length });
-          continue;
+      // 整批只加载一次模型，所有图片处理完后在 finally 中释放。
+      // begin 内部会先清理上一次可能残留的常驻进程。
+      if (localModelIds.length) {
+        setTagBatchPhase("加载模型中…");
+        try {
+          await withTimeout(
+            api.taggerBatchBegin(localModelIds),
+            15 * 60 * 1000,
+            "模型加载超时，请检查模型文件或改用更小的模型。",
+          );
+        } catch (error) {
+          notify({
+            tone: "warning",
+            title: "模型常驻加载失败",
+            message: `${normalizeError(error).message}。将继续逐张加载。`,
+          });
         }
+      }
+      setTagBatchPhase(null);
+      for (const [index, id] of targets.entries()) {
         setAiTagActiveId(id);
         try {
-          const result = await augmentCaptionWithModel(id, tagModel);
-          saved += result.saved;
-          setAiTagDoneIds((current) => (current.includes(id) ? current : [...current, id]));
+          const result = await augmentCaptionWithModels(id, tagModelIds);
+          if (result.historySeq !== null) historySeqs.push(result.historySeq);
+          setAiTagDoneIds((current) => [...current.slice(-99), id]);
         } catch (error) {
-          failures.push(`${summary.name}：${normalizeError(error).message}`);
+          failed += 1;
+          if (!firstFailure) {
+            const summary = (await api.assetSummaries([id]).catch(() => []))[0];
+            firstFailure = `${summary?.name ?? id.slice(0, 8)}：${normalizeError(error).message}`;
+          }
         }
         setAiTagActiveId(null);
         setTagBatchProgress({ done: index + 1, total: targets.length });
         setAiTagProgress({ done: index + 1, total: targets.length });
       }
-      if (saved > 0) {
+      const saved = historySeqs.length;
+      if (saved) {
         bumpRefresh();
-        if (currentId && targets.includes(currentId)) reloadDetail(true);
+        const current = assetIdRef.current;
+        if (current && targets.includes(current) && !captionRef.current.dirty) reloadDetail(true);
       }
       notify({
-        tone: failures.length > 0 ? "warning" : "success",
+        tone: failed ? "warning" : "success",
         title: "批量打标完成",
         message:
           saved > 0
-            ? `已为 ${saved} 张补充标注${failures.length > 0 ? `，${failures.length} 张失败：${failures[0]}` : ""}`
-            : `没有新增短语${failures.length > 0 ? `，${failures.length} 张失败：${failures[0]}` : ""}`,
+            ? `已为 ${saved} 张补充标注${failed ? `，${failed} 张失败：${firstFailure}` : ""}`
+            : `没有新增标注${failed ? `，${failed} 张失败：${firstFailure}` : ""}`,
         actionLabel: saved > 0 ? "撤销本批打标" : undefined,
         onAction:
           saved > 0
             ? async () => {
                 try {
-                  for (let index = 0; index < saved; index += 1) {
-                    await api.undo();
+                  for (let index = historySeqs.length - 1; index >= 0; index -= 1) {
+                    await api.undo(historySeqs[index]);
                   }
                   bumpRefresh();
                   reloadDetail(true);
@@ -1102,9 +1283,18 @@ export function WorkbenchPage({
     } catch (error) {
       notify({ tone: "danger", title: "批量打标失败", message: normalizeError(error).message });
     } finally {
+      try {
+        // 无论常驻加载是否成功都清理一次：超时的 begin 可能在后台晚到并回填会话。
+        // 释放最多等 4 秒，超时也不能让批次入口一直停在“运行中”。
+        await Promise.race([api.taggerBatchEnd().catch(() => undefined), delay(4000)]);
+      } catch {
+        // 释放失败不覆盖批次结果；下次开始时也会清理残留会话。
+      }
       setAiTagActiveId(null);
       setTagBatchRunning(false);
       setTagBatchProgress(null);
+      setTagBatchPhase(null);
+      tagBatchLock.current = false;
       aiHighlightTimer.current = window.setTimeout(() => {
         setAiTagDoneIds([]);
         setAiTagProgress(null);
@@ -1244,17 +1434,6 @@ export function WorkbenchPage({
     }
   };
 
-  const refreshSequence = async () => {
-    try {
-      const ids = await api.assetIds(filter);
-      const next = currentId && !ids.includes(currentId) ? [currentId, ...ids] : ids;
-      setSequence(next, S.workbench.sequenceLibrary);
-      notify({ message: `浏览序列已刷新（${next.length} 张）` });
-    } catch (error) {
-      notify({ tone: "danger", message: normalizeError(error).message });
-    }
-  };
-
   const openSide = (tab: Tab) => {
     setActiveTab(tab);
     setSideOpen(true);
@@ -1313,13 +1492,23 @@ export function WorkbenchPage({
           ? "未保存"
           : S.common.saved;
 
-  const filmItems = sequence.slice(filmWindow.start, filmWindow.end);
+  const filmItems = sequence;
   const canPrev = Boolean(currentIndex > 0);
   const canNext = Boolean(currentIndex >= 0 && currentIndex < sequence.length - 1);
+  const cropFilter = active && workspace === "crop"
+    ? <DatasetFilterBar className="crop-workbench-filter" />
+    : null;
 
   if (!workbenchId) {
     return (
       <div className="page">
+        {workspace === "crop" ? (
+          <div className="row-wrap crop-workbench-title">
+            <h1 className="page-title">裁剪</h1>
+            {cropMode && onCropModeChange ? <CropModeSwitch mode={cropMode} onChange={onCropModeChange} /> : null}
+          </div>
+        ) : null}
+        {cropFilter}
         <EmptyState
           icon="workbench"
           title={S.workbench.noImage}
@@ -1346,9 +1535,11 @@ export function WorkbenchPage({
       <div className="workbench">
         <div className="wb-head">
           <div className="wb-title">
+            {workspace === "crop" ? <span className="wb-step-label">裁剪</span> : null}
             <Spinner /> <span className="small muted">正在载入图片…</span>
           </div>
         </div>
+        {cropFilter}
         <div className="wb-body">
           <div className="wb-canvas-wrap">
             <div className="skeleton" style={{ height: 48, margin: 12 }} />
@@ -1370,6 +1561,8 @@ export function WorkbenchPage({
   if (loadError || !detail || !plan || !geometry) {
     return (
       <div className="page">
+        {workspace === "crop" ? <h1 className="page-title">裁剪</h1> : null}
+        {cropFilter}
         <EmptyState
           icon="alert"
           title={S.errors.generic}
@@ -1466,6 +1659,8 @@ export function WorkbenchPage({
         </div>
       </div>
 
+      {cropFilter}
+
       <div className="wb-mobile-tabs">
         <button type="button" className={mobileSection === "image" ? "active" : ""} onClick={() => selectMobile("image")}>
           图片
@@ -1496,7 +1691,7 @@ export function WorkbenchPage({
             </div>
             {aiTagProgress ? (
               <span className="wb-rail-ai-progress" role="status">
-                AI 打标 {aiTagProgress.done}/{aiTagProgress.total}
+                {tagBatchPhase || `AI 打标 ${aiTagProgress.done}/${aiTagProgress.total}`}
               </span>
             ) : (
               <span
@@ -1537,7 +1732,7 @@ export function WorkbenchPage({
               </button>
             </div>
           </div>
-          <div className="wb-rail-list" ref={filmRef}>
+          <div className="wb-rail-list" ref={filmRef} onScroll={onFilmScroll}>
             {filmItems.map((id, index) => {
               const summary = filmSummaries[id];
               const checked = railSelection.includes(id);
@@ -1554,6 +1749,7 @@ export function WorkbenchPage({
                     aiActive && "ai-active",
                     aiDone && "ai-done",
                   )}
+                  data-film-id={id}
                   onPointerEnter={() => railDragEnter(id)}
                 >
                   <button
@@ -1579,8 +1775,17 @@ export function WorkbenchPage({
                   </button>
                   <button type="button" className="wb-rail-main" onClick={() => { openWorkbench(id); setMobileRailOpen(false); }} title={summary?.name || id}>
                     <span className="wb-rail-thumb">
-                      {summary ? <img src={lowThumbRaw(summary.id, summary.thumbVersion)} alt="" loading="lazy" /> : null}
-                      <span className="wb-rail-index">{filmWindow.start + index + 1}</span>
+                      {summary ? (
+                        <img
+                          src={lowThumbRaw(summary.id, summary.thumbVersion)}
+                          alt=""
+                          loading="lazy"
+                          decoding="async"
+                        />
+                      ) : (
+                        <span className="wb-rail-thumb-placeholder" aria-hidden />
+                      )}
+                      <span className="wb-rail-index">{index + 1}</span>
                       {aiActive ? (
                         <span className="wb-rail-ai-badge active" aria-label="AI 打标中">
                           <Spinner />
@@ -1666,16 +1871,18 @@ export function WorkbenchPage({
                 批量打标
               </button>
               <span className="hint tag-batch-hint">
-                {aiTagActiveId
-                  ? `正在打标 ${filmSummaries[aiTagActiveId]?.name || "当前图片"}`
-                  : aiTagging
-                    ? "正在为当前图片补充短语"
-                    : `选中 ${tagSelection.length} 张 · 单图 AI 在标注列`}
+                {tagBatchPhase
+                  ? `正在加载 ${tagModelIds.length} 个打标模型…`
+                  : aiTagActiveId
+                    ? `正在打标 ${filmSummaries[aiTagActiveId]?.name || "当前图片"}`
+                    : aiTagging
+                      ? "正在为当前图片补充短语"
+                      : `选中 ${tagSelection.length} 张 · 单图 AI 在标注列`}
               </span>
               <div className="spacer" />
               {aiTagProgress ? (
                 <span className="tag-ai-progress">
-                  AI {aiTagProgress.done}/{aiTagProgress.total}
+                  {tagBatchPhase ? "加载模型" : `AI ${aiTagProgress.done}/${aiTagProgress.total}`}
                 </span>
               ) : null}
               {tagBatchProgress ? (
@@ -1773,11 +1980,11 @@ export function WorkbenchPage({
                   triggerWord={triggerWord}
                   triggerDisabled={detail.summary.triggerDisabled}
                   aiModels={tagModels}
-                  aiModel={tagModel}
+                  aiModelIds={tagModelIds}
                   aiModelsLoading={tagModelsLoading}
-                  aiBusy={aiTagging}
+                    aiBusy={aiTagging || tagBatchRunning}
                   aiNote={aiTagNote}
-                  onAiModelChange={setTagModel}
+                  onAiModelsChange={setTagModelIds}
                   onAiTag={() => void runAiTagCurrent()}
                   onChange={updateCaption}
                   onToggleTrigger={(disabled) => void toggleTrigger(disabled)}
@@ -1793,7 +2000,7 @@ export function WorkbenchPage({
           <TagAssist
             active={active}
             currentId={currentId}
-            selectedIds={tagSelection}
+            selectedIds={railSelection}
             refreshToken={refreshToken}
             onAddToCurrent={addTagsToCurrent}
             beforeBulk={saveCaptionNow}
@@ -1943,7 +2150,7 @@ export function WorkbenchPage({
           if (!tagBatchRunning) setTagBatchOpen(false);
         }}
         title="批量打标"
-        subtitle={`向 ${tagSelection.length} 张图片追加标注，自动去重。`}
+        subtitle={`向 ${railSelection.length} 张图片追加标注`}
         width="wide"
         footer={
           <>
@@ -1953,7 +2160,7 @@ export function WorkbenchPage({
             <button
               type="button"
               className="btn primary"
-              disabled={!tagModel || tagSelection.length === 0}
+              disabled={tagModelsLoading || tagModelIds.length === 0 || railSelection.length === 0}
               onClick={() => void runTagBatch()}
             >
               <Icon name="sparkles" />
@@ -1964,12 +2171,12 @@ export function WorkbenchPage({
       >
         {tagModelsLoading ? (
           <div className="tag-model-loading">
-            <Spinner /> 正在读取本地 WD14 模型…
+            <Spinner /> 正在读取打标模型…
           </div>
         ) : tagModels.length === 0 ? (
           <>
             <Notice tone="warning">
-              暂无可用模型。请先下载 WD14 标签模型，或打开模型设置指定模型目录。
+              暂无可用模型。可在设置中接入视觉服务或下载标签模型。
             </Notice>
             <div className="row" style={{ justifyContent: "flex-end", marginTop: 10 }}>
               <button
@@ -1986,34 +2193,61 @@ export function WorkbenchPage({
             </div>
           </>
         ) : (
-          <div className="model-download-list">
-            {tagModels.map((item) => (
-              <label
-                key={item.id}
-                className={classNames("model-download-row", tagModel === item.id && "selected")}
+          <>
+            <div className="row" style={{ alignItems: "center", marginBottom: 8 }}>
+              <span className="hint">已选 {tagModelIds.length} 个模型，合并新增标签和描述</span>
+              <span className="spacer" />
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => setTagModelIds(tagModels.map((item) => item.id))}
               >
-                <input
-                  type="radio"
-                  name="tag-batch-model"
-                  value={item.id}
-                  checked={tagModel === item.id}
-                  onChange={() => setTagModel(item.id)}
-                />
-                <span className="grow">
-                  <span className="model-download-name">{item.name}</span>
-                  <span className="model-download-meta">
-                    {modelKindLabel(item)} · {item.version} · {formatBytes(item.sizeBytes)} ·{" "}
-                    {item.device}
+                全选
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => setTagModelIds([])}
+              >
+                清空
+              </button>
+            </div>
+            <div className="model-download-list">
+              {tagModels.map((item) => (
+                <label
+                  key={item.id}
+                  className={classNames(
+                    "model-download-row",
+                    tagModelIds.includes(item.id) && "selected",
+                  )}
+                >
+                  <input
+                    type="checkbox"
+                    checked={tagModelIds.includes(item.id)}
+                    onChange={() =>
+                      setTagModelIds((current) =>
+                        current.includes(item.id)
+                          ? current.filter((id) => id !== item.id)
+                          : [...current, item.id],
+                      )
+                    }
+                  />
+                  <span className="grow">
+                    <span className="model-download-name">{item.name}</span>
+                    <span className="model-download-meta">
+                      {modelKindLabel(item)} · {item.version} · {item.sizeBytes > 0 ? `${formatBytes(item.sizeBytes)} · ` : ""}
+                      {item.device}
+                    </span>
+                    <span className="model-download-note">{modelDescription(item)}</span>
                   </span>
-                  <span className="model-download-note">{modelDescription(item)}</span>
-                </span>
-              </label>
-            ))}
-          </div>
+                </label>
+              ))}
+            </div>
+          </>
         )}
-        <Notice tone="info">
-          WD14 生成短语标签，Florence-2 生成自然语言描述并按句拆成多条短语；建议会追加到现有标注并剔除重复项，图片不会上传。Florence-2 需要 Python 安装 torch、transformers、einops，并可在设置中指定该 Python 路径。
-        </Notice>
+        {tagModels.some((item) => tagModelIds.includes(item.id) && item.device === "云端服务") ? (
+          <Notice tone="info">选中的云端服务会接收这些图片的裁剪版本。</Notice>
+        ) : null}
       </Modal>
     </div>
   );

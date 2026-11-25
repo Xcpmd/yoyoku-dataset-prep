@@ -1,5 +1,5 @@
 use crate::error::AppResult;
-use crate::exports::{ExportItem, ADAPTER_VERSION, DIFFUSERS_COMPAT, KOHYA_COMPAT};
+use crate::exports::{ExportItem, ADAPTER_VERSION, DIFFUSERS_COMPAT, KOHYA_COMPAT, LORA_SCRIPT_COMPAT};
 use crate::model::*;
 use crate::util;
 use serde_json::json;
@@ -100,7 +100,9 @@ pub fn manifest_json(
     let subsets: Vec<serde_json::Value> = {
         let mut map: std::collections::BTreeMap<String, (String, u32, i64)> = Default::default();
         for item in items.iter().filter(|i| i.split == "train") {
-            let key = if item.subset.is_empty() {
+            let key = if config.target == "lora_script" {
+                item.subset.clone()
+            } else if item.subset.is_empty() {
                 "train".to_string()
             } else {
                 format!("train/{}", item.subset)
@@ -116,12 +118,17 @@ pub fn manifest_json(
             })
             .collect()
     };
+    let upstream = match config.target.as_str() {
+        "kohya" => KOHYA_COMPAT,
+        "imagefolder" => DIFFUSERS_COMPAT,
+        _ => LORA_SCRIPT_COMPAT,
+    };
     let manifest = json!({
         "manifestVersion": 1,
         "app": format!("yoyoku-dataset-prep/{}", env!("CARGO_PKG_VERSION")),
         "adapter": config.target,
         "adapterVersion": ADAPTER_VERSION,
-        "upstream": if config.target == "kohya" { KOHYA_COMPAT } else { DIFFUSERS_COMPAT },
+        "upstream": upstream,
         "baseModel": model,
         "outputName": output_name,
         "snapshotFingerprint": fingerprint,
@@ -152,6 +159,7 @@ pub fn manifest_json(
 
 pub fn readme_content(
     config: &ExportConfig,
+    items: &[ExportItem],
     split: &SplitSummary,
     output_name: &str,
     model: &str,
@@ -207,7 +215,7 @@ SD 1.5 LoRA 可将脚本替换为 `train_network.py`。相对路径 `image_dir` 
                 "未启用验证集。".to_string()
             },
         )
-    } else {
+    } else if config.target == "imagefolder" {
         format!(
 r#"# {output_name}
 
@@ -262,6 +270,64 @@ SD 1.5 使用 `train_text_to_image_lora.py`。验证目录供后续验证流程�
                 "未启用验证集。".to_string()
             },
         )
+    } else {
+        let mut groups: std::collections::BTreeMap<String, (String, u32, i64)> = Default::default();
+        for item in items.iter().filter(|item| item.split == "train") {
+            let entry = groups
+                .entry(item.subset.clone())
+                .or_insert((item.subset_label.clone(), item.repeats.max(1), 0));
+            entry.2 += 1;
+        }
+        let mut tree = String::new();
+        for (dir, (label, repeats, count)) in groups.iter().take(8) {
+            tree.push_str(&format!("  {dir}/\n"));
+            if groups.len() <= 8 {
+                tree.push_str(&format!(
+                    "    # {label} · 单图训练 {repeats} 次 · {count} 张\n"
+                ));
+            }
+        }
+        if groups.len() > 8 {
+            tree.push_str(&format!("  … 共 {} 个分组目录\n", groups.len()));
+        }
+        if groups.is_empty() {
+            tree.push_str("  1_未分组/\n");
+        }
+        let ungrouped = items
+            .iter()
+            .find(|item| item.subset_label == "未分组")
+            .map(|item| item.subset.clone())
+            .unwrap_or_else(|| {
+                format!("{}_未分组", config.lora_script.ungrouped_repeats.max(1))
+            });
+        format!(
+r#"# {output_name}
+
+由 Yoyoku Dataset Prep 生成。目标训练端：lora_script。
+基础模型：{model}。适配器版本：{ADAPTER_VERSION}。
+
+## 目录结构
+
+```text
+{output_name}/
+{tree}  manifest.json
+  README.md
+```
+
+每个分组目录内是一组「图片 + 同名 `.txt`」，例如 `000001.jpg` 与 `000001.txt`。
+目录名前缀是该分组每张图片的训练次数（`单图训练次数_分组名`），训练端可直接按文件夹
+批量读取；不属于任何分组的图片进入 `{ungrouped}`。训练图片共 {train} 张。
+
+## 说明
+
+- 每个分组是一个独立训练子集，可分别设置单图训练次数。
+- 标注固定为同名 `.txt`，与图片同目录。
+- 本次导出已完成计数、图片解码、图片/标注配对与清单一致性校验。
+"#,
+            tree = tree,
+            train = split.train,
+            ungrouped = ungrouped,
+        )
     }
 }
 
@@ -276,7 +342,7 @@ pub fn fill_preview_files(
     if config.target == "kohya" {
         let toml = toml_content(config, items);
         files.push(PreviewFile { path: "dataset.toml".into(), content: Some(toml.clone()), kind: "toml".into() });
-    } else {
+    } else if config.target == "imagefolder" {
         for split in ["train", "validation"] {
             let content = jsonl_content(items, split);
             files.push(PreviewFile {
@@ -286,7 +352,7 @@ pub fn fill_preview_files(
             });
         }
     }
-    let readme = readme_content(config, &preview.split, &Path::new(&preview.output_path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), model);
+    let readme = readme_content(config, items, &preview.split, &Path::new(&preview.output_path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), model);
     files.push(PreviewFile { path: "README.md".into(), content: Some(readme), kind: "readme".into() });
     let manifest_sample = json!({
         "manifestVersion": 1,

@@ -51,6 +51,25 @@ export function displayUrl(assetId: string, version: string): string {
   return `${ASSET_BASE}/display/${assetId}/${safeVersion}`;
 }
 
+/** 裁后大图：按已应用的裁剪配方渲染 1600 px WebP。 */
+export function processedDisplayUrl(
+  asset: Pick<AssetSummary, "id" | "thumbVersion">,
+): string {
+  return displayUrl(asset.id, `proc-${asset.thumbVersion}`);
+}
+
+/** 放大查看用的 2560 px 裁后大图，仅在画布高倍缩放时请求。 */
+export function hdProcessedDisplayUrl(
+  asset: Pick<AssetSummary, "id" | "thumbVersion">,
+): string {
+  return displayUrl(asset.id, `hd-proc-${asset.thumbVersion}`);
+}
+
+/** 放大查看用的 2560 px 原图大图。 */
+export function hdSourceDisplayUrl(asset: { id: string; sha256: string }): string {
+  return displayUrl(asset.id, `hd-src-${asset.sha256.slice(0, 10)}`);
+}
+
 export function previewUrl(path: string): string {
   return `${ASSET_BASE}${path.startsWith("/") ? path : `/${path}`}`;
 }
@@ -219,7 +238,13 @@ export function filterActiveCount(filter: AssetFilter): number {
   if (filter.recycledOnly) count += 1;
   if (filter.minShortEdge) count += 1;
   if (filter.maxShortEdge) count += 1;
+  if (filter.expression) count += filterRuleCount(filter.expression);
   return count;
+}
+
+export function filterRuleCount(expression: import("./types").FilterExpression): number {
+  if (expression.kind === "rule") return 1;
+  return expression.children.reduce((count, child) => count + filterRuleCount(child), 0);
 }
 
 export function defaultPlan(baseResolution: number): TransformPlan {

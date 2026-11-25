@@ -18,6 +18,7 @@ import type {
   CaptionTagState,
   CollectionInfo,
   ConvertPreview,
+  CropApplyStart,
   DedupeActionResult,
   DedupeRecycled,
   DedupeScan,
@@ -50,6 +51,7 @@ import type {
   StorageStats,
   SuggestionInfo,
   SuggestionResult,
+  TaggerBatchInfo,
   TagBulkRequest,
   TagBulkResult,
   TagTotalsResult,
@@ -58,6 +60,10 @@ import type {
   TransformPlan,
   TransformSaveResult,
   WorkerPing,
+  VisionConfiguration,
+  VisionConnection,
+  VisionModel,
+  VisionPreferences,
 } from "./types";
 
 export class ApiError extends Error {
@@ -178,7 +184,8 @@ export const api = {
     call<AssetsPage>("assets_query", {
       req: { filter, sort, offset, limit, cursor: cursor || null },
     }),
-  assetIds: (filter: AssetFilter) => call<string[]>("assets_ids", { filter }),
+  assetIds: (filter: AssetFilter, withinIds?: string[]) => call<string[]>("assets_ids", { filter, withinIds }),
+  validateAssetFilter: (filter: AssetFilter) => call<void>("assets_filter_validate", { filter }),
   getAsset: (id: string) => call<AssetDetail>("asset_get", { id }),
   assetSummaries: (ids: string[]) => call<AssetSummary[]>("assets_summaries", { ids }),
   assetTransformPlans: (ids: string[]) => call<AssetPlanInfo[]>("assets_transform_plans", { ids }),
@@ -192,9 +199,9 @@ export const api = {
 
   batchPreview: (req: BatchRequest) => call<BatchPreview>("batch_preview", { req }),
   batchApply: (previewId: string) => call<BatchResult>("batch_apply", { previewId }),
-  undo: () =>
+  undo: (expectedSeq?: number) =>
     call<{ label: string; seq: number; commandType: string; redoable: boolean; affectedIds: string[] } | null>(
-      "undo",
+      "undo", { expectedSeq },
     ),
   redo: () =>
     call<{ label: string; seq: number; commandType: string; redoable: boolean; affectedIds: string[] } | null>(
@@ -226,6 +233,13 @@ export const api = {
     call<TransformPreview>("transform_preview", { req: { assetId, plan, maxSide } }),
   transformSave: (assetId: string, plan: TransformPlan, expectedRevision: number) =>
     call<TransformSaveResult>("transform_save", { req: { assetId, plan, expectedRevision } }),
+  cropApplyBatch: (req: {
+    assetIds: string[];
+    width: number;
+    height: number;
+    collectionId?: string | null;
+    title?: string;
+  }) => call<CropApplyStart>("crop_apply_batch", { req }),
   saveDraft: (assetId: string, plan: TransformPlan) =>
     call<{ draftRevisionId: string | null; savedAt: string | null }>("transform_draft_save", {
       assetId,
@@ -262,9 +276,13 @@ export const api = {
   generateSuggestion: (req: {
     assetId: string;
     model?: string;
+    models?: string[];
     threshold?: number;
     characterThreshold?: number;
   }) => call<SuggestionResult>("suggestion_generate", { req }),
+  taggerBatchBegin: (models: string[]) =>
+    call<TaggerBatchInfo>("tagger_batch_begin", { req: { models } }),
+  taggerBatchEnd: () => call<void>("tagger_batch_end"),
   applySuggestion: (revisionId: string, expectedRevision: number) =>
     call<CaptionSaveResult>("suggestion_apply", { req: { revisionId, expectedRevision } }),
 
@@ -315,6 +333,7 @@ export const api = {
   openExportOutput: (recordId: string) => call<void>("export_open_output", { recordId }),
 
   jobs: () => call<JobInfo[]>("jobs_list"),
+  clearFinishedJobs: () => call<number>("jobs_clear_finished"),
   pauseJob: (jobId: string) => call<void>("jobs_pause", { jobId }),
   resumeJob: (jobId: string) => call<ImportResult | null>("jobs_resume", { jobId }),
   cancelJob: (jobId: string) => call<void>("jobs_cancel", { jobId }),
@@ -334,6 +353,15 @@ export const api = {
     call<CachedTranslation[]>("translation_cache_get", { texts, to }),
 
   models: () => call<ModelInfo[]>("models_list"),
+  visionConfiguration: () => call<VisionConfiguration>("vlm_configuration"),
+  visionSavePreferences: (preferences: VisionPreferences) =>
+    call<void>("vlm_preferences_save", { preferences }),
+  visionSaveConnection: ({ hasKey: _hasKey, verifiedModels: _verifiedModels, ...connection }: VisionConnection, key?: string) =>
+    call<VisionConnection>("vlm_connection_save", { connection, key: key ?? null }),
+  visionRemoveConnection: (id: string) => call<void>("vlm_connection_remove", { id }),
+  visionDiscover: (id: string) => call<VisionModel[]>("vlm_models_discover", { id }),
+  visionVerify: (id: string, model: string) => call<VisionModel>("vlm_model_verify", { id, model }),
+  visionTestPrompt: (id: string, model: string) => call<{ tags: string[]; caption: string }>("vlm_prompt_test", { id, model }),
   modelCatalog: () => call<ModelCatalogEntry[]>("models_catalog"),
   downloadModel: (modelId: string) => call<ModelDownloadResult>("model_download", { modelId }),
   openModelsDir: () => call<void>("models_open_dir"),

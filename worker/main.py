@@ -500,14 +500,23 @@ def op_thumbnail(params):
         rendered = rendered.convert("RGB")
     rendered.thumbnail((size, size), Image.Resampling.LANCZOS)
     save_image(rendered, out, {"format": "jpg", "quality": 86})
+    low_out = params.get("lowOut")
+    if low_out:
+        low_size = int(params.get("lowSize") or 256)
+        low = rendered.copy()
+        low.thumbnail((low_size, low_size), Image.Resampling.LANCZOS)
+        save_image(low, low_out, {"format": "jpg", "quality": 86})
     return {"width": rendered.width, "height": rendered.height}
 
 
 def op_display(params):
     path = params["path"]
     out = params["out"]
+    plan = params.get("plan")
     max_side = int(params.get("maxSide") or 2048)
     im, meta = load_normalized(path)
+    if plan:
+        im, _geometry = render_plan(im, plan)
     im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     save_image(im, out, {"format": "webp"})
     return {

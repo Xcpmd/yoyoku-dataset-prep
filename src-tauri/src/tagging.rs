@@ -1,15 +1,21 @@
 use crate::caption;
 use crate::db;
 use crate::error::{AppError, AppResult};
-use crate::model::{ModelCatalogEntry, ModelDownloadProgress, ModelDownloadResult, ModelInfo, SuggestionResult};
+use crate::model::{ModelCatalogEntry, ModelDownloadProgress, ModelDownloadResult, ModelInfo, SuggestionResult, TransformPlan};
 use crate::project::captions;
 use crate::project::Project;
 use crate::state::AppState;
 use crate::util;
-use serde::Deserialize;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::io::{BufRead, BufReader};
-use std::process::Stdio;
+use std::process::{Child, ChildStdin, Stdio};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +213,7 @@ pub fn list_models(state: &AppState) -> Vec<ModelInfo> {
             "自然语言描述模型尚未安装。可在设置中下载 Florence-2 权重，下载后即可在打标页选择。".into()
         },
     });
+    models.extend(crate::vlm::list_models(state));
     models
 }
 
@@ -405,6 +412,472 @@ fn resolve_model_dir(state: &AppState, model: &str) -> AppResult<PathBuf> {
         .ok_or_else(|| AppError::new("MODEL_UNAVAILABLE", "所选模型不可用"))
 }
 
+pub type SharedTaggerSession = Arc<Mutex<TaggerSession>>;
+
+/// 批量打标期间常驻的模型进程；模型在批次开始时加载，结束后随会话销毁。
+pub struct TaggerSession {
+    child: Child,
+    stdin: ChildStdin,
+    receiver: Receiver<String>,
+    next_id: u64,
+    model_id: String,
+    model_name: String,
+    device: String,
+    runtime: String,
+    load_ms: u64,
+}
+
+impl TaggerSession {
+    fn spawn(
+        python: &str,
+        script: &Path,
+        model_dir: &Path,
+        model_id: &str,
+        isolated: bool,
+        log_path: &Path,
+        load_timeout: Duration,
+    ) -> AppResult<Self> {
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let stderr = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+            .ok();
+        let mut command = util::hidden_command(python);
+        if isolated {
+            command.arg("-I");
+        }
+        command
+            .arg(script)
+            .arg("--model-dir")
+            .arg(model_dir)
+            .arg("--serve")
+            .env("PYTHONIOENCODING", "utf-8")
+            .current_dir(script.parent().unwrap_or(Path::new(".")))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some(file) = stderr {
+            command.stderr(Stdio::from(file));
+        } else {
+            command.stderr(Stdio::null());
+        }
+
+        let started = Instant::now();
+        let mut child = command.spawn().map_err(|error| {
+            AppError::new(
+                "MODEL_UNAVAILABLE",
+                format!("无法启动本地打标进程（{python}）：{error}"),
+            )
+            .retryable(true)
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::new("MODEL_UNAVAILABLE", "打标进程 stdin 不可用"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::new("MODEL_UNAVAILABLE", "打标进程 stdout 不可用"))?;
+        let (tx, receiver) = channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(text) => {
+                        if tx.send(text).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let mut session = Self {
+            child,
+            stdin,
+            receiver,
+            next_id: 1,
+            model_id: model_id.to_string(),
+            model_name: String::new(),
+            device: String::new(),
+            runtime: String::new(),
+            load_ms: 0,
+        };
+        let ready = session.wait_ready(load_timeout, log_path)?;
+        session.model_name = ready
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or("本地模型")
+            .to_string();
+        session.device = ready
+            .get("device")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        session.runtime = ready
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        session.load_ms = started.elapsed().as_millis() as u64;
+        Ok(session)
+    }
+
+    fn wait_ready(&mut self, timeout: Duration, log_path: &Path) -> AppResult<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                self.kill();
+                return Err(AppError::new("MODEL_TIMEOUT", "本地模型加载超时").retryable(true));
+            }
+            match self.receiver.recv_timeout(deadline - now) {
+                Ok(text) => {
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    if value.get("ready").and_then(|item| item.as_bool()) == Some(true) {
+                        return Ok(value);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.kill();
+                    return Err(AppError::new("MODEL_TIMEOUT", "本地模型加载超时").retryable(true));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.kill();
+                    let tail = log_tail(log_path);
+                    let detail = if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("：{tail}")
+                    };
+                    return Err(AppError::new(
+                        "MODEL_ERROR",
+                        format!("本地模型加载失败{detail}"),
+                    )
+                    .retryable(true));
+                }
+            }
+        }
+    }
+
+    fn call(&mut self, image: &Path, params: Value, timeout: Duration) -> AppResult<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut request = match params {
+            Value::Object(map) => Value::Object(map),
+            _ => serde_json::json!({}),
+        };
+        request["id"] = serde_json::json!(id);
+        request["image"] = serde_json::json!(image.to_string_lossy());
+        let line = serde_json::to_string(&request)?;
+        writeln!(self.stdin, "{line}")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| {
+                AppError::new("MODEL_INTERRUPTED", format!("写入打标进程失败：{error}"))
+                    .retryable(true)
+            })?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                self.kill();
+                return Err(AppError::new("MODEL_TIMEOUT", "本地模型推理超时").retryable(true));
+            }
+            match self.receiver.recv_timeout(deadline - now) {
+                Ok(text) => {
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    if value.get("id").and_then(|item| item.as_u64()) != Some(id) {
+                        continue;
+                    }
+                    if value.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                    let error = value.get("error").cloned().unwrap_or(Value::Null);
+                    let message = error
+                        .get("message")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("本地模型推理失败")
+                        .to_string();
+                    let code = error
+                        .get("code")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("MODEL_ERROR")
+                        .to_string();
+                    return Err(AppError::new(&code, message).retryable(true));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.kill();
+                    return Err(AppError::new("MODEL_TIMEOUT", "本地模型推理超时").retryable(true));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.kill();
+                    return Err(
+                        AppError::new("MODEL_INTERRUPTED", "本地打标进程已退出，请重试")
+                            .retryable(true),
+                    );
+                }
+            }
+        }
+    }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        // 终止进程后最多等待 300ms 回收，绝不无限阻塞：
+        // 某些模型进程在退出前会卡在驱动/显存释放里，如果这里一直 wait，
+        // tagger_batch_end 就永远不返回，下一次批量打标会被前端锁死。
+        for _ in 0..15 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+impl Drop for TaggerSession {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn log_tail(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| line.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaggerModelSessionInfo {
+    pub model_id: String,
+    pub model: String,
+    pub device: String,
+    pub runtime: String,
+    pub load_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaggerBatchInfo {
+    pub models: Vec<TaggerModelSessionInfo>,
+    pub load_ms: u64,
+}
+
+/// 批量打标开始时加载所有选中模型；同一批次内复用，直到 end_batch。
+pub fn begin_batch(state: &AppState, model_ids: &[String]) -> AppResult<TaggerBatchInfo> {
+    let mut ids: Vec<String> = Vec::new();
+    for model_id in model_ids {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            continue;
+        }
+        if !ids.iter().any(|existing| existing == model_id) {
+            ids.push(model_id.to_string());
+        }
+    }
+    if ids.is_empty() {
+        return Err(AppError::new("MODEL_UNAVAILABLE", "未选择打标模型"));
+    }
+
+    // 清掉上一次可能残留的常驻进程，避免批量切换模型时占用显存/内存。
+    end_batch(state);
+    let generation = state.tagger_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut sessions: Vec<(String, SharedTaggerSession)> = Vec::new();
+    let mut infos: Vec<TaggerModelSessionInfo> = Vec::new();
+    for model_id in ids.iter().filter(|model_id| !crate::vlm::is_model(model_id)) {
+        let session = spawn_session(state, model_id).map_err(|mut error| {
+            error.message = format!("{model_id}：{}", error.message);
+            error
+        })?;
+        infos.push(TaggerModelSessionInfo {
+            model_id: session.model_id.clone(),
+            model: session.model_name.clone(),
+            device: session.device.clone(),
+            runtime: session.runtime.clone(),
+            load_ms: session.load_ms,
+        });
+        sessions.push((model_id.clone(), Arc::new(Mutex::new(session))));
+    }
+    // 模型加载期间用户可能已经取消/重新发起批次；旧批次不得把会话回填到状态里。
+    if state.tagger_generation.load(Ordering::SeqCst) != generation {
+        drop(sessions);
+        return Err(AppError::new(
+            "MODEL_INTERRUPTED",
+            "批量打标已被新的批次替代，请重新开始",
+        ));
+    }
+    let load_ms = infos.iter().map(|info| info.load_ms).sum();
+    {
+        let mut map = state.tagger_sessions.lock();
+        for (model_id, session) in sessions {
+            map.insert(model_id, session);
+        }
+    }
+    Ok(TaggerBatchInfo {
+        models: infos,
+        load_ms,
+    })
+}
+
+/// 批量打标结束后释放所有常驻模型进程。
+pub fn end_batch(state: &AppState) {
+    // 递增代际：让仍在加载的旧 begin_batch 失效，避免它在释放后回填会话。
+    state.tagger_generation.fetch_add(1, Ordering::SeqCst);
+    let drained: Vec<SharedTaggerSession> = {
+        let mut map = state.tagger_sessions.lock();
+        map.drain().map(|(_, session)| session).collect()
+    };
+    drop(drained);
+}
+
+fn spawn_session(state: &AppState, model_id: &str) -> AppResult<TaggerSession> {
+    let (python, script, model_dir, isolated, timeout) = if model_id == FLORENCE_ID {
+        let model_dir = florence_model_dir(state).ok_or_else(|| {
+            AppError::new(
+                "MODEL_UNAVAILABLE",
+                "未找到 Florence-2 权重。请先在设置中下载，或把 microsoft--Florence-2-base-ft 放入模型目录。",
+            )
+        })?;
+        (
+            florence_python(state),
+            adapter_script(state, "florence_infer.py")?,
+            model_dir,
+            false,
+            Duration::from_secs(600),
+        )
+    } else {
+        (
+            tagger_python(state),
+            adapter_script(state, "wd14_infer.py")?,
+            resolve_model_dir(state, model_id)?,
+            true,
+            Duration::from_secs(300),
+        )
+    };
+    let digest = util::sha256_text(model_id);
+    let log_path = state
+        .data_dir
+        .join("logs")
+        .join(format!("tagger-{}.log", digest.get(..10).unwrap_or("model")));
+    TaggerSession::spawn(
+        &python,
+        &script,
+        &model_dir,
+        model_id,
+        isolated,
+        &log_path,
+        timeout,
+    )
+}
+
+fn session_for(state: &AppState, model_id: &str) -> Option<SharedTaggerSession> {
+    state.tagger_sessions.lock().get(model_id).cloned()
+}
+
+fn drop_session_if(state: &AppState, model_id: &str, session: &SharedTaggerSession) {
+    let removed = {
+        let mut map = state.tagger_sessions.lock();
+        let same = map
+            .get(model_id)
+            .map(|existing| Arc::ptr_eq(existing, session))
+            .unwrap_or(false);
+        if same {
+            map.remove(model_id)
+        } else {
+            None
+        }
+    };
+    drop(removed);
+}
+
+fn session_error_is_fatal(error: &AppError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "MODEL_TIMEOUT" | "MODEL_INTERRUPTED" | "MODEL_UNAVAILABLE" | "MODEL_PROTOCOL"
+    )
+}
+
+fn call_tagger_session(
+    session: &SharedTaggerSession,
+    image: &Path,
+    threshold: f64,
+    character_threshold: f64,
+) -> AppResult<TaggerOutput> {
+    let result = {
+        let mut guard = session.lock();
+        guard.call(
+            image,
+            serde_json::json!({
+                "threshold": threshold,
+                "characterThreshold": character_threshold,
+                "maxTags": 80,
+            }),
+            Duration::from_secs(240),
+        )
+    }?;
+    serde_json::from_value::<TaggerOutput>(result)
+        .map_err(|error| AppError::new("MODEL_PROTOCOL", format!("模型结果解析失败：{error}")))
+}
+
+fn call_florence_session(
+    session: &SharedTaggerSession,
+    image: &Path,
+) -> AppResult<FlorenceOutput> {
+    let result = {
+        let mut guard = session.lock();
+        guard.call(
+            image,
+            serde_json::json!({
+                "task": "<MORE_DETAILED_CAPTION>",
+                "maxNewTokens": 256,
+            }),
+            Duration::from_secs(360),
+        )
+    }?;
+    serde_json::from_value::<FlorenceOutput>(result)
+        .map_err(|error| AppError::new("MODEL_PROTOCOL", format!("模型结果解析失败：{error}")))
+}
+
+fn run_tagger_once(
+    state: &AppState,
+    source: &Path,
+    model_id: &str,
+    threshold: f64,
+    character_threshold: f64,
+) -> AppResult<TaggerOutput> {
+    let model_dir = resolve_model_dir(state, model_id)?;
+    let script = adapter_script(state, "wd14_infer.py")?;
+    let python = tagger_python(state);
+    run_tagger(source, &model_dir, threshold, character_threshold, &script, &python)
+}
+
+fn run_florence_once(state: &AppState, source: &Path) -> AppResult<FlorenceOutput> {
+    let model_dir = florence_model_dir(state).ok_or_else(|| {
+        AppError::new(
+            "MODEL_UNAVAILABLE",
+            "未找到 Florence-2 权重。请先在设置中下载，或把 microsoft--Florence-2-base-ft 放入模型目录。",
+        )
+    })?;
+    let script = adapter_script(state, "florence_infer.py")?;
+    let python = florence_python(state);
+    run_florence(source, &model_dir, &script, &python)
+}
+
 fn run_tagger(
     image: &Path,
     model_dir: &Path,
@@ -563,25 +1036,71 @@ fn split_sentence_tags(text: &str) -> Vec<String> {
     sentences
 }
 
-pub fn generate(
+/// 临时文件在离开作用域时删除，避免打标失败留下大图副本。
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 当前素材已应用的裁剪配方。
+fn applied_plan(project: &Project, asset: &db::AssetRow) -> TransformPlan {
+    let json = {
+        let conn = project.conn();
+        asset
+            .transform_revision_id
+            .as_deref()
+            .and_then(|id| {
+                conn.query_row(
+                    "SELECT plan_json FROM transform_revisions WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+    };
+    json.and_then(|text| serde_json::from_str::<TransformPlan>(&text).ok())
+        .unwrap_or_default()
+        .sanitized()
+}
+
+/// 生成打标输入：按已应用的裁剪配方渲染，原图不直接送入模型。
+fn render_for_tagging(
     state: &AppState,
     project: &Project,
-    asset_id: &str,
-    model_id: &str,
+    asset: &db::AssetRow,
+) -> AppResult<TempFile> {
+    let source = project.require_source(asset)?;
+    let plan = applied_plan(project, asset);
+    let out = project
+        .staging_dir()
+        .join(format!("tagging-{}-{}.png", &asset.id[..8.min(asset.id.len())], util::short_id(8)));
+    if let Some(parent) = out.parent() {
+        util::ensure_dir(parent)?;
+    }
+    let out = TempFile(out);
+    state
+        .worker
+        .render_interactive(&source, &plan, &out.0, Some(2048), Some("png"), 300)?;
+    Ok(out)
+}
+
+struct ModelRun {
+    kind: &'static str,
+    tags: Vec<String>,
+    mode: String,
+    text: String,
+    model: String,
+    version: String,
     threshold: f64,
-    character_threshold: f64,
-) -> AppResult<SuggestionResult> {
-    let asset = {
-        let conn = project.conn();
-        db::get_asset(&conn, asset_id)?
-    };
-    let source = project.require_source(&asset)?;
-    let is_florence = model_id == FLORENCE_ID;
-    let script_name = if is_florence {
-        "florence_infer.py"
-    } else {
-        "wd14_infer.py"
-    };
+    device: String,
+    elapsed_ms: u64,
+    model_json: serde_json::Value,
+}
+
+fn adapter_script(state: &AppState, script_name: &str) -> AppResult<PathBuf> {
     let script = state
         .worker_script
         .parent()
@@ -593,94 +1112,266 @@ pub fn generate(
             format!("缺少适配器脚本：{}", script.display()),
         ));
     }
+    Ok(script)
+}
 
-    let (mode, tags, text, model_name, model_version, threshold_value, device, elapsed_ms, model_json, source_kind) =
-        if is_florence {
-            let model_dir = florence_model_dir(state).ok_or_else(|| {
-                AppError::new(
-                    "MODEL_UNAVAILABLE",
-                    "未找到 Florence-2 权重。请先在设置中下载，或把 microsoft--Florence-2-base-ft 放入模型目录。",
-                )
-            })?;
-            let python = florence_python(state);
-            let result = run_florence(&source, &model_dir, &script, &python)?;
-            let raw_text = result.text.trim().to_string();
-            let tags = caption::normalize_tags(split_sentence_tags(&raw_text));
-            if tags.is_empty() {
-                return Err(AppError::new("MODEL_ERROR", "Florence-2 没有生成有效句子"));
-            }
-            let model_json = serde_json::json!({
-                "model": result.model.clone(),
-                "version": "safetensors",
-                "task": "<MORE_DETAILED_CAPTION>",
-                "device": result.device.clone(),
-                "runtime": result.runtime.clone(),
-                "elapsedMs": result.elapsed_ms,
-                "rawText": raw_text,
-                "generatedAt": util::now_iso(),
-            });
-            (
-                "tags".to_string(),
-                tags,
-                String::new(),
-                result.model,
-                "safetensors / transformers".to_string(),
-                0.0,
-                result.device,
-                result.elapsed_ms,
-                model_json,
-                "florence",
-            )
-        } else {
-            let model_dir = resolve_model_dir(state, model_id)?;
-            let python = tagger_python(state);
-            let result =
-                run_tagger(&source, &model_dir, threshold, character_threshold, &script, &python)?;
-            let mode = {
-                let conn = project.conn();
-                asset
-                    .caption_revision_id
-                    .as_deref()
-                    .and_then(|id| {
-                        conn.query_row(
-                            "SELECT mode FROM caption_revisions WHERE id = ?1",
-                            rusqlite::params![id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .ok()
-                    })
-                    .unwrap_or_else(|| project.default_caption_mode(&conn))
-            };
-            let tags = caption::normalize_tags(result.tags.iter().cloned());
-            let text = if mode == "nl" {
-                tags.join(", ")
-            } else {
-                String::new()
-            };
-            let model_json = serde_json::json!({
-                "model": result.model.clone(),
-                "version": "onnx",
-                "threshold": threshold,
-                "characterThreshold": character_threshold,
-                "device": result.device.clone(),
-                "runtime": result.runtime.clone(),
-                "elapsedMs": result.elapsed_ms,
-                "ratings": result.ratings,
-                "generatedAt": util::now_iso(),
-            });
-            (
-                mode,
-                tags,
-                text,
-                result.model,
-                "v3 / ONNX".to_string(),
-                threshold,
-                result.device,
-                result.elapsed_ms,
-                model_json,
-                "wd14",
-            )
+/// 运行单个模型，返回该模型的标签与元数据；多模型并集在 generate 中合并。
+fn run_model(
+    state: &AppState,
+    project: &Project,
+    asset: &db::AssetRow,
+    source: &Path,
+    model_id: &str,
+    threshold: f64,
+    character_threshold: f64,
+) -> AppResult<ModelRun> {
+    if crate::vlm::is_model(model_id) {
+        let start = Instant::now();
+        let run = crate::vlm::run(state, model_id, source)?;
+        let mode = match (run.output.tags.is_empty(), run.output.caption.is_empty()) {
+            (true, _) => "nl",
+            (_, true) => "tags",
+            _ => "mixed",
         };
+        return Ok(ModelRun {
+            kind: "vlm", tags: run.output.tags, mode: mode.into(), text: run.output.caption,
+            model: run.name, version: run.provider, threshold: 0.0, device: "HTTP".into(),
+            elapsed_ms: start.elapsed().as_millis() as u64, model_json: run.metadata,
+        });
+    }
+    if model_id == FLORENCE_ID {
+        let result = if let Some(session) = session_for(state, FLORENCE_ID) {
+            match call_florence_session(&session, source) {
+                Ok(result) => result,
+                Err(error) if session_error_is_fatal(&error) => {
+                    // 常驻进程异常时移除会话，本张回退到一次性进程。
+                    drop_session_if(state, FLORENCE_ID, &session);
+                    drop(session);
+                    run_florence_once(state, source)?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            run_florence_once(state, source)?
+        };
+        let raw_text = result.text.trim().to_string();
+        let tags = caption::normalize_tags(split_sentence_tags(&raw_text));
+        if tags.is_empty() {
+            return Err(AppError::new("MODEL_ERROR", "Florence-2 没有生成有效句子"));
+        }
+        let model_json = serde_json::json!({
+            "model": result.model.clone(),
+            "version": "safetensors",
+            "task": "<MORE_DETAILED_CAPTION>",
+            "device": result.device.clone(),
+            "runtime": result.runtime.clone(),
+            "elapsedMs": result.elapsed_ms,
+            "rawText": raw_text,
+            "generatedAt": util::now_iso(),
+        });
+        Ok(ModelRun {
+            kind: "florence",
+            tags,
+            mode: "tags".to_string(),
+            text: String::new(),
+            model: result.model,
+            version: "safetensors / transformers".to_string(),
+            threshold: 0.0,
+            device: result.device,
+            elapsed_ms: result.elapsed_ms,
+            model_json,
+        })
+    } else {
+        let result = if let Some(session) = session_for(state, model_id) {
+            match call_tagger_session(&session, source, threshold, character_threshold) {
+                Ok(result) => result,
+                Err(error) if session_error_is_fatal(&error) => {
+                    // 常驻进程异常时移除会话，本张回退到一次性进程。
+                    drop_session_if(state, model_id, &session);
+                    drop(session);
+                    run_tagger_once(state, source, model_id, threshold, character_threshold)?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            run_tagger_once(state, source, model_id, threshold, character_threshold)?
+        };
+        let mode = {
+            let conn = project.conn();
+            asset
+                .caption_revision_id
+                .as_deref()
+                .and_then(|id| {
+                    conn.query_row(
+                        "SELECT mode FROM caption_revisions WHERE id = ?1",
+                        rusqlite::params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| project.default_caption_mode(&conn))
+        };
+        let tags = caption::normalize_tags(result.tags.iter().cloned());
+        let text = if mode == "nl" {
+            tags.join(", ")
+        } else {
+            String::new()
+        };
+        let model_json = serde_json::json!({
+            "model": result.model.clone(),
+            "version": "onnx",
+            "threshold": threshold,
+            "characterThreshold": character_threshold,
+            "device": result.device.clone(),
+            "runtime": result.runtime.clone(),
+            "elapsedMs": result.elapsed_ms,
+            "ratings": result.ratings,
+            "generatedAt": util::now_iso(),
+        });
+        Ok(ModelRun {
+            kind: "wd14",
+            tags,
+            mode,
+            text,
+            model: result.model,
+            version: "v3 / ONNX".to_string(),
+            threshold,
+            device: result.device,
+            elapsed_ms: result.elapsed_ms,
+            model_json,
+        })
+    }
+}
+
+pub fn generate(
+    state: &AppState,
+    project: &Project,
+    asset_id: &str,
+    model_ids: &[String],
+    threshold: f64,
+    character_threshold: f64,
+) -> AppResult<SuggestionResult> {
+    let asset = {
+        let conn = project.conn();
+        db::get_asset(&conn, asset_id)?
+    };
+    // 模型输入统一使用按裁剪配方渲染后的图片；原图只用于生成临时副本。
+    let tag_source = render_for_tagging(state, project, &asset)?;
+    let source = tag_source.0.as_path();
+
+    let mut ids: Vec<String> = Vec::new();
+    for model_id in model_ids {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            continue;
+        }
+        if !ids.iter().any(|existing| existing == model_id) {
+            ids.push(model_id.to_string());
+        }
+    }
+    if ids.is_empty() {
+        // 兼容旧请求：空模型时由 resolve_model_dir 选择第一个 WD14 模型。
+        ids.push(String::new());
+    }
+
+    let mut runs: Vec<ModelRun> = Vec::with_capacity(ids.len());
+    for model_id in &ids {
+        let run = run_model(
+            state,
+            project,
+            &asset,
+            source,
+            model_id,
+            threshold,
+            character_threshold,
+        )
+        .map_err(|mut error| {
+            if !model_id.is_empty() {
+                error.message = format!("{model_id}：{}", error.message);
+            }
+            error
+        })?;
+        runs.push(run);
+    }
+
+    let multiple = runs.len() > 1;
+    // 多模型结果按首次出现顺序取并集；normalize_tags 负责全半角/大小写归一化去重。
+    let tags = if multiple {
+        caption::normalize_tags(runs.iter().flat_map(|run| run.tags.iter().cloned()))
+    } else {
+        runs[0].tags.clone()
+    };
+    let vision_language = runs.iter().any(|run| run.kind == "vlm");
+    let text = if !multiple {
+        runs[0].text.clone()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        runs.iter().filter(|run| run.kind == "vlm")
+            .flat_map(|run| run.text.split_inclusive(['.', '!', '?']))
+            .map(str::trim)
+            .filter(|sentence| !sentence.is_empty() && seen.insert(sentence.to_ascii_lowercase()))
+            .collect::<Vec<_>>().join(" ")
+    };
+    let mode = if !multiple {
+        runs[0].mode.clone()
+    } else if text.is_empty() {
+        "tags".into()
+    } else if tags.is_empty() {
+        "nl".into()
+    } else {
+        "mixed".into()
+    };
+    let model_name = if multiple {
+        runs.iter()
+            .map(|run| run.model.clone())
+            .collect::<Vec<_>>()
+            .join(" + ")
+    } else {
+        runs[0].model.clone()
+    };
+    let model_version = if multiple {
+        "multi-model".to_string()
+    } else {
+        runs[0].version.clone()
+    };
+    let mut devices: Vec<String> = Vec::new();
+    for run in &runs {
+        if !devices.iter().any(|device| device == &run.device) {
+            devices.push(run.device.clone());
+        }
+    }
+    let device = if multiple {
+        devices.join(" + ")
+    } else {
+        runs[0].device.clone()
+    };
+    let elapsed_ms = if multiple {
+        runs.iter().map(|run| run.elapsed_ms).sum::<u64>()
+    } else {
+        runs[0].elapsed_ms
+    };
+    let threshold_value = if multiple {
+        runs.iter()
+            .map(|run| run.threshold)
+            .find(|value| *value > 0.0)
+            .unwrap_or(0.0)
+    } else {
+        runs[0].threshold
+    };
+    let source_kind = if multiple { "multi" } else { runs[0].kind };
+    let model_json = if multiple {
+        serde_json::json!({
+            "model": model_name.clone(),
+            "version": model_version.clone(),
+            "threshold": threshold_value,
+            "device": device.clone(),
+            "elapsedMs": elapsed_ms,
+            "models": runs.iter().map(|run| run.model_json.clone()).collect::<Vec<_>>(),
+            "generatedAt": util::now_iso(),
+        })
+    } else {
+        runs[0].model_json.clone()
+    };
 
     let revision_id = {
         let conn = project.conn();
@@ -700,6 +1391,7 @@ pub fn generate(
         mode,
         tags,
         text,
+        vision_language,
         model: model_name,
         model_version,
         threshold: threshold_value,

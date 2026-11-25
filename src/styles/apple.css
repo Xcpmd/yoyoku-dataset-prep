@@ -910,6 +910,9 @@ h4 {
   padding: 4px 5px;
   border-radius: 11px;
   border: 1px solid transparent;
+  /* 大图库一次渲染完整序列时，离屏项跳过布局与绘制，滚动仍能到达每一张。 */
+  content-visibility: auto;
+  contain-intrinsic-size: 0 53px;
 }
 
 .wb-rail-item:hover {
@@ -980,7 +983,38 @@ h4 {
 .wb-rail-thumb img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  /* 素材列表展示完整构图，不裁掉图片边缘。 */
+  object-fit: contain;
+}
+
+.wb-rail-thumb-placeholder {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background:
+    linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.35) 40%, transparent 60%),
+    var(--surface-subtle);
+  background-size: 200% 100%;
+  animation: rail-thumb-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes rail-thumb-shimmer {
+  from {
+    background-position: 140% 0;
+  }
+  to {
+    background-position: -40% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-rail-thumb-placeholder {
+    animation: none;
+  }
+}
+
+:root.reduce-motion .wb-rail-thumb-placeholder {
+  animation: none;
 }
 
 .wb-rail-index {
@@ -2012,18 +2046,6 @@ h4 {
   pointer-events: none;
 }
 
-.crop-card-target {
-  position: absolute;
-  right: 5px;
-  bottom: 5px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.55);
-  color: #fff;
-  font-size: 9.5px;
-  pointer-events: none;
-}
-
 .crop-card-select {
   position: absolute;
   z-index: 4;
@@ -2042,11 +2064,23 @@ h4 {
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
   cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px) scale(0.94);
   transition:
+    opacity 140ms var(--ease),
     background 140ms var(--ease),
     border-color 140ms var(--ease),
     color 140ms var(--ease),
     transform 140ms var(--ease);
+}
+
+.inline-crop-card:hover .crop-card-select,
+.crop-card-select.selected,
+.crop-card-select:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
 }
 
 .crop-card-select:hover {
@@ -2068,6 +2102,15 @@ h4 {
   width: 15px;
   height: 15px;
   stroke-width: 2.6;
+}
+
+/* 触屏设备没有 hover，选中按钮始终可见。 */
+@media (hover: none) {
+  .crop-card-select {
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
 }
 
 .crop-card-loading {
@@ -2219,21 +2262,94 @@ h4 {
   color: var(--primary);
 }
 
-.select.select-trigger.caption-ai-select {
-  flex: 1;
-  width: auto;
-  min-width: 0;
-  min-height: 30px;
-  padding: 4px 8px;
-  font-size: 11.5px;
-  border-radius: 9px;
-}
-
 .caption-ai-row .btn {
   flex: none;
   min-height: 30px;
   padding: 0 9px;
   font-size: 11.5px;
+}
+
+.caption-ai-model-picker {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
+.caption-ai-model-picker > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.caption-ai-row .caption-ai-model-trigger {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 9px;
+}
+
+.caption-ai-model-trigger .caption-ai-model-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.caption-ai-model-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 0 4px 4px;
+}
+
+.caption-ai-model-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.caption-ai-model-option:hover {
+  background: var(--surface-2);
+}
+
+.caption-ai-model-option.selected {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.caption-ai-model-option input {
+  flex: none;
+  margin-top: 2px;
+  accent-color: var(--primary);
+}
+
+.caption-ai-model-option-name {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.caption-ai-model-option-meta {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.caption-ai-model-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 6px 8px 2px;
+  border-top: 1px solid var(--line);
 }
 
 .caption-ai-note {

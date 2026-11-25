@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -576,12 +577,19 @@ export interface SelectOption {
   disabled?: boolean;
 }
 
+export interface SelectGroup {
+  label: string;
+  options: SelectOption[];
+}
+
 /**
  * 自绘下拉选择器，替代原生的系统弹层，保证菜单与全站 Apple 风格一致。
  */
 export function Select({
+  id,
   value,
-  options,
+  options = [],
+  groups = [],
   onChange,
   placeholder = "请选择",
   ariaLabel,
@@ -589,8 +597,10 @@ export function Select({
   disabled,
   title,
 }: {
+  id?: string;
   value: string;
-  options: SelectOption[];
+  options?: SelectOption[];
+  groups?: SelectGroup[];
   onChange: (value: string) => void;
   placeholder?: string;
   ariaLabel?: string;
@@ -598,6 +608,7 @@ export function Select({
   disabled?: boolean;
   title?: string;
 }) {
+  const menuId = useId();
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState<{
     top?: number;
@@ -608,7 +619,8 @@ export function Select({
   }>({ left: 0, width: 180, maxHeight: 320 });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const selected = options.find((option) => option.value === value);
+  const selected = options.find((option) => option.value === value) ??
+    groups.flatMap((group) => group.options).find((option) => option.value === value);
   const close = useCallback((restoreFocus: boolean) => {
     setOpen(false);
     if (restoreFocus) triggerRef.current?.focus();
@@ -618,24 +630,23 @@ export function Select({
     const trigger = triggerRef.current;
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
-    const width = Math.max(rect.width, 180);
-    let left = rect.left;
-    left = Math.min(Math.max(8, left), window.innerWidth - width - 8);
-    const spaceBelow = window.innerHeight - rect.bottom - 10;
-    const spaceAbove = rect.top - 10;
+    const width = Math.min(window.innerWidth - 16, Math.max(rect.width, 180));
+    const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
+    const spaceBelow = window.innerHeight - rect.bottom - 14;
+    const spaceAbove = rect.top - 14;
     if (spaceBelow < 220 && spaceAbove > spaceBelow) {
       setPosition({
         bottom: window.innerHeight - rect.top + 6,
         left,
         width,
-        maxHeight: Math.max(180, Math.min(spaceAbove, 360)),
+        maxHeight: Math.max(0, Math.min(spaceAbove, 360)),
       });
     } else {
       setPosition({
         top: rect.bottom + 6,
         left,
         width,
-        maxHeight: Math.max(180, Math.min(spaceBelow, 360)),
+        maxHeight: Math.max(0, Math.min(spaceBelow, 360)),
       });
     }
     setOpen(true);
@@ -649,6 +660,7 @@ export function Select({
       close(false);
     };
     const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Tab") close(true);
       if (event.key === "Escape") {
         event.stopPropagation();
         event.preventDefault();
@@ -662,19 +674,20 @@ export function Select({
     };
     const onResize = () => close(false);
     document.addEventListener("pointerdown", onPointer, true);
-    document.addEventListener("keydown", onKey, true);
+    // Handle Escape before the modal's document-level listener.
+    window.addEventListener("keydown", onKey, true);
     document.addEventListener("scroll", onScroll, true);
     window.addEventListener("resize", onResize);
     const timer = window.setTimeout(() => {
       const preferred =
-        menuRef.current?.querySelector<HTMLElement>(".select-option.selected") ||
+        menuRef.current?.querySelector<HTMLElement>(".select-option.selected:not([disabled])") ||
         menuRef.current?.querySelector<HTMLElement>(".select-option:not([disabled])");
-      preferred?.focus();
-      preferred?.scrollIntoView({ block: "nearest" });
+      (preferred || menuRef.current)?.focus({ preventScroll: true });
+      preferred?.scrollIntoView({ block: "nearest", inline: "nearest" });
     }, 20);
     return () => {
       document.removeEventListener("pointerdown", onPointer, true);
-      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("keydown", onKey, true);
       document.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", onResize);
       window.clearTimeout(timer);
@@ -691,15 +704,36 @@ export function Select({
     const index = items.indexOf(document.activeElement as HTMLElement);
     let next = 0;
     if (event.key === "ArrowDown") next = (index + 1) % items.length;
-    if (event.key === "ArrowUp") next = (index - 1 + items.length) % items.length;
+    if (event.key === "ArrowUp") next = index <= 0 ? items.length - 1 : index - 1;
     if (event.key === "End") next = items.length - 1;
     items[next]?.focus();
   };
+
+  const renderOption = (option: SelectOption) => (
+    <button
+      key={option.value}
+      type="button"
+      role="option"
+      tabIndex={-1}
+      aria-selected={option.value === value}
+      disabled={option.disabled}
+      className={classNames("select-option", option.value === value && "selected")}
+      onClick={() => {
+        onChange(option.value);
+        close(true);
+      }}
+    >
+      <span className="select-option-label">{option.label}</span>
+      {option.hint ? <span className="select-option-hint">{option.hint}</span> : null}
+      {option.value === value ? <Icon name="check" className="sm select-option-check" /> : null}
+    </button>
+  );
 
   return (
     <>
       <button
         ref={triggerRef}
+        id={id}
         type="button"
         className={classNames("select", "select-trigger", open && "open", className)}
         disabled={disabled}
@@ -707,6 +741,7 @@ export function Select({
         aria-label={ariaLabel}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
         onClick={() => (open ? close(false) : openMenu())}
         onKeyDown={(event) => {
           if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -724,8 +759,10 @@ export function Select({
         ? createPortal(
             <div
               ref={menuRef}
+              id={menuId}
               className="select-pop"
               role="listbox"
+              tabIndex={-1}
               aria-label={ariaLabel}
               style={{
                 position: "fixed",
@@ -739,33 +776,16 @@ export function Select({
               }}
               onKeyDown={onMenuKeyDown}
             >
-              {options.length === 0 ? (
+              {options.length === 0 && groups.length === 0 ? (
                 <div className="select-empty">{placeholder}</div>
-              ) : (
-                options.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    role="option"
-                    aria-selected={option.value === value}
-                    disabled={option.disabled}
-                    className={classNames(
-                      "select-option",
-                      option.value === value && "selected",
-                    )}
-                    onClick={() => {
-                      onChange(option.value);
-                      close(true);
-                    }}
-                  >
-                    <span className="select-option-label">{option.label}</span>
-                    {option.hint ? <span className="select-option-hint">{option.hint}</span> : null}
-                    {option.value === value ? (
-                      <Icon name="check" className="sm select-option-check" />
-                    ) : null}
-                  </button>
-                ))
-              )}
+              ) : null}
+              {options.map(renderOption)}
+              {groups.map((group) => (
+                <div key={group.label} className="select-group" role="group" aria-label={group.label}>
+                  <div className="select-group-label" aria-hidden="true">{group.label}</div>
+                  {group.options.map(renderOption)}
+                </div>
+              ))}
             </div>,
             document.body,
           )
