@@ -718,7 +718,7 @@ export const S = {
     modelAvailable: "可用",
     modelUnavailable: "未安装",
     openModelDir: "打开模型目录",
-    modelsDir: "模型目录",
+    modelsDir: "模型存放目录",
     pythonPath: "图像处理 Python",
     pythonHint: "修改 Python 路径后需重启应用。留空自动检测。",
     testWorker: "测试运行时",

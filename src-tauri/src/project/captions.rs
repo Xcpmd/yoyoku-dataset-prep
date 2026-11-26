@@ -185,33 +185,44 @@ fn append_unique(list: &mut Vec<String>, values: &[String]) -> usize {
     added
 }
 
-/// 就地替换短语，保留首次出现的位置；目标短语已存在时只删除旧短语，避免重复。
-fn replace_tag(list: &mut Vec<String>, from: &str, to: &str) -> bool {
-    let from_key = caption::normalize_key(from);
-    if from_key.is_empty() {
-        return false;
+fn expand_underscores(tag: &str) -> Option<String> {
+    let start = tag.len() - tag.trim_start_matches('_').len();
+    let end = tag.trim_end_matches('_').len();
+    let core = tag.get(start..end)?;
+    if !core.contains('_') {
+        return None;
     }
-    let mut changed = false;
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::with_capacity(list.len());
-    for item in list.iter() {
-        let key = caption::normalize_key(item);
-        if key == from_key {
-            changed = true;
-            if !seen.insert(caption::normalize_key(to)) {
-                continue;
+    let mut expanded = String::from(&tag[..start]);
+    let mut previous_underscore = false;
+    for ch in core.chars() {
+        if ch != '_' {
+            expanded.push(ch);
+        } else if !previous_underscore {
+            expanded.push(' ');
+        }
+        previous_underscore = ch == '_';
+    }
+    expanded.push_str(&tag[end..]);
+    Some(expanded)
+}
+
+fn expand_tag_list(
+    tags: &[String],
+    variants: &std::collections::HashMap<String, String>,
+    keep_original: bool,
+) -> Vec<String> {
+    let mut next = Vec::with_capacity(tags.len());
+    for tag in tags {
+        if let Some(variant) = variants.get(&caption::normalize_key(tag)) {
+            if keep_original {
+                next.push(tag.clone());
             }
-            result.push(to.to_string());
+            next.push(variant.clone());
         } else {
-            if !seen.insert(key) {
-                changed = true;
-                continue;
-            }
-            result.push(item.clone());
+            next.push(tag.clone());
         }
     }
-    *list = result;
-    changed
+    caption::normalize_tags(next)
 }
 
 fn scope_ids_json(asset_ids: &[String]) -> (String, i64) {
@@ -295,6 +306,9 @@ pub fn tag_bulk(project: &Project, request: &TagBulkRequest) -> AppResult<TagBul
     let values = caption::normalize_tags(request.tags.iter().cloned());
     let from = request.from.trim().to_string();
     let to = request.to.trim().to_string();
+    let from_key = caption::normalize_key(&from);
+    let expand = matches!(action, "convertUnderscores" | "duplicateUnderscores");
+    let keep_original = action == "duplicateUnderscores";
     match action {
         "add" | "remove" if values.is_empty() => {
             return Err(AppError::new("INVALID_TAGS", "请填写要处理的提示词"));
@@ -302,7 +316,10 @@ pub fn tag_bulk(project: &Project, request: &TagBulkRequest) -> AppResult<TagBul
         "rename" if from.is_empty() || to.is_empty() => {
             return Err(AppError::new("INVALID_TAGS", "请填写原提示词和新提示词"));
         }
-        "add" | "remove" | "rename" => {}
+        "convertUnderscores" | "duplicateUnderscores" if request.asset_ids.is_empty() => {
+            return Err(AppError::new("EMPTY_SCOPE", "请先选择要处理的图片"));
+        }
+        "add" | "remove" | "rename" | "convertUnderscores" | "duplicateUnderscores" => {}
         _ => return Err(AppError::new("INVALID_ACTION", "未知的批量操作")),
     }
     if from.chars().count() > 2000 || to.chars().count() > 2000 {
@@ -374,6 +391,11 @@ pub fn tag_bulk(project: &Project, request: &TagBulkRequest) -> AppResult<TagBul
     for target in &targets {
         let mut tags = target.tags.clone();
         let mode = target.mode.clone();
+        if action != "add" && !is_tag_mode(&mode) {
+            skipped_assets += 1;
+            continue;
+        }
+        let mut variants = std::collections::HashMap::new();
         let mut dirty = false;
         match action {
             "add" => {
@@ -387,20 +409,24 @@ pub fn tag_bulk(project: &Project, request: &TagBulkRequest) -> AppResult<TagBul
                 }
             }
             "remove" => {
-                if !is_tag_mode(&mode) {
-                    skipped_assets += 1;
-                    continue;
-                }
                 let before = tags.len();
                 tags.retain(|tag| !value_keys.contains(&caption::normalize_key(tag)));
                 dirty = tags.len() != before;
             }
             "rename" => {
-                if !is_tag_mode(&mode) {
-                    skipped_assets += 1;
-                    continue;
+                dirty = caption::replace_tag(&mut tags, &from_key, &to);
+            }
+            _ if expand => {
+                for tag in &tags {
+                    if let Some(variant) = expand_underscores(tag) {
+                        variants.insert(caption::normalize_key(tag), variant);
+                    }
                 }
-                dirty = replace_tag(&mut tags, &from, &to);
+                if !variants.is_empty() {
+                    let next = expand_tag_list(&tags, &variants, keep_original);
+                    dirty = next != tags;
+                    tags = next;
+                }
             }
             _ => unreachable!(),
         }
@@ -447,10 +473,20 @@ pub fn tag_bulk(project: &Project, request: &TagBulkRequest) -> AppResult<TagBul
                     state_changed = order.len() + disabled.len() != before;
                 }
                 "rename" => {
-                    state_changed |= replace_tag(&mut order, &from, &to);
-                    state_changed |= replace_tag(&mut disabled, &from, &to);
+                    state_changed |= caption::replace_tag(&mut order, &from_key, &to);
+                }
+                _ if expand => {
+                    let next_order = expand_tag_list(&order, &variants, keep_original);
+                    state_changed = next_order != order;
+                    order = next_order;
                 }
                 _ => {}
+            }
+            if expand || action == "rename" {
+                let enabled: std::collections::HashSet<_> = tags.iter().map(|tag| caption::normalize_key(tag)).collect();
+                let before = disabled.len();
+                disabled.retain(|tag| !enabled.contains(&caption::normalize_key(tag)));
+                state_changed |= disabled.len() != before;
             }
             if state_changed {
                 tx.execute(
@@ -515,6 +551,8 @@ pub fn tag_bulk(project: &Project, request: &TagBulkRequest) -> AppResult<TagBul
         let label = match action {
             "add" => format!("批量添加提示词（{changed_assets} 张）"),
             "remove" => format!("批量删除提示词（{changed_assets} 张）"),
+            "convertUnderscores" => format!("下划线转为空格（{changed_assets} 张）"),
+            "duplicateUnderscores" => format!("复制空格版本（{changed_assets} 张）"),
             _ => format!("批量重命名提示词（{changed_assets} 张）"),
         };
         Some(history::record(

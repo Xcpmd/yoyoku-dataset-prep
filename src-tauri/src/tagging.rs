@@ -58,6 +58,8 @@ fn tagger_root() -> Option<PathBuf> {
 
 fn candidate_roots(state: &AppState) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
+    // 发布版的唯一默认目录。旧目录仍作为兼容来源保留在后面。
+    roots.push(state.install_root.join("models"));
     let settings = state.settings();
     if let Some(dir) = settings.models_dir.filter(|d| !d.trim().is_empty()) {
         let path = PathBuf::from(util::expand_user_home(&dir));
@@ -66,9 +68,7 @@ fn candidate_roots(state: &AppState) -> Vec<PathBuf> {
         }
     }
     let app_models = state.data_dir.join("models");
-    if app_models.exists() {
-        roots.push(app_models);
-    }
+    roots.push(app_models);
     if let Some(root) = tagger_root() {
         roots.push(root.join("models"));
     }
@@ -80,11 +80,7 @@ fn models_root(state: &AppState) -> Option<PathBuf> {
 }
 
 pub fn download_root(state: &AppState) -> PathBuf {
-    let settings = state.settings();
-    if let Some(dir) = settings.models_dir.filter(|d| !d.trim().is_empty()) {
-        return PathBuf::from(util::expand_user_home(&dir));
-    }
-    state.data_dir.join("models")
+    state.install_root.join("models")
 }
 
 /// WD14 与基础图像工作进程共用设置中的 Python 运行时；
@@ -401,7 +397,7 @@ fn resolve_model_dir(state: &AppState, model: &str) -> AppResult<PathBuf> {
     if dirs.is_empty() {
         return Err(AppError::new(
             "MODEL_UNAVAILABLE",
-            "未找到本地标签模型。请把 WD14 ONNX 模型放入 wd14Tagger/models 或在设置中指定模型目录。",
+            "未找到本地标签模型。请把 WD14 ONNX 模型放入应用安装目录下的 models 文件夹，或在设置页下载模型。",
         ));
     }
     if model.trim().is_empty() {

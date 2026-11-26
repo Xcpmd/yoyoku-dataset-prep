@@ -17,7 +17,7 @@ Stable Diffusion LoRA 训练集预处理桌面工具。v1.0 实施基线见 [PRO
 - 提示词库：独立管理页（侧栏「提示词库」或顶栏图标进入）支持搜索英文 / 中文 / 分类、分类筛选、英文 / 分类 / 中文排序、分页；可新增、编辑英文与中文、修改主分类、调用翻译服务填充中英文、删除条目。修改写入项目 SQLite，并立即刷新打标页的补全、分组与中英对照。
 - 质检：阻塞 / 建议 / 已忽略筛选、规则证据、忽略理由、pHash 分组查重、数据概况与 Kohya 分桶估算。
 - 导出：范围与验证集拆分、Kohya `sd-scripts`（TXT + TOML）与 Hugging Face ImageFolder（JSONL）、文件夹 / ZIP、命名与尺寸策略、按目标尺寸缩放并输出无损 PNG、填充透明背景（默认开启，PNG 关闭后保留透明通道，JPEG 始终白底）、预检指纹、结构校验、导出历史与绝对版训练入口。
-- 设置：浅色 / 深色 / 跟随系统、减透明、减动效、平滑缩放、高对比、大字号、密度、图库卡片宽度、检查器宽度、图像处理并发（默认 4，重启生效）；项目阈值；本地打标模型目录、模型清单与 **Hugging Face 模型下载**（WD14 ONNX 与 Florence-2 base-ft 权重；进度、失败重试、已安装标记）；图像运行时；百度翻译 AppID / 密钥（可选，留空时使用 MyMemory 免费接口）；存储占用与可重建缓存清理；快捷键说明。
+- 设置：浅色 / 深色 / 跟随系统、减透明、减动效、平滑缩放、高对比、大字号、密度、图库卡片宽度、检查器宽度、图像处理并发（默认 4，重启生效）；项目阈值；本地打标模型清单与 **Hugging Face 模型下载**（WD14 ONNX 与 Florence-2 base-ft 权重；进度、失败重试、已安装标记）；图像运行时；百度翻译 AppID / 密钥（可选，留空时使用 MyMemory 免费接口）；存储占用与可重建缓存清理；快捷键说明。
 - 外观：Apple 风格设计令牌（单一 Action Blue、系统字体、羊皮纸 / 白 / 近黑表面、胶囊按钮、8/11/18 px 圆角），适配 1920 / 1440 / 平板 / 手机宽度。原生标题栏与独立自绘标题条均已移除：最小化 / 最大化 / 关闭是**应用内按钮**，项目页位于顶栏右端，项目列表页浮在右上角；拖动由顶栏和页面空白区域承担，双击最大化。`core:window` 的最小化 / 切换最大化 / 关闭 / 查询最大化 / 开始拖动权限已在 capabilities 中显式授予。所有外部 Python 与系统命令都以 `CREATE_NO_WINDOW` 启动，使用期间不会弹出终端窗口。应用图标保留 `public/icon.jpg` 完整画面，仅用五次方超椭圆 `|x|⁵ + |y|⁵ ≤ 1` 裁切四角，得到**圆角矩形**（不是圆形）；`tools/make_icons.py` 可重新生成 32–1024 px PNG、ICO、ICNS 与 Windows 方形图块。
 
 ## 开发环境
@@ -33,9 +33,9 @@ Stable Diffusion LoRA 训练集预处理桌面工具。v1.0 实施基线见 [PRO
 
 1. 设置中的 Python 路径（保存至 `settings.json`）
 2. `YOYOKU_PYTHON` 环境变量
-3. `worker/.venv/Scripts/python.exe`
-4. `wd14Tagger/python31010/python.exe`（如存在，本项目环境会命中）
-5. `python`
+3. 开发构建探测仓库内的解释器，例如 `wd14Tagger/python31010/python.exe`
+4. 安装包自带的 `worker/runtime/python/python.exe`
+5. PATH 中的 `python`
 
 安装与开发：
 
@@ -46,11 +46,13 @@ npm run tauri:dev
 
 仅前端：`npm run dev`。类型检查：`npx tsc --noEmit`。前端构建：`npm run build`。安装包：`npm run tauri:build`，NSIS 输出位于 `src-tauri/target/release/bundle/nsis/`。
 
-工作进程可用 `YOYOKU_WORKER_SCRIPT` 指定 `worker/main.py`，打包时通过 Tauri resource `worker/` 分发。安装包**不包含** Python 运行时与 Pillow，也不会打包 WD14 模型；目标机需要 Python 3.10+ 且安装 Pillow，或安装后在设置中填写 Python 路径，并把模型目录指向本机的 WD14 ONNX 目录。开发环境会自动命中 `wd14Tagger/python31010`。
+工作进程可用 `YOYOKU_WORKER_SCRIPT` 指定 `worker/main.py`。Windows x64 安装包包含图像处理所需的嵌入式 Python 和 Pillow。首次构建安装包会下载并校验固定版本的运行时。安装后将设置中的 Python 路径留空，即可用内置运行时导入、裁剪和导出。
 
 ## 本地标签模型
 
-WD14 建议使用随项目准备的 `wd14Tagger/models/SmilingWolf--*` 目录（`model.onnx` + `selected_tags.csv`），也可以把模型目录放进设置中的「模型目录」。推理使用 `wd14Tagger/python31010/python.exe`（含 onnxruntime 与 Pillow），通过 `worker/tagging/wd14_infer.py` 执行；图片不会上传。
+WD14 与 Florence-2 的默认存放位置是应用安装根目录下的独立 `models/` 文件夹。每个模型使用自己的子目录，例如 `models/SmilingWolf--wd-vit-tagger-v3/` 与 `models/microsoft--Florence-2-base-ft/`。设置页会显示实际路径并提供打开按钮，下载功能也始终写入此目录。推理使用安装包内的 Python 与 Pillow，图片不会上传。
+
+旧版本位于应用数据目录的 `models/`、设置中曾指定的模型目录，以及开发环境中的 `wd14Tagger/models/` 仍会被自动扫描，以兼容已有模型。新下载的模型不会继续写入这些旧目录。
 
 设置页提供「下载模型」：后端 `models_catalog` 列出 WD ViT / ViT-Large / SwinV2 / ConvNeXt 等 WD14 v3 ONNX 模型及大约体积，`model_download` 调用只依赖 Python 标准库的 `worker/tagging/download_model.py`，从 Hugging Face 下载到模型目录。下载写入 `.part` 临时文件，`fsync` 后原子改名；进度通过 `model:download-progress` 事件显示，失败可直接重试。已安装的模型在下载对话框中标记为「已安装」。
 
@@ -95,7 +97,7 @@ cargo test
 
 - 本仓库未分发 sd-scripts 与 Diffusers 训练端；导出包执行了结构、配对、像素与语法校验，但真实训练端 loader 的最终读取需要在已安装上游依赖的目标机器上复验。README 与导出报告会注明上游适配器版本。
 - Florence-2 权重可下载并识别为已安装，可在单图建议与批量打标中选择；其推理需要目标机 Python 具备 torch、transformers、einops。批量打标也可继续使用 WD14 标签模型。
-- 安装包只包含 `worker/` 脚本与前端资源，不含 Python、Pillow 和 WD14 模型；目标机需自备运行时与模型，设置页会显示解析结果。
+- 使用 WD14、Florence-2 需要单独配置模型及推理依赖。视觉语言模型打标需要在设置中接入本地或云端服务。
 - 自动模糊检测阈值需要人工校准，默认关闭。
 - 打标页的默认画布仍显示原图（可切换「原图 / 对比」查看处理后预览），不会在打标页直接改裁剪；裁剪联动只作用于裁剪页。
 - 工作台处理预设库与 ZIP 内直接生成绝对版 TOML 仍为后续迭代项。

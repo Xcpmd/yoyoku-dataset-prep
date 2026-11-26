@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-image-runtime.ps1",
     "frontendDist": "../dist"
   },
   "app": {
@@ -48,6 +48,7 @@
     ],
     "resources": {
       "../worker/main.py": "worker/main.py",
+      "../worker/runtime/": "worker/runtime/",
       "../worker/translate.py": "worker/translate.py",
       "../worker/tagging/download_model.py": "worker/tagging/download_model.py",
       "../worker/tagging/florence_infer.py": "worker/tagging/florence_infer.py",

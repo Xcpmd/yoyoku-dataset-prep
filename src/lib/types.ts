@@ -799,6 +799,7 @@ export interface StorageStats {
 export interface AppInfo {
   version: string;
   dataDir: string;
+  modelsDir: string;
   workerReady: boolean;
   workerPython: string;
   workerScript: string;
@@ -844,9 +845,9 @@ export interface TagTotalsResult {
 }
 
 export interface TagBulkRequest {
-  /** 空数组表示作用于项目内全部图片。 */
+  /** 添加、删除和重命名可传空数组以处理整个项目。 */
   assetIds: string[];
-  action: "add" | "remove" | "rename";
+  action: "add" | "remove" | "rename" | "convertUnderscores" | "duplicateUnderscores";
   from?: string;
   to?: string;
   tags?: string[];

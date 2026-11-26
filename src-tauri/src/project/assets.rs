@@ -25,6 +25,7 @@ fn caption_config(conn: &rusqlite::Connection) -> AppResult<CaptionConfig> {
     Ok(CaptionConfig { trigger_word, trigger_mode, default_mode })
 }
 
+#[derive(Clone)]
 struct CaptionRaw {
     mode: String,
     tags: Vec<String>,
@@ -743,10 +744,10 @@ fn transform_caption(
     raw: &CaptionRaw,
     trigger_word: &str,
 ) -> (CaptionRaw, Option<String>) {
-    if raw.mode == "tags" {
+    if raw.mode == "tags" || (raw.mode == "mixed" && matches!(op, BatchOp::ReplaceTag { .. })) {
         let (tags, _text) = caption::apply_tag_transform(op, &raw.mode, &raw.tags, &raw.text, trigger_word);
         return (
-            CaptionRaw { mode: "tags".into(), tags, text: raw.text.clone() },
+            CaptionRaw { mode: raw.mode.clone(), tags, text: raw.text.clone() },
             None,
         );
     }
@@ -767,6 +768,9 @@ fn transform_caption(
         }
         BatchOp::ReplaceTag { from, to } => {
             let key = caption::normalize_key(from);
+            if !terms.iter().any(|term| caption::normalize_key(term) == key && term != to) {
+                return (raw.clone(), None);
+            }
             for term in terms.iter_mut() {
                 if caption::normalize_key(term) == key {
                     *term = to.clone();

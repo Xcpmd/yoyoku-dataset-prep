@@ -15,7 +15,6 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
   const [pythonPath, setPythonPath] = useState(settings.pythonPath || "");
-  const [modelsDir, setModelsDir] = useState(settings.modelsDir || "");
   const [translateAppId, setTranslateAppId] = useState(settings.baiduTranslateAppId || "");
   const [translateKey, setTranslateKey] = useState(settings.baiduTranslateKey || "");
   const [downloadOpen, setDownloadOpen] = useState(false);
@@ -43,11 +42,10 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
   useEffect(() => {
     if (!open) return;
     setPythonPath(settings.pythonPath || "");
-    setModelsDir(settings.modelsDir || "");
     setTranslateAppId(settings.baiduTranslateAppId || "");
     setTranslateKey(settings.baiduTranslateKey || "");
     void loadModels();
-  }, [open, settings.pythonPath, settings.modelsDir, settings.baiduTranslateAppId, settings.baiduTranslateKey, loadModels]);
+  }, [open, settings.pythonPath, settings.baiduTranslateAppId, settings.baiduTranslateKey, loadModels]);
 
   useEffect(() => {
     if (open && modelRevision > 0) void loadModels();
@@ -56,15 +54,9 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
   const saveRuntime = async () => {
     await updateSettings({
       pythonPath: pythonPath.trim() || null,
-      modelsDir: modelsDir.trim() || null,
     });
     notify({ message: S.settings.restartRequired });
     await loadModels();
-  };
-
-  const pickModelsDir = async () => {
-    const folder = await api.pickFolder("选择模型目录");
-    if (folder) setModelsDir(folder);
   };
 
   const saveTranslateSettings = async () => {
@@ -265,7 +257,7 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
             </div>
           ) : null}
           {models.length === 0 && !modelsLoading ? (
-            <Notice tone="warning">未找到本地模型。可在下方指定模型目录，或使用「下载模型」获取。</Notice>
+            <Notice tone="warning">未找到本地模型。可使用「下载模型」获取，模型会保存到下方显示的 models 文件夹。</Notice>
           ) : (
             <div className="stack" style={{ gap: 6 }}>
               {models.map((item) => (
@@ -285,16 +277,16 @@ export function HomeSettings({ open, onClose }: { open: boolean; onClose: () => 
             </div>
           )}
           <div className="grid-2">
-            <Field label={S.settings.modelsDir}>
+            <Field label={S.settings.modelsDir} hint="新下载的模型统一存放在应用安装根目录下的 models 文件夹。">
               <div className="input-row">
                 <input
                   className="input mono"
                   style={{ fontSize: 11 }}
-                  value={modelsDir}
-                  onChange={(event) => setModelsDir(event.target.value)}
-                  placeholder="自动检测 wd14Tagger/models"
+                  value={appInfo?.modelsDir || "—"}
+                  readOnly
+                  aria-label="模型存放目录"
                 />
-                <button type="button" className="btn subtle" onClick={() => void pickModelsDir()}>
+                <button type="button" className="btn subtle" onClick={() => void api.openModelsDir().catch((error) => notify({ tone: "danger", message: normalizeError(error).message }))}>
                   <Icon name="folder-open" />
                 </button>
               </div>

@@ -35,6 +35,9 @@ interface Props {
   aiModelsLoading: boolean;
   aiBusy: boolean;
   aiNote: string | null;
+  underscoreTargets: number;
+  underscoreBusy: boolean;
+  onExpandUnderscores: (keepOriginal: boolean) => void;
   onAiModelsChange: (value: string[]) => void;
   onAiTag: () => void;
   onChange: (patch: { mode?: CaptionMode; tags?: string[]; text?: string }) => void;
@@ -60,6 +63,9 @@ export function CaptionPanel({
   aiModelsLoading,
   aiBusy,
   aiNote,
+  underscoreTargets,
+  underscoreBusy,
+  onExpandUnderscores,
   onAiModelsChange,
   onAiTag,
   onChange,
@@ -186,16 +192,6 @@ export function CaptionPanel({
       return next.length === current.length ? current : next;
     });
   }, [tags]);
-
-  useEffect(() => {
-    if (!tagStateLoaded || !stateLoadedRef.current) return;
-    const timer = window.setTimeout(() => {
-      void api
-        .captionTagStateSet(assetId, { order: tagOrder, disabled: disabledTags })
-        .catch(() => undefined);
-    }, 400);
-    return () => window.clearTimeout(timer);
-  }, [assetId, tagOrder, disabledTags, tagStateLoaded]);
 
   const persistTagState = (order: string[], disabled: string[]) => {
     if (!stateLoadedRef.current) return;
@@ -608,35 +604,7 @@ export function CaptionPanel({
     }
   };
 
-  const convertUnderscoreTag = (value: string): string => {
-    const leading = value.match(/^_+/)?.[0] || "";
-    const rest = value.slice(leading.length);
-    const trailing = rest.match(/_+$/)?.[0] || "";
-    const core = rest.slice(0, rest.length - trailing.length);
-    if (!core.includes("_")) return value;
-    return leading + core.replace(/_+/g, " ") + trailing;
-  };
-
-  const underscoreTags = tags.filter((tag) => convertUnderscoreTag(tag) !== tag);
-
-  const expandUnderscores = (mode: "convert" | "duplicate") => {
-    if (underscoreTags.length === 0) return;
-    const next =
-      mode === "convert"
-        ? tags.map(convertUnderscoreTag)
-        : tags.flatMap((tag) => {
-            const variant = convertUnderscoreTag(tag);
-            return variant === tag ? [tag] : [tag, variant];
-          });
-    onChange({ tags: normalizeTagList(next) });
-    notify({
-      tone: "success",
-      message:
-        mode === "convert"
-          ? `已将 ${underscoreTags.length} 条标签的内侧下划线转为空格`
-          : `已为 ${underscoreTags.length} 条标签复制空格版本`,
-    });
-  };
+  const canExpandUnderscores = underscoreTargets > 0 || tags.some((tag) => /[^_]_+[^_]/.test(tag));
 
   const addTranslatedPrompt = () => {
     if (!translateResult?.text || translateResult.to !== "en") return;
@@ -1101,21 +1069,23 @@ export function CaptionPanel({
                   type="button"
                   className="btn ghost sm"
                   onClick={toggle}
-                  disabled={underscoreTags.length === 0}
-                  title={underscoreTags.length === 0 ? "当前没有含内侧下划线的标签" : "下划线标签扩展"}
+                  disabled={!canExpandUnderscores || underscoreBusy}
+                  title={canExpandUnderscores ? "下划线标签扩展" : "当前没有含内侧下划线的标签"}
                 >
-                  <Icon name="copy" className="sm" />
-                  标签扩展
+                  {underscoreBusy ? <Spinner /> : <Icon name="copy" className="sm" />}
+                  标签扩展{underscoreTargets > 0 ? ` · 已选 ${underscoreTargets} 张` : ""}
                 </button>
               )}
             >
               {(close) => (
                 <>
-                  <MenuLabel>下划线处理（首尾下划线保留）</MenuLabel>
+                  <MenuLabel>
+                    {underscoreTargets > 0 ? `已选 ${underscoreTargets} 张` : "当前图片"} · 保留首尾下划线
+                  </MenuLabel>
                   <MenuItem
                     icon="refresh"
                     onClick={() => {
-                      expandUnderscores("convert");
+                      onExpandUnderscores(false);
                       close();
                     }}
                   >
@@ -1124,7 +1094,7 @@ export function CaptionPanel({
                   <MenuItem
                     icon="copy"
                     onClick={() => {
-                      expandUnderscores("duplicate");
+                      onExpandUnderscores(true);
                       close();
                     }}
                   >

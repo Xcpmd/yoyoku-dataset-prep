@@ -49,6 +49,24 @@ pub fn tags_to_text(tags: &[String]) -> String {
     tags.join(", ")
 }
 
+pub fn replace_tag(tags: &mut Vec<String>, from_key: &str, to: &str) -> bool {
+    if !tags.iter().any(|tag| normalize_key(tag) == from_key) {
+        return false;
+    }
+    let next = normalize_tags(tags.iter().map(|tag| {
+        if normalize_key(tag) == from_key {
+            to.to_owned()
+        } else {
+            tag.clone()
+        }
+    }));
+    if next == *tags {
+        return false;
+    }
+    *tags = next;
+    true
+}
+
 pub fn search_text(mode: &str, tags: &[String], text: &str) -> String {
     let mut pieces = Vec::new();
     if mode != "nl" {
@@ -274,20 +292,11 @@ pub fn apply_tag_transform(
             if !trigger_key.is_empty() && from_key == trigger_key {
                 return (tags.to_vec(), text.to_string());
             }
-            let mut result: Vec<String> = tags
-                .iter()
-                .map(|tag| {
-                    if normalize_key(tag) == from_key {
-                        to_clean.clone()
-                    } else {
-                        tag.clone()
-                    }
-                })
-                .collect();
-            if mode == "nl" && !text.is_empty() && !from.trim().is_empty() {
-                result = tags.to_vec();
+            let mut result = tags.to_vec();
+            if mode != "nl" || text.is_empty() || from.trim().is_empty() {
+                replace_tag(&mut result, &from_key, &to_clean);
             }
-            (normalize_tags(result), text.to_string())
+            (result, text.to_string())
         }
         BatchOp::MoveToFront { tag } => {
             let key = normalize_key(tag);
@@ -341,6 +350,14 @@ mod tests {
             "blue eyes".into(),
         ]);
         assert_eq!(tags, vec!["Long Hair", "blue eyes"]);
+    }
+
+    #[test]
+    fn replacing_a_missing_tag_does_not_normalize_legacy_tags() {
+        let original = vec!["Long Hair".into(), "long  hair".into()];
+        let mut tags = original.clone();
+        assert!(!replace_tag(&mut tags, "blue_eyes", "green eyes"));
+        assert_eq!(tags, original);
     }
 
     #[test]

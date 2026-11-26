@@ -593,7 +593,9 @@ export function TagAssist({
                     }}
                     onBlur={() => settleEdit(true)}
                   />
-                  <span className="tiny faint stat-edit-scope">{scopeLabel}</span>
+                  <span className="tiny faint stat-edit-scope" title="仅修改包含此提示词的图片">
+                    {entry.count} 张含此词
+                  </span>
                   <button
                     type="button"
                     className="stat-delete"

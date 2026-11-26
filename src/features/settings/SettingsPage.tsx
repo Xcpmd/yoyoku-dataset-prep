@@ -78,7 +78,6 @@ export function SettingsPage({ active }: { active: boolean }) {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [pythonPath, setPythonPath] = useState(settings.pythonPath || "");
-  const [modelsDir, setModelsDir] = useState(settings.modelsDir || "");
   const [imageSlots, setImageSlots] = useState(settings.imageSlots || 4);
   const [translateAppId, setTranslateAppId] = useState(settings.baiduTranslateAppId || "");
   const [translateKey, setTranslateKey] = useState(settings.baiduTranslateKey || "");
@@ -108,13 +107,11 @@ export function SettingsPage({ active }: { active: boolean }) {
 
   useEffect(() => {
     setPythonPath(settings.pythonPath || "");
-    setModelsDir(settings.modelsDir || "");
     setImageSlots(settings.imageSlots || 4);
     setTranslateAppId(settings.baiduTranslateAppId || "");
     setTranslateKey(settings.baiduTranslateKey || "");
   }, [
     settings.pythonPath,
-    settings.modelsDir,
     settings.imageSlots,
     settings.baiduTranslateAppId,
     settings.baiduTranslateKey,
@@ -212,16 +209,10 @@ export function SettingsPage({ active }: { active: boolean }) {
   const saveRuntimeSettings = async () => {
     await updateSettings({
       pythonPath: pythonPath.trim() || null,
-      modelsDir: modelsDir.trim() || null,
       imageSlots: Math.min(8, Math.max(1, Math.round(imageSlots) || 4)),
     });
     notify({ message: S.settings.restartRequired });
     await loadModels();
-  };
-
-  const pickModelsDir = async () => {
-    const folder = await api.pickFolder("选择模型目录");
-    if (folder) setModelsDir(folder);
   };
 
   const saveTranslateSettings = async () => {
@@ -692,7 +683,7 @@ export function SettingsPage({ active }: { active: boolean }) {
             </p>
             {modelError ? <Notice tone="danger">{modelError}</Notice> : null}
             {models.length === 0 && !modelsLoading ? (
-              <Notice tone="warning">未找到本地模型。可在下方指定模型目录，或把 WD14 ONNX 模型放入默认模型目录。</Notice>
+              <Notice tone="warning">未找到本地模型。可使用「下载模型」，或把模型文件放入下方显示的 models 文件夹。</Notice>
             ) : (
               <table className="model-table">
                 <thead>
@@ -730,16 +721,16 @@ export function SettingsPage({ active }: { active: boolean }) {
               </table>
             )}
             <div className="grid-2">
-              <Field label={S.settings.modelsDir}>
+              <Field label={S.settings.modelsDir} hint="新下载的 WD14 与 Florence-2 模型统一存放在应用安装根目录下的 models 文件夹。">
                 <div className="input-row">
                   <input
                     className="input mono"
                     style={{ fontSize: 11 }}
-                    value={modelsDir}
-                    onChange={(event) => setModelsDir(event.target.value)}
-                    placeholder="自动检测 wd14Tagger/models"
+                    value={appInfo?.modelsDir || "—"}
+                    readOnly
+                    aria-label="模型存放目录"
                   />
-                  <button type="button" className="btn subtle" onClick={() => void pickModelsDir()}>
+                  <button type="button" className="btn subtle" onClick={() => void api.openModelsDir().catch((error) => notify({ tone: "danger", message: normalizeError(error).message }))}>
                     <Icon name="folder-open" />
                   </button>
                 </div>

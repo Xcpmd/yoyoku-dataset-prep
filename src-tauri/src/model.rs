@@ -1103,6 +1103,7 @@ pub struct StorageStats {
 pub struct AppInfo {
     pub version: String,
     pub data_dir: String,
+    pub models_dir: String,
     pub worker_ready: bool,
     pub worker_python: String,
     pub worker_script: String,

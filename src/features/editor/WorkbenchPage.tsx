@@ -100,6 +100,7 @@ export function WorkbenchPage({
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadNonce, setLoadNonce] = useState(0);
+  const [captionLoadKey, setCaptionLoadKey] = useState(0);
   const [plan, setPlan] = useState<TransformPlan | null>(null);
   const [appliedPlan, setAppliedPlan] = useState<TransformPlan | null>(null);
   const [planDirty, setPlanDirty] = useState(false);
@@ -118,6 +119,8 @@ export function WorkbenchPage({
   const [linked, setLinked] = useState(false);
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
   const [tagSelection, setTagSelection] = useState<string[]>([]);
+  const [underscoreBusy, setUnderscoreBusy] = useState(false);
+  const underscoreLock = useRef(false);
   const [tagBatchOpen, setTagBatchOpen] = useState(false);
   const [tagModels, setTagModels] = useState<ModelInfo[]>([]);
   const [tagModelsLoading, setTagModelsLoading] = useState(false);
@@ -285,6 +288,7 @@ export function WorkbenchPage({
         : hydratedText.trim().length > 0
           ? "nl"
           : "tags";
+    setCaptionLoadKey((key) => key + 1);
     setCaptionMode(hydratedMode);
     setTags(hydratedTags);
     setCaptionText(duplicateLegacyText || hydratedTags.length > 0 && hydratedText.trim().length === 0 ? "" : hydratedText);
@@ -455,6 +459,45 @@ export function WorkbenchPage({
     bumpRefresh();
     reloadDetail(true);
   }, [bumpRefresh, reloadDetail]);
+
+  const expandUnderscores = async (keepOriginal: boolean) => {
+    const targets = railSelection.length > 0 ? railSelection : currentId ? [currentId] : [];
+    if (targets.length === 0 || underscoreLock.current) return;
+    underscoreLock.current = true;
+    setUnderscoreBusy(true);
+    try {
+      if (!(await saveCaptionNow())) return;
+      const result = await api.captionTagBulk({
+        assetIds: targets,
+        action: keepOriginal ? "duplicateUnderscores" : "convertUnderscores",
+      });
+      const historySeq = result.historySeq;
+      if (historySeq === null) {
+        notify({ message: "没有需要转换的提示词" });
+        return;
+      }
+      handleBulkDone();
+      notify({
+        tone: "success",
+        message: `已更新 ${result.changedAssets} 张图片`,
+        actionLabel: S.common.undo,
+        onAction: async () => {
+          try {
+            if (!(await saveCaptionNow())) return;
+            await api.undo(historySeq);
+            handleBulkDone();
+          } catch (error) {
+            notify({ tone: "danger", message: normalizeError(error).message });
+          }
+        },
+      });
+    } catch (error) {
+      notify({ tone: "danger", message: normalizeError(error).message });
+    } finally {
+      underscoreLock.current = false;
+      setUnderscoreBusy(false);
+    }
+  };
 
   const saveDraftNow = useCallback(async () => {
     const id = assetIdRef.current;
@@ -1970,6 +2013,7 @@ export function WorkbenchPage({
                 />
               ) : activeTab === "caption" ? (
                 <CaptionPanel
+                  key={`${detail.summary.id}:${captionLoadKey}`}
                   assetId={detail.summary.id}
                   mode={captionMode}
                   tags={tags}
@@ -1982,8 +2026,11 @@ export function WorkbenchPage({
                   aiModels={tagModels}
                   aiModelIds={tagModelIds}
                   aiModelsLoading={tagModelsLoading}
-                    aiBusy={aiTagging || tagBatchRunning}
+                  aiBusy={aiTagging || tagBatchRunning}
                   aiNote={aiTagNote}
+                  underscoreTargets={railSelection.length}
+                  underscoreBusy={underscoreBusy}
+                  onExpandUnderscores={(keepOriginal) => void expandUnderscores(keepOriginal)}
                   onAiModelsChange={setTagModelIds}
                   onAiTag={() => void runAiTagCurrent()}
                   onChange={updateCaption}

@@ -71,6 +71,8 @@ impl Default for JobControl {
 
 pub struct AppState {
     pub data_dir: PathBuf,
+    /// 应用安装根目录。发布版模型统一存放在此目录下的 `models` 文件夹。
+    pub install_root: PathBuf,
     pub settings: RwLock<AppSettings>,
     pub recent: RwLock<RecentStore>,
     pub project: RwLock<Option<Arc<Project>>>,
@@ -98,14 +100,17 @@ impl AppState {
     pub fn new(data_dir: PathBuf, resource_dir: Option<PathBuf>, python_override: Option<String>) -> AppResult<Self> {
         util::ensure_dir(&data_dir)?;
         util::ensure_dir(&data_dir.join("logs"))?;
+        let install_root = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| resource_dir.clone())
+            .unwrap_or_else(|| data_dir.clone());
         let settings = load_settings(&data_dir);
         let recent = load_recent(&data_dir);
-        let python = resolve_python(
-            python_override
-                .or_else(|| settings.python_path.clone())
-                .as_deref(),
-        );
         let worker_script = resolve_worker_script(resource_dir.as_deref())?;
+        let configured_python = python_override.as_deref().or(settings.python_path.as_deref());
+        let bundled_python = worker_script.parent().map(|dir| dir.join("runtime/python/python.exe"));
+        let python = resolve_python_with_fallback(configured_python, bundled_python.as_deref());
         let worker_log = data_dir.join("logs").join("worker.log");
         let image_slots = settings.image_slots.clamp(1, 8) as usize;
         let worker = WorkerPool::new(
@@ -116,6 +121,7 @@ impl AppState {
         );
         Ok(Self {
             data_dir,
+            install_root,
             settings: RwLock::new(settings),
             recent: RwLock::new(recent),
             project: RwLock::new(None),
@@ -315,6 +321,10 @@ fn workspace_root() -> PathBuf {
 /// 图像工作进程、WD14 与 Florence 共用的解释器解析顺序：
 /// 设置中的 Python → `YOYOKU_PYTHON` → 开发机候选 → PATH 中的 `python`。
 pub fn resolve_python(preferred: Option<&str>) -> String {
+    resolve_python_with_fallback(preferred, None)
+}
+
+fn resolve_python_with_fallback(preferred: Option<&str>, bundled: Option<&Path>) -> String {
     if let Some(path) = preferred {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
@@ -328,6 +338,9 @@ pub fn resolve_python(preferred: Option<&str>) -> String {
     }
     if let Some(found) = existing_python(&workspace_root()) {
         return found;
+    }
+    if let Some(path) = bundled.filter(|path| path.is_file()) {
+        return path.to_string_lossy().into_owned();
     }
     "python".to_string()
 }

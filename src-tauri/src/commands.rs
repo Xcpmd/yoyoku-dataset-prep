@@ -24,6 +24,7 @@ pub async fn app_info(state: State<'_, AppState>) -> AppResult<AppInfo> {
     Ok(AppInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         data_dir: state.data_dir.to_string_lossy().to_string(),
+        models_dir: tagging::download_root(&state).to_string_lossy().to_string(),
         worker_ready: state.worker.verified() && state.worker.last_error().is_none(),
         worker_python: state.python.clone(),
         worker_script: state.worker_script.to_string_lossy().to_string(),
